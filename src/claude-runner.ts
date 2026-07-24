@@ -21,7 +21,7 @@ export interface ClaudeResult {
 }
 
 export interface StreamEvent {
-  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta";
+  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user";
  text?: string;
  toolName?: string;
  toolInput?: unknown;
@@ -29,6 +29,8 @@ export interface StreamEvent {
  permissionId?: string;
  usage?: { input_tokens?: number; output_tokens?: number };
   slashCommands?: string[];
+  /** For assistant events: marks an API call boundary (for context estimation). */
+  apiCallIndex?: number;
 }
 
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
@@ -378,34 +380,58 @@ export class ClaudeRunner {
       return;
     }
 
-    // Handle assistant message with content array
-    if (parsed.type === "assistant" && parsed.message?.content) {
-      for (const block of parsed.message.content) {
-        if (block.type === "text") {
-          onEvent({ type: "text_delta", text: block.text });
-        } else if (block.type === "tool_use") {
-          onEvent({
-            type: "tool_use",
-            toolName: block.name,
-            toolInput: block.input,
-          });
-        } else if (block.type === "thinking") {
-          onEvent({ type: "thinking", text: block.thinking });
-        }
-      }
+   // Handle assistant message with content array
+   if (parsed.type === "assistant" && parsed.message?.content) {
+      // Emit an "assistant" event FIRST — this marks an API call boundary
+      // for context estimation (each assistant message = one LLM API call).
+      onEvent({ type: "assistant", apiCallIndex: 0 });
+     for (const block of parsed.message.content) {
+       if (block.type === "text") {
+         onEvent({ type: "text_delta", text: block.text });
+       } else if (block.type === "tool_use") {
+         onEvent({
+           type: "tool_use",
+           toolName: block.name,
+           toolInput: block.input,
+         });
+       } else if (block.type === "thinking") {
+         onEvent({ type: "thinking", text: block.thinking });
+       }
+     }
+     return;
+   }
+
+    // Handle user message (tool results) — emit for context estimation.
+    // Claude CLI stream-json emits {"type":"user","message":{"content":[{"type":"tool_result","content":"..."}]}}
+    if (parsed.type === "user" && parsed.message?.content) {
+      // Emit a "user" event so the context estimator can accumulate tool results.
+      const toolResultText = Array.isArray(parsed.message.content)
+        ? parsed.message.content
+            .map((b: any) => {
+              if (typeof b === "string") return b;
+              if (b.type === "tool_result") {
+                return typeof b.content === "string"
+                  ? b.content
+                  : JSON.stringify(b.content ?? "");
+              }
+              return JSON.stringify(b);
+            })
+            .join("")
+        : "";
+      onEvent({ type: "user", text: toolResultText });
       return;
     }
 
-    // Handle permission request from Claude CLI
-    if (parsed.type === "permission_request") {
-      onEvent({
-        type: "permission_request",
-        toolName: parsed.tool_name ?? parsed.toolName,
-        toolInput: parsed.tool_input ?? parsed.toolInput,
-        permissionId: parsed.permission_id ?? parsed.permissionId,
-      });
-      return;
-    }
+   // Handle permission request from Claude CLI
+   if (parsed.type === "permission_request") {
+     onEvent({
+       type: "permission_request",
+       toolName: parsed.tool_name ?? parsed.toolName,
+       toolInput: parsed.tool_input ?? parsed.toolInput,
+       permissionId: parsed.permission_id ?? parsed.permissionId,
+     });
+     return;
+   }
 
     // Handle thinking/extended thinking blocks
     if (

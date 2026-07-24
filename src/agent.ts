@@ -224,6 +224,81 @@ function getAutoCompactThreshold(modelId: string | undefined): number {
 // can run after the turn finishes.
 const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
 
+// ─── Real-time context estimation ──────────────────────────────────────────
+// Claude CLI only reports usage in the result event at turn END (cumulative).
+// To show usage DURING the turn, we estimate context size from stream events:
+// accumulate conversation content (text, tool calls, tool results) and add
+// the fixed overhead (system prompt + tool definitions).
+// Approximate token count: ~4 chars per token (rough heuristic).
+const CHARS_PER_TOKEN = 4;
+// Claude CLI system prompt is ~7KB. Tools (24 defs) are ~65KB. These are sent
+// on EVERY API call. Pre-computed: 7148 + 65600 = 72748 bytes overhead.
+const CLAUDE_OVERHEAD_BYTES = 72748;
+
+/** Estimate tokens from a character count (rough: 4 chars ≈ 1 token). */
+function estimateTokensFromChars(chars: number): number {
+  return Math.ceil(chars / CHARS_PER_TOKEN);
+}
+
+/** Per-turn accumulator for estimating real-time context size. */
+class TurnContextEstimator {
+  private contentBytes = 0;
+  private apiCallCount = 0;
+
+  /** Called when a new assistant event arrives (marks an API call boundary). */
+  markApiCall(): void {
+    this.apiCallCount++;
+  }
+
+  /** Accumulate text content (assistant messages, thinking, tool results). */
+  addText(text: string): void {
+    if (text) this.contentBytes += text.length;
+  }
+
+  /** Accumulate tool call content (JSON-serialized input). */
+  addToolCall(toolName: string, toolInput: unknown): void {
+    this.contentBytes += toolName.length;
+    try {
+      this.contentBytes += JSON.stringify(toolInput ?? {}).length;
+    } catch {
+      this.contentBytes += 50; // fallback estimate
+    }
+  }
+
+  /** Get the estimated context size (overhead + conversation content). */
+  getEstimatedTokens(): number {
+    const totalBytes = CLAUDE_OVERHEAD_BYTES + this.contentBytes;
+    return estimateTokensFromChars(totalBytes);
+  }
+
+  getApiCallCount(): number {
+    return this.apiCallCount;
+  }
+}
+
+/** Send a usage_update with the estimated context size (real-time, mid-turn). */
+function sendEstimatedUsage(
+  estimator: TurnContextEstimator,
+  connection: AgentSideConnection,
+  sessionId: string,
+  modelId: string | undefined,
+): void {
+  const contextWindow = getContextWindowForModel(modelId);
+  const estimated = estimator.getEstimatedTokens();
+  // Cap at contextWindow so the UI never shows >100%.
+  const capped = Math.min(estimated, contextWindow);
+  connection.sessionUpdate({
+    sessionId,
+    update: {
+      sessionUpdate: "usage_update",
+      used: capped,
+      size: contextWindow,
+    } as any,
+  }).catch(() => {
+    // Best effort — don't fail the turn.
+  });
+}
+
 /** Parse a slash command from prompt text. Returns null if not a command. */
 function parseSlashCommand(prompt: string): { name: string; rest: string } | null {
   const trimmed = prompt.trim();
@@ -1045,7 +1120,13 @@ export function createClaudeCodeAgent(
 
       const claudeSessionId = store.getClaudeSessionId(sessionId);
       const cwd = store.getCwd(sessionId)!;
-      let toolCallCounter = 0;
+     let toolCallCounter = 0;
+
+      // Real-time context estimator — tracks conversation content to estimate
+      // context size during the turn (before the result event arrives).
+      const ctxEstimator = new TurnContextEstimator();
+      // Accumulate the user's prompt text (it's part of the conversation).
+      ctxEstimator.addText(effectivePrompt);
 
       // Get model and effort overrides from session config (set via pickers)
       const configOverrides = store.getConfigOverrides(sessionId);
@@ -1085,85 +1166,104 @@ export function createClaudeCodeAgent(
               sessionUpdate: "available_commands_update",
               availableCommands: allCommands,
             } as any,
-          }).catch(() => {
-            // Best effort
-          });
-        }
-      // Handle result event — Claude CLI reports CUMULATIVE usage across all
-      // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
-      // single-call turn, input_tokens = real context size (accurate). For a
-      // multi-call turn (tool calls), input_tokens = sum of all calls' input
-      // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
-      // but real context is ~20k).
-      //
-      // Claude CLI does NOT forward message_delta events to stdout in
-      // stream-json mode (includePartialMessages defaults to false), so we
-      // cannot get per-call usage from the stream. The result event is our
-      // only source.
-      //
-      // Strategy: use input_tokens from the result event for usage_update,
-      // capped at contextWindow so the UI never shows >100%. For
-      // auto-compact, use the raw cumulative value — it triggers compaction
-      // earlier on multi-call turns, which is a safe safety net (better to
-      // compact too early than to overflow the context window).
-      if (event.type === "result" && event.usage) {
-        lastUsage = event.usage;
-        const inputTokens = event.usage.input_tokens ?? 0;
-        const outputTokens = event.usage.output_tokens ?? 0;
-        const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-        const contextWindow = getContextWindowForModel(effectiveModel);
-        // Store cumulative usage for auto-compact check.
-        sessionLastUsage.set(sessionId, { input_tokens: inputTokens, output_tokens: outputTokens });
-        // For the UI: cap used at contextWindow so it never shows >100%.
-        // Use input_tokens as the context usage metric (this is vLLM's
-        // prompt_tokens = the actual context size sent to the model).
-        const cappedUsed = Math.min(inputTokens, contextWindow);
-        connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "usage_update",
-            used: cappedUsed,
-            size: contextWindow,
-          } as any,
-        }).catch(() => {
-          // Best effort — don't fail the turn if usage_update fails.
-        });
+         }).catch(() => {
+           // Best effort
+         });
+       }
+      // Handle assistant event — marks an API call boundary. Each assistant
+      // message in Claude CLI's stream-json output = one LLM API call.
+      // Send a real-time usage_update so the context ring shows during the turn.
+      if (event.type === "assistant") {
+        ctxEstimator.markApiCall();
+        sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
       }
-        if ((event as any).type === "thinking" && (event as any).text) {
-          connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_thought_chunk",
-              content: { type: "text", text: (event as any).text },
-            } as any,
-          });
-        } else if (event.type === "text_delta" && event.text) {
-          connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: event.text },
-            },
-          });
-        } else if (event.type === "tool_use" && event.toolName) {
-          const toolCallId = `call_${++toolCallCounter}`;
-          logger.debug(`Tool call: ${event.toolName}`);
-          connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "tool_call",
-              toolCallId,
-              title: event.toolName,
-              kind: "execute",
-              status: "completed",
-              rawInput: event.toolInput ?? {},
-            },
-          });
-        } else if (event.type === "permission_request" && event.toolName) {
-          const toolCallId = `call_${++toolCallCounter}`;
-          const toolName = event.toolName;
-          const toolInput = event.toolInput ?? {};
-          logger.info(`Permission request: ${toolName}`);
+      // Handle user event (tool results) — accumulate for context estimation.
+      if (event.type === "user" && event.text) {
+        ctxEstimator.addText(event.text);
+      }
+    // Handle result event — Claude CLI reports CUMULATIVE usage across all
+    // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
+    // single-call turn, input_tokens = real context size (accurate). For a
+     // multi-call turn (tool calls), input_tokens = sum of all calls' input
+     // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
+     // but real context is ~20k).
+     //
+     // Claude CLI does NOT forward message_delta events to stdout in
+     // stream-json mode (includePartialMessages defaults to false), so we
+     // cannot get per-call usage from the stream. The result event is our
+     // only source.
+     //
+     // Strategy:
+     // - For the UI: use our real-time estimate (ctxEstimator), which is more
+     //   accurate than the cumulative result value. Cap at contextWindow.
+     // - For auto-compact: use the cumulative input_tokens from the result
+     //   event. It triggers compaction earlier on multi-call turns, which is
+     //   a safe safety net (better to compact too early than to overflow).
+     //   Also check the estimate — whichever is higher triggers compaction.
+     if (event.type === "result" && event.usage) {
+       lastUsage = event.usage;
+       const inputTokens = event.usage.input_tokens ?? 0;
+       const outputTokens = event.usage.output_tokens ?? 0;
+       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+       const contextWindow = getContextWindowForModel(effectiveModel);
+       // For auto-compact: use the higher of cumulative result usage or our
+       // estimate, so compaction triggers as a safety net.
+       const estimatedTokens = ctxEstimator.getEstimatedTokens();
+       const autoCompactInput = Math.max(inputTokens, estimatedTokens);
+       sessionLastUsage.set(sessionId, { input_tokens: autoCompactInput, output_tokens: outputTokens });
+       // For the UI: use our real-time estimate (more accurate than cumulative).
+       // Cap at contextWindow so it never shows >100%.
+       const cappedUsed = Math.min(estimatedTokens, contextWindow);
+       connection.sessionUpdate({
+         sessionId,
+         update: {
+           sessionUpdate: "usage_update",
+           used: cappedUsed,
+           size: contextWindow,
+         } as any,
+       }).catch(() => {
+         // Best effort — don't fail the turn if usage_update fails.
+       });
+     }
+       if ((event as any).type === "thinking" && (event as any).text) {
+         ctxEstimator.addText((event as any).text);
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "agent_thought_chunk",
+             content: { type: "text", text: (event as any).text },
+           } as any,
+         });
+       } else if (event.type === "text_delta" && event.text) {
+         ctxEstimator.addText(event.text);
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "agent_message_chunk",
+             content: { type: "text", text: event.text },
+           },
+         });
+       } else if (event.type === "tool_use" && event.toolName) {
+         ctxEstimator.addToolCall(event.toolName, event.toolInput);
+         const toolCallId = `call_${++toolCallCounter}`;
+         logger.debug(`Tool call: ${event.toolName}`);
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "tool_call",
+             toolCallId,
+             title: event.toolName,
+             kind: "execute",
+             status: "completed",
+             rawInput: event.toolInput ?? {},
+           },
+         });
+       } else if (event.type === "permission_request" && event.toolName) {
+         ctxEstimator.addToolCall(event.toolName, event.toolInput);
+         const toolCallId = `call_${++toolCallCounter}`;
+         const toolName = event.toolName;
+         const toolInput = event.toolInput ?? {};
+         logger.info(`Permission request: ${toolName}`);
 
           // Send pending tool_call status
           connection.sessionUpdate({
@@ -1323,20 +1423,21 @@ export function createClaudeCodeAgent(
             if (cancelledSessions.has(sessionId)) break;
             const claudeSid = store.getClaudeSessionId(sessionId);
             if (!claudeSid) break;
-            toolCallCounter = 0;
-            permissionPromises.length = 0;
-            logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
-            try {
-              // Prepend goal to steer messages too
-              const steerPrompt = activeGoal && !activeGoal.paused
-                ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
-                : steerText;
-              await runner.continueSessionStreaming(
-                claudeSid,
-                steerPrompt,
-                onEvent,
-                sessionId,
-                modelOverride,
+       toolCallCounter = 0;
+       permissionPromises.length = 0;
+       logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
+        try {
+          // Prepend goal to steer messages too
+          const steerPrompt = activeGoal && !activeGoal.paused
+            ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
+            : steerText;
+          ctxEstimator.addText(steerPrompt);
+          await runner.continueSessionStreaming(
+              claudeSid,
+              steerPrompt,
+              onEvent,
+              sessionId,
+               modelOverride,
                 effectiveEffort
               );
               await Promise.all(permissionPromises);
