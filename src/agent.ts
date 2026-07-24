@@ -332,6 +332,22 @@ export function createClaudeCodeAgent(
       logger.info(
         `Session created: ${sessionId} (cwd: ${resolvedCwd}, mcpServers: ${mcpServers.length})`
       );
+
+      // Send available_commands_update notification so vscode-acp picks up
+      // the slash commands. vscode-acp's SessionManager ignores the
+      // availableCommands field in the newSession response (hardcodes to []),
+      // and only populates via the available_commands_update notification.
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "available_commands_update",
+          availableCommands: BUILTIN_COMMANDS,
+        } as any,
+      }).catch(() => {
+        // Best effort — notification may arrive before session is registered,
+        // vscode-acp buffers it via pendingAvailableCommands.
+      });
+
       return {
         sessionId,
         modes: buildModeState(DEFAULT_MODE),
