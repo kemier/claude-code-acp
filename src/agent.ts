@@ -826,7 +826,28 @@ export function createClaudeCodeAgent(
 
       let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
       const onEvent = (event: StreamEvent) => {
-        // Handle result event — capture usage for prompt response and usage_update
+        // Handle system/init — extract native Claude CLI slash commands and
+        // surface them to vscode-acp via available_commands_update.
+        if (event.type === "system_init" && event.slashCommands && event.slashCommands.length > 0) {
+          const nativeCommands = event.slashCommands
+            .filter((name) => !BUILTIN_COMMANDS.some((b) => b.name === name))
+            .map((name) => ({
+              name,
+              description: `Claude Code: /${name}`,
+              input: null,
+            }));
+          const allCommands = [...BUILTIN_COMMANDS, ...nativeCommands];
+          connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "available_commands_update",
+              availableCommands: allCommands,
+            } as any,
+          }).catch(() => {
+            // Best effort
+          });
+        }
+       // Handle result event — capture usage for prompt response and usage_update
         if (event.type === "result" && event.usage) {
           lastUsage = event.usage;
           const inputTokens = event.usage.input_tokens ?? 0;

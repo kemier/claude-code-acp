@@ -21,13 +21,14 @@ export interface ClaudeResult {
 }
 
 export interface StreamEvent {
-  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking";
-  text?: string;
-  toolName?: string;
-  toolInput?: unknown;
-  sessionId?: string;
-  permissionId?: string;
-  usage?: { input_tokens?: number; output_tokens?: number };
+  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init";
+ text?: string;
+ toolName?: string;
+ toolInput?: unknown;
+ sessionId?: string;
+ permissionId?: string;
+ usage?: { input_tokens?: number; output_tokens?: number };
+  slashCommands?: string[];
 }
 
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
@@ -359,7 +360,16 @@ export class ClaudeRunner {
     parsed: any,
     onEvent: (event: StreamEvent) => void
   ): void {
-    // Handle content_block_delta (streaming text)
+    // Handle system/init — extract native slash commands from Claude CLI
+    if (parsed.type === "system" && parsed.subtype === "init") {
+      const slashCommands: string[] = Array.isArray(parsed.slash_commands)
+        ? parsed.slash_commands.filter((c: any) => typeof c === "string")
+        : [];
+      onEvent({ type: "system_init", slashCommands });
+      return;
+    }
+
+   // Handle content_block_delta (streaming text)
     if (
       parsed.type === "content_block_delta" &&
       parsed.delta?.type === "text_delta"
