@@ -301,8 +301,8 @@ export function createClaudeCodeAgent(
           version: "0.1.0",
         },
         agentCapabilities: {
-          loadSession: false,
-          promptCapabilities: {
+          loadSession: true,
+         promptCapabilities: {
             image: false,
             audio: false,
             embeddedContext: false,
@@ -387,22 +387,107 @@ export function createClaudeCodeAgent(
     },
 
     async loadSession(
-      params: LoadSessionRequest
-    ): Promise<LoadSessionResponse> {
-      const { sessionId } = params;
+     params: LoadSessionRequest
+   ): Promise<LoadSessionResponse> {
+     const { sessionId } = params;
 
-      if (!store.has(sessionId)) {
-        throw RequestError.resourceNotFound(
-          `Session ${sessionId} not found`
-        );
+     if (!store.has(sessionId)) {
+       throw RequestError.resourceNotFound(
+         `Session ${sessionId} not found`
+       );
+     }
+
+     const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+     logger.info(`Load session: ${sessionId}`);
+
+      // Replay conversation history from Claude CLI's JSONL transcript.
+      // The transcript lives at ~/.claude/projects/<encoded-cwd>/<claude-session-id>.jsonl
+      const claudeSessionId = store.getClaudeSessionId(sessionId);
+      if (claudeSessionId) {
+        try {
+          const { homedir } = await import("node:os");
+          const cwd = store.getCwd(sessionId)!;
+          const encodedCwd = cwd.replace(/\//g, "-");
+          const transcriptPath = `${homedir()}/.claude/projects/${encodedCwd}/${claudeSessionId}.jsonl`;
+          const { readFileSync, existsSync } = await import("node:fs");
+          if (existsSync(transcriptPath)) {
+            const raw = readFileSync(transcriptPath, "utf-8");
+            const lines = raw.split("\n").filter((l) => l.trim());
+            logger.info(`Replaying ${lines.length} transcript lines from ${transcriptPath}`);
+            for (const line of lines) {
+              try {
+                const entry = JSON.parse(line);
+                if (entry.type === "user") {
+                  const msg = entry.message;
+                  if (!msg) continue;
+                  const content = msg.content;
+                  if (typeof content === "string" && content.trim()) {
+                    await connection.sessionUpdate({
+                      sessionId,
+                      update: {
+                        sessionUpdate: "user_message_chunk",
+                        content: { type: "text", text: content },
+                      } as any,
+                    });
+                  } else if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block.type === "text" && block.text) {
+                        await connection.sessionUpdate({
+                          sessionId,
+                          update: {
+                            sessionUpdate: "user_message_chunk",
+                            content: { type: "text", text: block.text },
+                          } as any,
+                        });
+                      }
+                    }
+                  }
+                } else if (entry.type === "assistant") {
+                  const msg = entry.message;
+                  if (!msg) continue;
+                  const content = msg.content;
+                  if (Array.isArray(content)) {
+                    for (const block of content) {
+                      if (block.type === "text" && block.text) {
+                        await connection.sessionUpdate({
+                          sessionId,
+                          update: {
+                            sessionUpdate: "agent_message_chunk",
+                            content: { type: "text", text: block.text },
+                          } as any,
+                        });
+                      } else if (block.type === "tool_use") {
+                        await connection.sessionUpdate({
+                          sessionId,
+                          update: {
+                            sessionUpdate: "tool_call",
+                            toolCallId: block.id ?? `replay-${Math.random().toString(36).slice(2, 8)}`,
+                            title: block.name ?? "tool",
+                            kind: "execute",
+                            status: "completed",
+                            rawInput: block.input ?? {},
+                          } as any,
+                        });
+                      }
+                    }
+                  }
+                }
+              } catch {
+                // Skip unparseable lines
+              }
+            }
+            logger.info(`Replay complete for session ${sessionId}`);
+          } else {
+            logger.warn(`Transcript not found: ${transcriptPath}`);
+          }
+        } catch (e) {
+          logger.error(`Failed to replay transcript: ${e instanceof Error ? e.message : String(e)}`);
+        }
       }
 
-      const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
-      logger.info(`Load session: ${sessionId}`);
-
-      return {
-        modes: buildModeState(currentMode),
-        configOptions: buildConfigOptions(store, sessionId),
+     return {
+       modes: buildModeState(currentMode),
+       configOptions: buildConfigOptions(store, sessionId),
         availableCommands: BUILTIN_COMMANDS,
       } as LoadSessionResponse;
     },
