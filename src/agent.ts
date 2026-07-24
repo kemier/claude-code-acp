@@ -824,7 +824,24 @@ export function createClaudeCodeAgent(
 
       const permissionPromises: Promise<void>[] = [];
 
+      let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
       const onEvent = (event: StreamEvent) => {
+        // Handle result event — capture usage for prompt response and usage_update
+        if (event.type === "result" && event.usage) {
+          lastUsage = event.usage;
+          const inputTokens = event.usage.input_tokens ?? 0;
+          const outputTokens = event.usage.output_tokens ?? 0;
+          const total = inputTokens + outputTokens;
+          const contextWindow = 200000;
+          connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "usage_update",
+              used: total,
+              size: contextWindow,
+            } as any,
+          });
+        }
         if ((event as any).type === "thinking" && (event as any).text) {
           connection.sessionUpdate({
             sessionId,
@@ -1050,7 +1067,7 @@ export function createClaudeCodeAgent(
           });
         }
 
-        return { stopReason: "end_turn" };
+        return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
       } catch (err) {
         // Check if cancelled
         if (cancelledSessions.has(sessionId)) {
