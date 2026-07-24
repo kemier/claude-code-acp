@@ -58,10 +58,14 @@ export class ClaudeRunner {
     this.config = config ?? loadConfig();
   }
 
-  private buildExtraArgs(): string[] {
+  private buildExtraArgs(modelOverride?: string, effortOverride?: string): string[] {
     const extra: string[] = [];
-    if (this.config.model) {
-      extra.push("--model", this.config.model);
+    const model = modelOverride || this.config.model;
+    if (model) {
+      extra.push("--model", model);
+    }
+    if (effortOverride) {
+      extra.push("--effort", effortOverride);
     }
     if (this.config.maxTurns) {
       extra.push("--max-turns", String(this.config.maxTurns));
@@ -103,7 +107,9 @@ export class ClaudeRunner {
     cwd: string,
     prompt: string,
     onEvent: (event: StreamEvent) => void,
-    trackingId?: string
+    trackingId?: string,
+    modelOverride?: string,
+    effortOverride?: string
   ): Promise<ClaudeResult> {
     const args = [
       "-p",
@@ -111,7 +117,7 @@ export class ClaudeRunner {
       "--output-format",
       "stream-json",
       "--verbose",
-      ...this.buildExtraArgs(),
+      ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
     return this.runStreaming(args, cwd, onEvent, trackingId);
   }
@@ -120,7 +126,9 @@ export class ClaudeRunner {
     claudeSessionId: string,
     prompt: string,
     onEvent: (event: StreamEvent) => void,
-    trackingId?: string
+    trackingId?: string,
+    modelOverride?: string,
+    effortOverride?: string
   ): Promise<ClaudeResult> {
     const args = [
       "-p",
@@ -130,7 +138,7 @@ export class ClaudeRunner {
       "--output-format",
       "stream-json",
       "--verbose",
-      ...this.buildExtraArgs(),
+      ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
     return this.runStreaming(args, undefined, onEvent, trackingId);
   }
@@ -203,10 +211,11 @@ export class ClaudeRunner {
   }
 
   private sanitizeEnv(): NodeJS.ProcessEnv {
-    const env = { ...process.env };
-    delete env.ANTHROPIC_API_KEY;
-    delete env.ANTHROPIC_AUTH_TOKEN;
-    return env;
+    // Keep ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN so claude CLI
+    // routes through our CCR gateway → ericai-proxy → EricAI vLLM.
+    // The original code deleted these to force subscription auth, but
+    // in our setup we use API key auth via the proxy chain.
+    return { ...process.env };
   }
 
   cancel(trackingId: string): void {

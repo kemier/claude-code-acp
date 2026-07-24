@@ -51,24 +51,163 @@ function buildModeState(currentModeId: string) {
   };
 }
 
+/** Models available through ericai-proxy (queried from /v1/models). */
+const PROXY_MODELS = [
+  { id: "glm-5.2", name: "GLM-5.2" },
+  { id: "glm-5.1", name: "GLM-5.1" },
+  { id: "Qwen3-Coder", name: "Qwen3-Coder" },
+  { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro" },
+  { id: "kimi-k2.7-code", name: "Kimi-K2.7-Code" },
+  { id: "kimi-k2.6", name: "Kimi-K2.6" },
+  { id: "mimo-v2.5-pro", name: "MiMo-V2.5-Pro" },
+  { id: "mimo-v2.5", name: "MiMo-V2.5" },
+  { id: "qwen2.5-14b-1m", name: "Qwen2.5-14B-1M" },
+];
+
+/** All possible effort levels (Claude Code CLI --effort flag). */
+const ALL_EFFORT_LEVELS: Record<string, { name: string; description: string }> = {
+  low: { name: "Low", description: "Fast, minimal reasoning" },
+  medium: { name: "Medium", description: "Balanced reasoning" },
+  high: { name: "High", description: "Deep reasoning" },
+  xhigh: { name: "XHigh", description: "Extra-deep reasoning" },
+  max: { name: "Max", description: "Maximum reasoning effort" },
+};
+
+/**
+ * Per-model effort support. Must match reasoning_profiles in
+ * ericai-proxy/scripts/update_catalog.sh.
+ * - Models with thinking support get their specific effort levels.
+ * - Models without thinking get an empty array (effort picker hidden).
+ */
+const MODEL_EFFORTS: Record<string, string[]> = {
+  "glm-5.2": ["low", "medium", "high"],
+  "glm-5.1": ["low", "medium", "high"],
+  "Qwen3-Coder": ["low", "medium", "high"],
+  "deepseek-v4-pro": ["low", "medium", "high", "xhigh"],
+  "kimi-k2.7-code": ["low", "high"],
+  "kimi-k2.6": ["low", "high"],
+  "mimo-v2.5-pro": ["low", "high"],
+  "mimo-v2.5": ["low", "high"],
+  // qwen2.5-14b-1m is a non-reasoning model — no effort picker
+  "qwen2.5-14b-1m": [],
+};
+
+/** Default effort per model (first entry in MODEL_EFFORTS, or undefined). */
+function getDefaultEffort(modelId: string): string | undefined {
+  const efforts = MODEL_EFFORTS[modelId];
+  if (!efforts || efforts.length === 0) return undefined;
+  // GLM/DeepSeek default to high; Kimi/MiMo default to high
+  return efforts.includes("high") ? "high" : efforts[0];
+}
+
+/** Built-in slash commands (mirrors codex-acp's CodexCommands). */
+const BUILTIN_COMMANDS = [
+  {
+    name: "ps",
+    description: "List background terminal processes.",
+    input: null,
+  },
+  {
+    name: "goal",
+    description: "Set a goal to keep pursuing.",
+    input: { hint: "[<objective>|clear|pause|resume]" },
+  },
+  {
+    name: "skills",
+    description: "List available skills.",
+    input: null,
+  },
+  {
+    name: "status",
+    description: "Display session configuration and token usage.",
+    input: null,
+  },
+];
+
+/** Per-session goal state. */
+const sessionGoals = new Map<string, { text: string; paused: boolean }>();
+
+/** Parse a slash command from prompt text. Returns null if not a command. */
+function parseSlashCommand(prompt: string): { name: string; rest: string } | null {
+  const trimmed = prompt.trim();
+  if (!trimmed.startsWith("/")) return null;
+  const commandText = trimmed.slice(1).trim();
+  if (!commandText) return null;
+  const [name, ...restParts] = commandText.split(/\s+/);
+  if (!name) return null;
+  return {
+    name: name.toLowerCase(),
+    rest: restParts.join(" ").trim(),
+  };
+}
+
+/** Check if a prompt is a read-only slash command (no LLM turn needed). */
+function isReadOnlyCommand(name: string): boolean {
+  return name === "ps" || name === "status" || name === "skills";
+}
+
 function buildConfigOptions(store: SessionStore, sessionId: string) {
-  const overrides = store.getConfigOverrides(sessionId);
-  return [
+  const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+  const currentModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+  const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+  const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+
+  // Get effort levels supported by the CURRENT model
+  const modelEfforts = MODEL_EFFORTS[currentModel] ?? [];
+  // If the stored effort is not supported by this model, fall back to default
+  const defaultEffort = getDefaultEffort(currentModel);
+  const currentEffort =
+    effortOverride && modelEfforts.includes(effortOverride)
+      ? effortOverride
+      : defaultEffort;
+
+  const configOptions: any[] = [
     {
-      id: "thought_level",
-      name: "Thinking Level",
+      id: "mode",
+      name: "Mode",
       type: "select" as const,
-      category: "thought_level",
-      description: "Control the depth of reasoning",
-      currentValue: (overrides.thought_level as string) ?? "medium",
-      options: [
-        { value: "low", name: "Low" },
-        { value: "medium", name: "Medium" },
-        { value: "high", name: "High" },
-        { value: "max", name: "Max" },
-      ],
+      category: "mode",
+      description: "Agent mode",
+      options: AVAILABLE_MODES.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.description,
+      })),
+      currentValue: currentMode,
+    },
+    {
+      id: "model",
+      name: "Model",
+      type: "select" as const,
+      category: "model",
+      description: "EricAI model (via ericai-proxy)",
+      options: PROXY_MODELS.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.id,
+      })),
+      currentValue: currentModel,
     },
   ];
+
+  // Only show effort picker if the model supports thinking
+  if (modelEfforts.length > 0) {
+    configOptions.push({
+      id: "effort",
+      name: "Effort",
+      type: "select" as const,
+      category: "effort",
+      description: "Thinking effort level",
+      options: modelEfforts.map((e) => ({
+        value: e,
+        name: ALL_EFFORT_LEVELS[e]?.name ?? e,
+        description: ALL_EFFORT_LEVELS[e]?.description ?? "",
+      })),
+      currentValue: currentEffort,
+    });
+  }
+
+  return configOptions;
 }
 
 export function createClaudeCodeAgent(
@@ -128,7 +267,7 @@ export function createClaudeCodeAgent(
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: {
           name: "claude-code-acp",
-          title: "Claude Code ACP Bridge",
+          title: "Claude Code",
           version: "0.1.0",
         },
         agentCapabilities: {
@@ -197,6 +336,7 @@ export function createClaudeCodeAgent(
         sessionId,
         modes: buildModeState(DEFAULT_MODE),
         configOptions: buildConfigOptions(store, sessionId),
+        availableCommands: BUILTIN_COMMANDS,
       } as NewSessionResponse;
     },
 
@@ -217,6 +357,7 @@ export function createClaudeCodeAgent(
       return {
         modes: buildModeState(currentMode),
         configOptions: buildConfigOptions(store, sessionId),
+        availableCommands: BUILTIN_COMMANDS,
       } as LoadSessionResponse;
     },
 
@@ -309,9 +450,192 @@ export function createClaudeCodeAgent(
         throw RequestError.invalidParams("Empty prompt text");
       }
 
+      // ── Slash command handling ──────────────────────────────────
+      // Intercept built-in commands (/ps, /goal, /skills, /status) before
+      // starting an LLM turn. Read-only commands (ps, status, skills) return
+      // immediately. /goal sets session state and may start a turn.
+      const command = parseSlashCommand(text);
+      if (command) {
+        const { name, rest } = command;
+
+        // /ps — list background processes (always empty for claude-code-acp,
+        // but vscode-acp expects the agent to handle it when not done client-side)
+        if (name === "ps") {
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "No background terminals running." },
+            } as any,
+          });
+          return { stopReason: "end_turn" };
+        }
+
+        // /status — show session info
+        if (name === "status") {
+          const cwd = store.getCwd(sessionId)!;
+          const configOverrides = store.getConfigOverrides(sessionId);
+          const currentModel = (configOverrides["model"] as string) || process.env.ANTHROPIC_MODEL || "glm-5.2";
+          const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+          const goal = sessionGoals.get(sessionId);
+          const lines = [
+            `**Model:** ${currentModel}`,
+            `**Mode:** ${currentMode}`,
+            `**Directory:** ${cwd}`,
+            `**Session:** \`${sessionId}\``,
+            goal ? `**Goal:** ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "**Goal:** none",
+          ];
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: lines.join("\n") },
+            } as any,
+          });
+          return { stopReason: "end_turn" };
+        }
+
+        // /skills — list available skills (from EriCLI skills system)
+        if (name === "skills") {
+          const { execSync } = await import("node:child_process");
+          let skillsList = "No skills configured.";
+          try {
+            const output = execSync("ericli skills list 2>/dev/null || echo ''", {
+              encoding: "utf-8",
+              timeout: 5000,
+            }).trim();
+            if (output) {
+              skillsList = `Available skills:\n${output}`;
+            }
+          } catch {
+            skillsList = "Skills system not available. Install ericli to list skills.";
+          }
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: skillsList },
+            } as any,
+          });
+          return { stopReason: "end_turn" };
+        }
+
+        // /goal — set/clear/pause/resume a persistent goal
+        if (name === "goal") {
+          const argument = rest.trim();
+          if (!argument) {
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: 'Command "/goal" requires [<objective>|clear|pause|resume].' },
+              } as any,
+            });
+            return { stopReason: "end_turn" };
+          }
+
+          const lowerArg = argument.toLowerCase();
+          if (lowerArg === "clear") {
+            sessionGoals.delete(sessionId);
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Goal cleared." },
+              } as any,
+            });
+            return { stopReason: "end_turn" };
+          }
+          if (lowerArg === "pause") {
+            const goal = sessionGoals.get(sessionId);
+            if (goal) {
+              goal.paused = true;
+              await connection.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
+                } as any,
+              });
+            } else {
+              await connection.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: "No goal to pause. Set one with /goal <objective>." },
+                } as any,
+              });
+            }
+            return { stopReason: "end_turn" };
+          }
+          if (lowerArg === "resume") {
+            const goal = sessionGoals.get(sessionId);
+            if (goal) {
+              goal.paused = false;
+              await connection.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
+                } as any,
+              });
+            } else {
+              await connection.sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: { type: "text", text: "No goal to resume. Set one with /goal <objective>." },
+                } as any,
+              });
+            }
+            return { stopReason: "end_turn" };
+          }
+
+          // Set a new goal
+          if (argument.length > 4000) {
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: 'Command "/goal" requires goal text of at most 4000 characters.' },
+              } as any,
+            });
+            return { stopReason: "end_turn" };
+          }
+          sessionGoals.set(sessionId, { text: argument, paused: false });
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
+            } as any,
+          });
+          return { stopReason: "end_turn" };
+        }
+      }
+
+      // If there's an active (non-paused) goal, prepend it to the prompt
+      const activeGoal = sessionGoals.get(sessionId);
+      let effectivePrompt = text;
+      if (activeGoal && !activeGoal.paused && !command) {
+        effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${text}`;
+      }
+
       const claudeSessionId = store.getClaudeSessionId(sessionId);
       const cwd = store.getCwd(sessionId)!;
       let toolCallCounter = 0;
+
+      // Get model and effort overrides from session config (set via pickers)
+      const configOverrides = store.getConfigOverrides(sessionId);
+      const modelOverride = configOverrides["model"] as string | undefined;
+      const effortOverride = configOverrides["effort"] as string | undefined;
+      // Only pass effort if the selected model actually supports it
+      const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+      const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
+      const effectiveEffort =
+        effortOverride && modelEfforts.includes(effortOverride)
+          ? effortOverride
+          : undefined;
 
       logger.info(`Prompt for session ${sessionId}: ${text.length} chars`);
       logger.debug(
@@ -437,9 +761,11 @@ export function createClaudeCodeAgent(
           try {
             result = await runner.continueSessionStreaming(
               claudeSessionId,
-              text,
+              effectivePrompt,
               onEvent,
-              sessionId
+              sessionId,
+              modelOverride,
+              effectiveEffort
             );
           } catch (resumeErr) {
             // Resume failed (expired session, etc.) — fall back to new session
@@ -449,9 +775,11 @@ export function createClaudeCodeAgent(
             store.clearPersistedSession(cwd);
             result = await runner.startSessionStreaming(
               cwd,
-              text,
+              effectivePrompt,
               onEvent,
-              sessionId
+              sessionId,
+              modelOverride,
+              effectiveEffort
             );
             store.setClaudeSessionId(sessionId, result.sessionId);
           }
@@ -468,9 +796,11 @@ export function createClaudeCodeAgent(
           } else {
             result = await runner.startSessionStreaming(
               cwd,
-              text,
+              effectivePrompt,
               onEvent,
-              sessionId
+              sessionId,
+              modelOverride,
+              effectiveEffort
             );
           }
           store.setClaudeSessionId(sessionId, result.sessionId);
@@ -513,11 +843,17 @@ export function createClaudeCodeAgent(
             permissionPromises.length = 0;
             logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
             try {
+              // Prepend goal to steer messages too
+              const steerPrompt = activeGoal && !activeGoal.paused
+                ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
+                : steerText;
               await runner.continueSessionStreaming(
                 claudeSid,
-                steerText,
+                steerPrompt,
                 onEvent,
-                sessionId
+                sessionId,
+                modelOverride,
+                effectiveEffort
               );
               await Promise.all(permissionPromises);
             } catch (steerErr) {
