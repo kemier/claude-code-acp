@@ -1089,26 +1089,33 @@ export function createClaudeCodeAgent(
             // Best effort
           });
         }
-      // Handle result event — capture usage for prompt response and usage_update
-       if (event.type === "result" && event.usage) {
-         lastUsage = event.usage;
-         const inputTokens = event.usage.input_tokens ?? 0;
-         const outputTokens = event.usage.output_tokens ?? 0;
-         const total = inputTokens + outputTokens;
-          // Resolve context window for the current model (dynamic from proxy).
-          const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-          const contextWindow = getContextWindowForModel(effectiveModel);
-          // Store for auto-compact check after the turn finishes.
-          sessionLastUsage.set(sessionId, { input_tokens: inputTokens, output_tokens: outputTokens });
-         connection.sessionUpdate({
-           sessionId,
-           update: {
-             sessionUpdate: "usage_update",
-             used: total,
-             size: contextWindow,
-           } as any,
-         });
-        }
+      // Handle message_delta — this carries the PER-CALL usage from vLLM
+      // (the real current context size). The result event's usage is
+      // CUMULATIVE across all API calls in the turn, which inflates the
+      // usage UI (e.g. 10 calls × 40k = 400k reported, showing 300%+).
+      // We prefer message_delta for accurate context usage tracking.
+      if (event.type === "message_delta" && event.usage) {
+        const inputTokens = event.usage.input_tokens ?? 0;
+        const outputTokens = event.usage.output_tokens ?? 0;
+        const total = inputTokens + outputTokens;
+        const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+        const contextWindow = getContextWindowForModel(effectiveModel);
+        // Store per-call usage (not cumulative) for auto-compact check.
+        sessionLastUsage.set(sessionId, { input_tokens: inputTokens, output_tokens: outputTokens });
+        connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: total,
+            size: contextWindow,
+          } as any,
+        });
+      }
+      // Handle result event — capture usage as fallback (for the prompt
+      // response), but DON'T use it for usage_update since it's cumulative.
+      if (event.type === "result" && event.usage) {
+        lastUsage = event.usage;
+      }
         if ((event as any).type === "thinking" && (event as any).text) {
           connection.sessionUpdate({
             sessionId,

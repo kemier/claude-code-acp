@@ -21,7 +21,7 @@ export interface ClaudeResult {
 }
 
 export interface StreamEvent {
-  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init";
+  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta";
  text?: string;
  toolName?: string;
  toolInput?: unknown;
@@ -413,6 +413,19 @@ export class ClaudeRunner {
       parsed.delta?.type === "thinking_delta"
     ) {
       onEvent({ type: "thinking", text: parsed.delta.thinking });
+      return;
+    }
+
+    // Handle message_delta — carries per-call usage (the REAL current
+    // context size), unlike the result event which has cumulative usage.
+    if (parsed.type === "message_delta" && parsed.usage) {
+      onEvent({
+        type: "message_delta",
+        usage: {
+          input_tokens: parsed.usage.input_tokens ?? parsed.usage.inputTokens,
+          output_tokens: parsed.usage.output_tokens ?? parsed.usage.outputTokens,
+        },
+      });
       return;
     }
 
