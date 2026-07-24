@@ -1193,27 +1193,25 @@ export function createClaudeCodeAgent(
      // cannot get per-call usage from the stream. The result event is our
      // only source.
      //
-     // Strategy:
-     // - For the UI: use our real-time estimate (ctxEstimator), which is more
-     //   accurate than the cumulative result value. Cap at contextWindow.
-     // - For auto-compact: use the cumulative input_tokens from the result
-     //   event. It triggers compaction earlier on multi-call turns, which is
-     //   a safe safety net (better to compact too early than to overflow).
-     //   Also check the estimate — whichever is higher triggers compaction.
+    // Strategy:
+    // - For the UI: use our real-time estimate (ctxEstimator), which is more
+    //   accurate than the cumulative result value. Cap at contextWindow.
+     // - For auto-compact: use ONLY our estimate. The cumulative result
+     //   value (sum of all API calls) is inflated on multi-call turns and
+     //   triggers compaction way too early (e.g. 340k for a 27k context).
+     //   Our estimate tracks actual conversation growth and is accurate.
      if (event.type === "result" && event.usage) {
-       lastUsage = event.usage;
-       const inputTokens = event.usage.input_tokens ?? 0;
-       const outputTokens = event.usage.output_tokens ?? 0;
-       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-       const contextWindow = getContextWindowForModel(effectiveModel);
-       // For auto-compact: use the higher of cumulative result usage or our
-       // estimate, so compaction triggers as a safety net.
-       const estimatedTokens = ctxEstimator.getEstimatedTokens();
-       const autoCompactInput = Math.max(inputTokens, estimatedTokens);
-       sessionLastUsage.set(sessionId, { input_tokens: autoCompactInput, output_tokens: outputTokens });
-       // For the UI: use our real-time estimate (more accurate than cumulative).
-       // Cap at contextWindow so it never shows >100%.
-       const cappedUsed = Math.min(estimatedTokens, contextWindow);
+      lastUsage = event.usage;
+      const inputTokens = event.usage.input_tokens ?? 0;
+      const outputTokens = event.usage.output_tokens ?? 0;
+      const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+      const contextWindow = getContextWindowForModel(effectiveModel);
+      // For auto-compact: use ONLY our estimate (not the cumulative result value).
+      const estimatedTokens = ctxEstimator.getEstimatedTokens();
+      sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: outputTokens });
+      // For the UI: use our real-time estimate (more accurate than cumulative).
+      // Cap at contextWindow so it never shows >100%.
+      const cappedUsed = Math.min(estimatedTokens, contextWindow);
        connection.sessionUpdate({
          sessionId,
          update: {
