@@ -1089,32 +1089,45 @@ export function createClaudeCodeAgent(
             // Best effort
           });
         }
-      // Handle message_delta — this carries the PER-CALL usage from vLLM
-      // (the real current context size). The result event's usage is
-      // CUMULATIVE across all API calls in the turn, which inflates the
-      // usage UI (e.g. 10 calls × 40k = 400k reported, showing 300%+).
-      // We prefer message_delta for accurate context usage tracking.
-      if (event.type === "message_delta" && event.usage) {
+      // Handle result event — Claude CLI reports CUMULATIVE usage across all
+      // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
+      // single-call turn, input_tokens = real context size (accurate). For a
+      // multi-call turn (tool calls), input_tokens = sum of all calls' input
+      // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
+      // but real context is ~20k).
+      //
+      // Claude CLI does NOT forward message_delta events to stdout in
+      // stream-json mode (includePartialMessages defaults to false), so we
+      // cannot get per-call usage from the stream. The result event is our
+      // only source.
+      //
+      // Strategy: use input_tokens from the result event for usage_update,
+      // capped at contextWindow so the UI never shows >100%. For
+      // auto-compact, use the raw cumulative value — it triggers compaction
+      // earlier on multi-call turns, which is a safe safety net (better to
+      // compact too early than to overflow the context window).
+      if (event.type === "result" && event.usage) {
+        lastUsage = event.usage;
         const inputTokens = event.usage.input_tokens ?? 0;
         const outputTokens = event.usage.output_tokens ?? 0;
-        const total = inputTokens + outputTokens;
         const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
         const contextWindow = getContextWindowForModel(effectiveModel);
-        // Store per-call usage (not cumulative) for auto-compact check.
+        // Store cumulative usage for auto-compact check.
         sessionLastUsage.set(sessionId, { input_tokens: inputTokens, output_tokens: outputTokens });
+        // For the UI: cap used at contextWindow so it never shows >100%.
+        // Use input_tokens as the context usage metric (this is vLLM's
+        // prompt_tokens = the actual context size sent to the model).
+        const cappedUsed = Math.min(inputTokens, contextWindow);
         connection.sessionUpdate({
           sessionId,
           update: {
             sessionUpdate: "usage_update",
-            used: total,
+            used: cappedUsed,
             size: contextWindow,
           } as any,
+        }).catch(() => {
+          // Best effort — don't fail the turn if usage_update fails.
         });
-      }
-      // Handle result event — capture usage as fallback (for the prompt
-      // response), but DON'T use it for usage_update since it's cumulative.
-      if (event.type === "result" && event.usage) {
-        lastUsage = event.usage;
       }
         if ((event as any).type === "thinking" && (event as any).text) {
           connection.sessionUpdate({

@@ -416,9 +416,14 @@ export class ClaudeRunner {
       return;
     }
 
-    // Handle message_delta — carries per-call usage (the REAL current
-    // context size), unlike the result event which has cumulative usage.
-    if (parsed.type === "message_delta" && parsed.usage) {
+   // Handle message_delta — carries per-call usage (the REAL current
+   // context size), unlike the result event which has cumulative usage.
+   if (parsed.type === "message_delta" && parsed.usage) {
+      // NOTE: Claude CLI does NOT forward message_delta events to stdout in
+      // stream-json mode (includePartialMessages defaults to false in
+      // QueryEngine.ts). This handler exists for future-proofing but will
+      // never fire with current Claude CLI versions. Usage tracking relies on
+      // the result event instead (see agent.ts).
       onEvent({
         type: "message_delta",
         usage: {
