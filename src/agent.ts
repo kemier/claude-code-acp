@@ -37,12 +37,19 @@ function generateSessionId(): string {
 }
 
 const AVAILABLE_MODES = [
-  { id: "code", name: "Code", description: "Write and edit code" },
-  { id: "ask", name: "Ask", description: "Ask questions without making changes" },
-  { id: "architect", name: "Architect", description: "Plan and design architecture" },
+  { id: "read-only", name: "Read-only", description: "Requires approval to edit files and run commands." },
+  { id: "agent", name: "Agent", description: "Read and edit files, and run commands." },
+  { id: "agent-full-access", name: "Agent (full access)", description: "Edit files outside workspace and run commands with network access." },
 ];
 
-const DEFAULT_MODE = "code";
+const DEFAULT_MODE = "agent";
+
+// ─── Collaboration mode (Default / Plan) ───────────────────────────────────
+const COLLABORATION_MODE_CONFIG_ID = "collaboration_mode";
+const DEFAULT_COLLABORATION_MODE = "default";
+const PLAN_COLLABORATION_MODE = "plan";
+
+const sessionCollaborationModes = new Map<string, string>();
 
 function buildModeState(currentModeId: string) {
   return {
@@ -157,12 +164,13 @@ function isReadOnlyCommand(name: string): boolean {
 }
 
 function buildConfigOptions(store: SessionStore, sessionId: string) {
-  const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-  const currentModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-  const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
-  const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+ const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+ const currentModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+ const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+ const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+  const currentCollabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
 
-  // Get effort levels supported by the CURRENT model
+ // Get effort levels supported by the CURRENT model
   const modelEfforts = MODEL_EFFORTS[currentModel] ?? [];
   // If the stored effort is not supported by this model, fall back to default
   const defaultEffort = getDefaultEffort(currentModel);
@@ -171,34 +179,46 @@ function buildConfigOptions(store: SessionStore, sessionId: string) {
       ? effortOverride
       : defaultEffort;
 
-  const configOptions: any[] = [
+ const configOptions: any[] = [
+   {
+     id: "mode",
+     name: "Mode",
+     type: "select" as const,
+     category: "mode",
+      description: "Approval and sandboxing preset for the session",
+     options: AVAILABLE_MODES.map((m) => ({
+       value: m.id,
+       name: m.name,
+       description: m.description,
+     })),
+     currentValue: currentMode,
+   },
     {
-      id: "mode",
-      name: "Mode",
+      id: COLLABORATION_MODE_CONFIG_ID,
+      name: "Collaboration mode",
       type: "select" as const,
-      category: "mode",
-      description: "Agent mode",
-      options: AVAILABLE_MODES.map((m) => ({
-        value: m.id,
-        name: m.name,
-        description: m.description,
-      })),
-      currentValue: currentMode,
+      category: "collaboration_mode",
+      description: "How the agent collaborates for subsequent turns",
+      options: [
+        { value: DEFAULT_COLLABORATION_MODE, name: "Default" },
+        { value: PLAN_COLLABORATION_MODE, name: "Plan", description: "Plan before making changes" },
+      ],
+      currentValue: currentCollabMode,
     },
-    {
-      id: "model",
-      name: "Model",
-      type: "select" as const,
-      category: "model",
-      description: "EricAI model (via ericai-proxy)",
-      options: PROXY_MODELS.map((m) => ({
-        value: m.id,
-        name: m.name,
-        description: m.id,
-      })),
-      currentValue: currentModel,
-    },
-  ];
+   {
+     id: "model",
+     name: "Model",
+     type: "select" as const,
+     category: "model",
+     description: "EricAI model (via ericai-proxy)",
+     options: PROXY_MODELS.map((m) => ({
+       value: m.id,
+       name: m.name,
+       description: m.id,
+     })),
+     currentValue: currentModel,
+   },
+ ];
 
   // Only show effort picker if the model supports thinking
   if (modelEfforts.length > 0) {
@@ -432,11 +452,18 @@ export function createClaudeCodeAgent(
       }
 
       const value = (params as any).value;
-      store.setConfigOverride(sessionId, configId, value);
-      logger.info(`Session ${sessionId} config ${configId} set to ${value}`);
 
-      // Send config_option_update notification
-      const configOptions = buildConfigOptions(store, sessionId);
+      // Handle collaboration_mode specially (stored in separate map)
+      if (configId === COLLABORATION_MODE_CONFIG_ID) {
+        sessionCollaborationModes.set(sessionId, value);
+        logger.info(`Session ${sessionId} collaboration_mode set to ${value}`);
+      } else {
+        store.setConfigOverride(sessionId, configId, value);
+        logger.info(`Session ${sessionId} config ${configId} set to ${value}`);
+      }
+
+     // Send config_option_update notification
+     const configOptions = buildConfigOptions(store, sessionId);
       await connection.sessionUpdate({
         sessionId,
         update: {
@@ -791,14 +818,20 @@ export function createClaudeCodeAgent(
       }
 
       // If there's an active (non-paused) goal, prepend it to the prompt.
-      // goalPrompt is set when /goal just set a new objective — use it directly.
-      // For subsequent prompts, prepend the goal as context.
-      const activeGoal = sessionGoals.get(sessionId);
-      let effectivePrompt = text;
-      if (goalPrompt) {
-        effectivePrompt = goalPrompt;
-      } else if (activeGoal && !activeGoal.paused && !command) {
-        effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${text}`;
+     // goalPrompt is set when /goal just set a new objective — use it directly.
+     // For subsequent prompts, prepend the goal as context.
+     const activeGoal = sessionGoals.get(sessionId);
+     let effectivePrompt = text;
+     if (goalPrompt) {
+       effectivePrompt = goalPrompt;
+     } else if (activeGoal && !activeGoal.paused && !command) {
+       effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${text}`;
+     }
+
+      // Inject collaboration mode (plan mode) instructions
+      const collabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
+      if (collabMode === PLAN_COLLABORATION_MODE) {
+        effectivePrompt = `<collaboration_mode># Collaboration Mode: Plan\n\nYou are now in Plan mode. Any previous instructions for other modes (e.g. Default mode) are no longer active.\n\nYour active mode changes only when new developer instructions with a different \`<collaboration_mode>...</collaboration_mode>\` change it; user requests or tool descriptions do not change mode by themselves.\n\nIn Plan mode, you MUST NOT make any changes to the codebase. Instead, analyze the request, investigate the codebase, and produce a detailed plan. Do not execute commands that modify files. Read-only investigation (searching, reading files, running read-only commands) is allowed.\n</collaboration_mode>\n\n${effectivePrompt}`;
       }
 
       const claudeSessionId = store.getClaudeSessionId(sessionId);
