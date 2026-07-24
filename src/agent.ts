@@ -122,6 +122,16 @@ const BUILTIN_COMMANDS = [
     description: "Display session configuration and token usage.",
     input: null,
   },
+  {
+    name: "clear",
+    description: "Clear conversation history and start fresh.",
+    input: null,
+  },
+  {
+    name: "compact",
+    description: "Summarize conversation to reduce context usage.",
+    input: null,
+  },
 ];
 
 /** Per-session goal state. */
@@ -469,8 +479,11 @@ export function createClaudeCodeAgent(
       // ── Slash command handling ──────────────────────────────────
       // Intercept built-in commands (/ps, /goal, /skills, /status) before
       // starting an LLM turn. Read-only commands (ps, status, skills) return
-      // immediately. /goal sets session state and may start a turn.
+      // immediately. /goal sets session state and starts a turn.
       const command = parseSlashCommand(text);
+      // When /goal sets a new objective, this holds the prompt to send
+      // to the LLM to start working on it immediately.
+      let goalPrompt: string | null = null;
       if (command) {
         const { name, rest } = command;
 
@@ -484,6 +497,94 @@ export function createClaudeCodeAgent(
               content: { type: "text", text: "No background terminals running." },
             } as any,
           });
+          return { stopReason: "end_turn" };
+        }
+
+        // /clear — clear conversation history and start fresh.
+        // Claude Code doesn't have a --clear flag, so we drop the persisted
+        // Claude session ID. The next prompt will start a brand new session
+        // instead of --resume-ing into the old one.
+        if (name === "clear") {
+          const cwd = store.getCwd(sessionId)!;
+          store.clearPersistedSession(cwd);
+          // Also clear the in-memory claude session ID
+          store.setClaudeSessionId(sessionId, "");
+          // Clear any active goal too
+          sessionGoals.delete(sessionId);
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Conversation cleared. Starting fresh." },
+            } as any,
+          });
+          return { stopReason: "end_turn" };
+        }
+
+        // /compact — summarize the conversation to reduce context.
+        // Claude Code CLI doesn't expose a compact API, so we ask the LLM
+        // to summarize the conversation so far, then clear the old session
+        // and start fresh with the summary as the first message.
+        if (name === "compact") {
+          const claudeSid = store.getClaudeSessionId(sessionId);
+          if (!claudeSid) {
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "No conversation to compact yet." },
+              } as any,
+            });
+            return { stopReason: "end_turn" };
+          }
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Compacting conversation..." },
+            } as any,
+          });
+          // Ask the LLM to produce a concise summary of the conversation
+          const compactPrompt = "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context.";
+          try {
+            const result = await runner.continueSessionStreaming(
+              claudeSid,
+              compactPrompt,
+              () => {}, // no streaming events for compact
+              sessionId,
+              undefined,
+              undefined
+            );
+            // Now clear the old session and start fresh with the summary
+            const cwd = store.getCwd(sessionId)!;
+            store.clearPersistedSession(cwd);
+            store.setClaudeSessionId(sessionId, "");
+            // Start a new session with the summary as context
+            const newResult = await runner.startSessionStreaming(
+              cwd,
+              `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
+              () => {},
+              sessionId,
+              undefined,
+              undefined
+            );
+            store.setClaudeSessionId(sessionId, newResult.sessionId);
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Conversation compacted successfully." },
+              } as any,
+            });
+          } catch (compactErr) {
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: `Compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}` },
+              } as any,
+            });
+          }
           return { stopReason: "end_turn" };
         }
 
@@ -511,21 +612,77 @@ export function createClaudeCodeAgent(
           return { stopReason: "end_turn" };
         }
 
-        // /skills — list available skills (from EriCLI skills system)
+        // /skills — list available Claude Code skills.
+        // Scans: ~/.claude/skills/, <cwd>/.agents/skills/, and parent
+        // workspace .agents/skills/ directories (mirrors codex-acp skill
+        // discovery which checks .agents/skills subdirectories).
         if (name === "skills") {
-          const { execSync } = await import("node:child_process");
-          let skillsList = "No skills configured.";
-          try {
-            const output = execSync("ericli skills list 2>/dev/null || echo ''", {
-              encoding: "utf-8",
-              timeout: 5000,
-            }).trim();
-            if (output) {
-              skillsList = `Available skills:\n${output}`;
+          const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+          const { join: joinPath, dirname } = await import("node:path");
+          const { homedir } = await import("node:os");
+
+          const cwd = store.getCwd(sessionId)!;
+          const skillsMap = new Map<string, { description: string; source: string }>();
+
+          const scanSkillsDir = (skillsDir: string, source: string) => {
+            if (!existsSync(skillsDir)) return;
+            let entries;
+            try {
+              entries = readdirSync(skillsDir, { withFileTypes: true });
+            } catch {
+              return;
             }
-          } catch {
-            skillsList = "Skills system not available. Install ericli to list skills.";
+            for (const entry of entries) {
+              if (!entry.isDirectory()) continue;
+              const skillFile = joinPath(skillsDir, entry.name, "SKILL.md");
+              let description = "";
+              if (existsSync(skillFile)) {
+                try {
+                  const content = readFileSync(skillFile, "utf-8");
+                  const descMatch = content.match(/^description:\s*(.+)$/m);
+                  if (descMatch) {
+                    description = descMatch[1].trim().replace(/^[\'"]|[\'"]$/g, "");
+                  } else {
+                    const headingMatch = content.match(/^#\s+(.+)$/m);
+                    if (headingMatch) description = headingMatch[1].trim();
+                  }
+                } catch {
+                  // skip unreadable
+                }
+              }
+              if (!skillsMap.has(entry.name)) {
+                skillsMap.set(entry.name, { description, source });
+              }
+            }
+          };
+
+          // 1. Global skills: ~/.claude/skills/
+          scanSkillsDir(joinPath(homedir(), ".claude", "skills"), "global");
+
+          // 2. Project-level skills: <cwd>/.agents/skills/
+          scanSkillsDir(joinPath(cwd, ".agents", "skills"), "project");
+
+          // 3. Walk up from cwd to find parent .agents/skills/
+          let dir = cwd;
+          for (let i = 0; i < 10; i++) {
+            const parent = dirname(dir);
+            if (parent === dir) break;
+            scanSkillsDir(joinPath(parent, ".agents", "skills"), "workspace");
+            dir = parent;
           }
+
+          let skillsList: string;
+          if (skillsMap.size === 0) {
+            skillsList = "No skills configured.\n\nSkills are loaded from:\n- ~/.claude/skills/\n- <project>/.agents/skills/\n- <workspace>/.agents/skills/";
+          } else {
+            const lines: string[] = ["Available skills:\n"];
+            for (const [sname, info] of skillsMap) {
+              const desc = info.description ? `: ${info.description}` : "";
+              lines.push(`- /${sname}${desc}`);
+            }
+            skillsList = lines.join("\n");
+          }
+
           await connection.sessionUpdate({
             sessionId,
             update: {
@@ -607,7 +764,7 @@ export function createClaudeCodeAgent(
             return { stopReason: "end_turn" };
           }
 
-          // Set a new goal
+          // Set a new goal — store it and immediately start working toward it
           if (argument.length > 4000) {
             await connection.sessionUpdate({
               sessionId,
@@ -626,14 +783,21 @@ export function createClaudeCodeAgent(
               content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
             } as any,
           });
-          return { stopReason: "end_turn" };
+          // Fall through to start an actual LLM turn pursuing the goal.
+          // Mirrors codex-acp's setGoal which calls runGoalSet() to start
+          // an actual turn. We set goalPrompt so the LLM turn uses it.
+          goalPrompt = `Please start working toward this goal now:\n\n${argument}`;
         }
       }
 
-      // If there's an active (non-paused) goal, prepend it to the prompt
+      // If there's an active (non-paused) goal, prepend it to the prompt.
+      // goalPrompt is set when /goal just set a new objective — use it directly.
+      // For subsequent prompts, prepend the goal as context.
       const activeGoal = sessionGoals.get(sessionId);
       let effectivePrompt = text;
-      if (activeGoal && !activeGoal.paused && !command) {
+      if (goalPrompt) {
+        effectivePrompt = goalPrompt;
+      } else if (activeGoal && !activeGoal.paused && !command) {
         effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${text}`;
       }
 
