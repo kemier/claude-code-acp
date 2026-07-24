@@ -86,7 +86,7 @@ export function createClaudeCodeAgent(
    * finishes. The user_message_chunk is emitted immediately so the IDE
    * shows the steering message as a user bubble (visual context).
    *
-   * Custom ACP extension: `_ericli/session/steer`.
+   * Custom ACP extension: `session/steer`.
    */
   async function handleSteer(params: { sessionId: string; text: string }): Promise<void> {
     const { sessionId, text } = params;
@@ -572,10 +572,10 @@ export function createClaudeCodeAgent(
     /**
      * Handle custom (non-standard) ACP notifications.
      * The SDK's AgentSideConnection dispatches unknown notification methods here.
-     * Used for _ericli/session/steer.
+     * Used for session/steer.
      */
     async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
-      if (method === "_ericli/session/steer") {
+      if (method === "session/steer") {
         return handleSteer(params as { sessionId: string; text: string });
       }
       logger.warn(`Unknown notification method: ${method}`);
