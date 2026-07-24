@@ -217,6 +217,10 @@ export class ClaudeRunner {
     }
   }
 
+  isRunning(trackingId: string): boolean {
+    return this.runningProcesses.has(trackingId);
+  }
+
   private runJson(
     args: string[],
     cwd?: string

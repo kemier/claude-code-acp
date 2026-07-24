@@ -77,6 +77,47 @@ export function createClaudeCodeAgent(
   const store = new SessionStore();
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
+  const steerQueues = new Map<string, string[]>();
+
+  /**
+   * Steering notification — injects a user message into the active turn.
+   * Claude CLI doesn't support mid-turn injection, so we queue the message
+   * and send it as a follow-up --resume prompt when the current process
+   * finishes. The user_message_chunk is emitted immediately so the IDE
+   * shows the steering message as a user bubble (visual context).
+   *
+   * Custom ACP extension: `_ericli/session/steer`.
+   */
+  async function handleSteer(params: { sessionId: string; text: string }): Promise<void> {
+    const { sessionId, text } = params;
+    if (!store.has(sessionId)) {
+      logger.warn(`Steer request for unknown session ${sessionId}`);
+      return;
+    }
+    if (!runner.isRunning(sessionId)) {
+      logger.info(`Steer request for idle session ${sessionId} — ignoring (no active turn)`);
+      return;
+    }
+    // Queue the message for delivery after the current turn finishes.
+    if (!steerQueues.has(sessionId)) {
+      steerQueues.set(sessionId, []);
+    }
+    steerQueues.get(sessionId)!.push(text);
+    logger.info(`Steer queued for session ${sessionId}: ${text.length} chars`);
+    // Emit a user_message_chunk so the IDE shows the steering message
+    // as a user bubble in the chat (visual context).
+    try {
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "user_message_chunk",
+          content: { type: "text", text },
+        } as any,
+      });
+    } catch {
+      // ignore — best effort visual feedback
+    }
+  }
 
   return {
     async initialize(
@@ -455,7 +496,44 @@ export function createClaudeCodeAgent(
           } as any,
         });
 
-        logger.info(`Prompt completed for session ${sessionId}`);
+       logger.info(`Prompt completed for session ${sessionId}`);
+
+        // Drain steering queue — send each queued steer message as a
+        // follow-up --resume prompt. Claude CLI doesn't support mid-turn
+        // injection, so steered messages are delivered sequentially after
+        // the current turn finishes.
+        const steerQueue = steerQueues.get(sessionId);
+        if (steerQueue && steerQueue.length > 0) {
+          steerQueues.delete(sessionId);
+          for (const steerText of steerQueue) {
+            if (cancelledSessions.has(sessionId)) break;
+            const claudeSid = store.getClaudeSessionId(sessionId);
+            if (!claudeSid) break;
+            toolCallCounter = 0;
+            permissionPromises.length = 0;
+            logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
+            try {
+              await runner.continueSessionStreaming(
+                claudeSid,
+                steerText,
+                onEvent,
+                sessionId
+              );
+              await Promise.all(permissionPromises);
+            } catch (steerErr) {
+              logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
+            }
+          }
+          store.touch(sessionId);
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "session_info_update",
+              updatedAt: store.getUpdatedAt(sessionId),
+            } as any,
+          });
+        }
+
         return { stopReason: "end_turn" };
       } catch (err) {
         // Check if cancelled
@@ -489,6 +567,18 @@ export function createClaudeCodeAgent(
       logger.info(`Cancel request for session ${params.sessionId}`);
       cancelledSessions.add(params.sessionId);
       runner.cancel(params.sessionId);
+    },
+
+    /**
+     * Handle custom (non-standard) ACP notifications.
+     * The SDK's AgentSideConnection dispatches unknown notification methods here.
+     * Used for _ericli/session/steer.
+     */
+    async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
+      if (method === "_ericli/session/steer") {
+        return handleSteer(params as { sessionId: string; text: string });
+      }
+      logger.warn(`Unknown notification method: ${method}`);
     },
   };
 }
