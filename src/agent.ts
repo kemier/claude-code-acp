@@ -1477,16 +1477,48 @@ export function createClaudeCodeAgent(
                 content: { type: "text", text: "*Context compacted to fit the model's context window.*\n\n" },
               } as any,
             });
-            await doCompact(
-              sessionId,
-              connection,
-              runner,
-              store,
-              modelOverride,
-              effectiveEffort,
-              false, // don't announce "Compacting..." — we already emitted the notice above
-            );
-          }
+           await doCompact(
+             sessionId,
+             connection,
+             runner,
+             store,
+             modelOverride,
+             effectiveEffort,
+             false, // don't announce "Compacting..." — we already emitted the notice above
+           );
+           // After compaction, re-send the original user prompt so the LLM
+           // continues the task in the fresh (compacted) session. This matches
+           // Codex behavior where compaction is transparent to the user — the
+           // task continues automatically after context is compressed.
+           logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
+           const claudeSid = store.getClaudeSessionId(sessionId);
+           if (claudeSid) {
+             const continueResult = await runner.continueSessionStreaming(
+               claudeSid,
+               effectivePrompt,
+               onEvent,
+               sessionId,
+               modelOverride,
+               effectiveEffort,
+             );
+             store.setClaudeSessionId(sessionId, continueResult.sessionId);
+             await Promise.all(permissionPromises);
+             // Update usage after continuation
+             const contEstimate = ctxEstimator.getEstimatedTokens();
+             const contContextWindow = getContextWindowForModel(
+               modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id,
+             );
+             sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
+             await connection.sessionUpdate({
+               sessionId,
+               update: {
+                 sessionUpdate: "usage_update",
+                 used: Math.min(contEstimate, contContextWindow),
+                 size: contContextWindow,
+               } as any,
+             }).catch(() => {});
+           }
+         }
         }
 
         return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
