@@ -3,10 +3,11 @@ import {
   AgentSideConnection,
   ndJsonStream,
 } from "@agentclientprotocol/sdk";
-import { createClaudeCodeAgent } from "./agent.js";
+import { createClaudeCodeAgent, loadModelContextWindows } from "./agent.js";
 import { logger } from "./logger.js";
 
 export { createClaudeCodeAgent } from "./agent.js";
+export { loadModelContextWindows } from "./agent.js";
 export { ClaudeRunner } from "./claude-runner.js";
 export { SessionStore } from "./session-store.js";
 export type { SessionInfo } from "./session-store.js";
@@ -27,6 +28,10 @@ export function startAgent(): AgentSideConnection {
   );
 
   logger.info("Agent started, waiting for connections on stdio...");
+
+  // Fetch per-model context windows from ericai-proxy /v1/models.
+  // Non-blocking — falls back to 200k default if the proxy is unreachable.
+  loadModelContextWindows().catch(() => {});
 
   connection.closed.then(() => {
     logger.info("Connection closed.");

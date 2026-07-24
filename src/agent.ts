@@ -144,6 +144,86 @@ const BUILTIN_COMMANDS = [
 /** Per-session goal state. */
 const sessionGoals = new Map<string, { text: string; paused: boolean }>();
 
+// ─── Context window resolution ──────────────────────────────────────────────
+// Default context window used when the proxy doesn't report one for a model.
+const DEFAULT_CONTEXT_WINDOW = 200_000;
+
+// Cached map of model-id → context_length, fetched once from the proxy's
+// /v1/models endpoint at startup. Falls back to DEFAULT_CONTEXT_WINDOW.
+const modelContextWindows = new Map<string, number>();
+let modelContextWindowsLoaded = false;
+
+/**
+ * The proxy URL for direct /v1/models queries.
+ * Claude CLI itself routes through ANTHROPIC_BASE_URL (a CCR gateway),
+ * so we derive the direct proxy URL from ERICAI_PROXY_URL, falling back
+ * to the default port 8317.
+ */
+function getProxyBaseUrl(): string {
+  return (
+    process.env.ERICAI_PROXY_URL ||
+    process.env.ERICAI_PROXY_BASE_URL ||
+    "http://127.0.0.1:8317"
+  );
+}
+
+/**
+ * Fetch /v1/models from the proxy and populate modelContextWindows.
+ * Called once at module load; safe to call again to refresh.
+ */
+export async function loadModelContextWindows(): Promise<void> {
+  if (modelContextWindowsLoaded) return;
+  modelContextWindowsLoaded = true; // set early to avoid concurrent fetches
+  try {
+    const url = `${getProxyBaseUrl()}/v1/models`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) {
+      logger.warn(`Failed to fetch /v1/models from proxy (${resp.status}): ${url}`);
+      return;
+    }
+    const body = await resp.json() as { data?: Array<{ id: string; context_length?: number }> };
+    if (body.data) {
+      for (const m of body.data) {
+        if (typeof m.context_length === "number" && m.context_length > 0) {
+          modelContextWindows.set(m.id, m.context_length);
+        }
+      }
+      logger.info(`Loaded ${modelContextWindows.size} model context windows from proxy`);
+    }
+  } catch (err) {
+    logger.warn(`Could not load model context windows from proxy: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+/**
+ * Resolve the context window (in tokens) for a given model.
+ * Uses the cached proxy data; falls back to DEFAULT_CONTEXT_WINDOW.
+ */
+function getContextWindowForModel(modelId: string | undefined): number {
+  if (modelId && modelContextWindows.has(modelId)) {
+    return modelContextWindows.get(modelId)!;
+  }
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+/**
+ * Auto-compact threshold = context_window * 9 / 10 (90%), mirroring Codex.
+ */
+function getAutoCompactThreshold(modelId: string | undefined): number {
+  return Math.floor((getContextWindowForModel(modelId) * 9) / 10);
+}
+
+// ─── Auto-compact ───────────────────────────────────────────────────────────
+// Mirrors Codex core's auto-compact: trigger compaction when token usage
+// reaches 90% of the context window (context_window * 9 / 10).
+// Codex checks after each API response mid-turn; Claude CLI manages turns
+// internally, so we check between turns — after the prompt finishes but
+// before the next user prompt is processed. The compaction replaces the
+// old Claude session with a fresh one seeded with a summary.
+// Track the last reported usage per session so the auto-compact check
+// can run after the turn finishes.
+const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
+
 /** Parse a slash command from prompt text. Returns null if not a command. */
 function parseSlashCommand(prompt: string): { name: string; rest: string } | null {
   const trimmed = prompt.trim();
@@ -287,6 +367,100 @@ export function createClaudeCodeAgent(
       // ignore — best effort visual feedback
     }
   }
+
+  /**
+   * Reusable compaction flow — used by both the /compact slash command
+   * and the auto-compact trigger. Asks the LLM to summarize the current
+   * conversation, then replaces the old Claude session with a fresh one
+   * seeded with the summary.
+   *
+   * Returns true if compaction succeeded.
+   */
+  async function doCompact(
+    sessionId: string,
+    connection: AgentSideConnection,
+    runner: ClaudeRunner,
+    store: SessionStore,
+    modelOverride: string | undefined,
+    effectiveEffort: string | undefined,
+    announce: boolean,
+  ): Promise<boolean> {
+    const claudeSid = store.getClaudeSessionId(sessionId);
+    if (!claudeSid) {
+      if (announce) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "No conversation to compact yet." },
+          } as any,
+        });
+      }
+      return false;
+    }
+    if (announce) {
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Compacting conversation..." },
+        } as any,
+      });
+    }
+    // Ask the LLM to produce a concise summary of the conversation.
+    const compactPrompt =
+      "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context.";
+    try {
+      const result = await runner.continueSessionStreaming(
+        claudeSid,
+        compactPrompt,
+        () => {}, // no streaming events for compact
+        sessionId,
+        modelOverride,
+        effectiveEffort,
+      );
+      // Now clear the old session and start fresh with the summary.
+      const cwd = store.getCwd(sessionId)!;
+      store.clearPersistedSession(cwd);
+      store.setClaudeSessionId(sessionId, "");
+      const newResult = await runner.startSessionStreaming(
+        cwd,
+        `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
+        () => {},
+        sessionId,
+        modelOverride,
+        effectiveEffort,
+      );
+      store.setClaudeSessionId(sessionId, newResult.sessionId);
+      // Clear usage tracking so auto-compact doesn't immediately re-trigger.
+      sessionLastUsage.delete(sessionId);
+      if (announce) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Conversation compacted successfully." },
+          } as any,
+        });
+      }
+      logger.info(`Compaction succeeded for session ${sessionId}`);
+      return true;
+    } catch (compactErr) {
+      logger.error(`Compaction failed for session ${sessionId}: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`);
+      if (announce) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `Compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}` },
+          } as any,
+        });
+      }
+      return false;
+    }
+  }
+
+
 
   return {
     async initialize(
@@ -638,65 +812,15 @@ export function createClaudeCodeAgent(
         // to summarize the conversation so far, then clear the old session
         // and start fresh with the summary as the first message.
         if (name === "compact") {
-          const claudeSid = store.getClaudeSessionId(sessionId);
-          if (!claudeSid) {
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "No conversation to compact yet." },
-              } as any,
-            });
-            return { stopReason: "end_turn" };
-          }
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: "Compacting conversation..." },
-            } as any,
-          });
-          // Ask the LLM to produce a concise summary of the conversation
-          const compactPrompt = "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context.";
-          try {
-            const result = await runner.continueSessionStreaming(
-              claudeSid,
-              compactPrompt,
-              () => {}, // no streaming events for compact
-              sessionId,
-              undefined,
-              undefined
-            );
-            // Now clear the old session and start fresh with the summary
-            const cwd = store.getCwd(sessionId)!;
-            store.clearPersistedSession(cwd);
-            store.setClaudeSessionId(sessionId, "");
-            // Start a new session with the summary as context
-            const newResult = await runner.startSessionStreaming(
-              cwd,
-              `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
-              () => {},
-              sessionId,
-              undefined,
-              undefined
-            );
-            store.setClaudeSessionId(sessionId, newResult.sessionId);
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "Conversation compacted successfully." },
-              } as any,
-            });
-          } catch (compactErr) {
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: `Compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}` },
-              } as any,
-            });
-          }
+          const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+          const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+          const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+          const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
+          const compactEffort =
+            effortOverride && modelEfforts.includes(effortOverride)
+              ? effortOverride
+              : getDefaultEffort(effectiveModel);
+          await doCompact(sessionId, connection, runner, store, modelOverride, compactEffort, true);
           return { stopReason: "end_turn" };
         }
 
@@ -965,21 +1089,25 @@ export function createClaudeCodeAgent(
             // Best effort
           });
         }
-       // Handle result event — capture usage for prompt response and usage_update
-        if (event.type === "result" && event.usage) {
-          lastUsage = event.usage;
-          const inputTokens = event.usage.input_tokens ?? 0;
-          const outputTokens = event.usage.output_tokens ?? 0;
-          const total = inputTokens + outputTokens;
-          const contextWindow = 200000;
-          connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "usage_update",
-              used: total,
-              size: contextWindow,
-            } as any,
-          });
+      // Handle result event — capture usage for prompt response and usage_update
+       if (event.type === "result" && event.usage) {
+         lastUsage = event.usage;
+         const inputTokens = event.usage.input_tokens ?? 0;
+         const outputTokens = event.usage.output_tokens ?? 0;
+         const total = inputTokens + outputTokens;
+          // Resolve context window for the current model (dynamic from proxy).
+          const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+          const contextWindow = getContextWindowForModel(effectiveModel);
+          // Store for auto-compact check after the turn finishes.
+          sessionLastUsage.set(sessionId, { input_tokens: inputTokens, output_tokens: outputTokens });
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "usage_update",
+             used: total,
+             size: contextWindow,
+           } as any,
+         });
         }
         if ((event as any).type === "thinking" && (event as any).text) {
           connection.sessionUpdate({
@@ -1204,6 +1332,42 @@ export function createClaudeCodeAgent(
               updatedAt: store.getUpdatedAt(sessionId),
             } as any,
           });
+        }
+
+        // ─── Auto-compact check ───────────────────────────────────────────
+        // Mirrors Codex core: after the turn finishes (including steer
+        // drains), check if token usage has reached 90% of the model's
+        // context window. If so, run the compaction flow to replace the
+        // session with a summary-seeded fresh one. This prevents context
+        // exhaustion on long conversations.
+        const lastUsageEntry = sessionLastUsage.get(sessionId);
+        if (lastUsageEntry) {
+          const threshold = getAutoCompactThreshold(
+            modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id,
+          );
+          const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
+          if (used >= threshold) {
+            logger.info(
+              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (90% of ${getContextWindowForModel(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)})`,
+            );
+            // Emit a compaction notice to the UI (matches Codex's style).
+            await connection.sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "*Context compacted to fit the model's context window.*\n\n" },
+              } as any,
+            });
+            await doCompact(
+              sessionId,
+              connection,
+              runner,
+              store,
+              modelOverride,
+              effectiveEffort,
+              false, // don't announce "Compacting..." — we already emitted the notice above
+            );
+          }
         }
 
         return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
