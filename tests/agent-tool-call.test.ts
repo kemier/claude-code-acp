@@ -173,3 +173,155 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].kind).toBe("execute");
   });
 });
+
+describe("Agent todo/plan updates", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    scriptedEvents = [];
+  });
+
+  it("TaskCreate emits a plan with one entry per task", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          tasks: [
+            { subject: "Write tests", description: "add vitest" },
+            { subject: "Build", description: "npm run build" },
+          ],
+        },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    expect(plans).toHaveLength(1);
+    expect(plans[0].entries).toHaveLength(2);
+    expect(plans[0].entries[0].content).toBe("Write tests");
+    expect(plans[0].entries[1].content).toBe("Build");
+    expect(plans[0].entries[0].status).toBe("pending");
+  });
+
+  it("TaskUpdate mutates the existing list, not a stacked copy", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          tasks: [{ subject: "First" }, { subject: "Second" }],
+        },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        toolInput: { taskId: "task-1", status: "completed" },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    expect(plans).toHaveLength(2);
+    // After the update the list is still 2 entries (no stacking).
+    const lastPlan = plans[plans.length - 1];
+    expect(lastPlan.entries).toHaveLength(2);
+    expect(lastPlan.entries[0].status).toBe("completed");
+    expect(lastPlan.entries[1].status).toBe("pending");
+  });
+
+  it("multiple TaskCreate calls accumulate into one growing list", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "A" }] },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "B" }, { subject: "C" }] },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    expect(lastPlan.entries).toHaveLength(3);
+    expect(lastPlan.entries.map((e: any) => e.content)).toEqual([
+      "A",
+      "B",
+      "C",
+    ]);
+  });
+
+  it("TaskList does not reset or duplicate the list", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "Only" }] },
+      },
+      { type: "tool_use", toolName: "TaskList", toolInput: {} },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    // TaskList still emits a snapshot (same list, unchanged).
+    const lastPlan = plans[plans.length - 1];
+    expect(lastPlan.entries).toHaveLength(1);
+    expect(lastPlan.entries[0].content).toBe("Only");
+  });
+
+  it("non-task tools do not emit a plan", async () => {
+    const { updates } = await runWithEvents([
+      { type: "tool_use", toolName: "Read", toolInput: { file_path: "/x" } },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    expect(plans).toHaveLength(0);
+  });
+});
+
+describe("Subagent (Task tool) lifecycle", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    scriptedEvents = [];
+  });
+
+  it("emits in_progress on Task tool_use, completed on tool_result", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Task",
+        toolInput: { description: "investigate", subagent_type: "general-purpose" },
+        toolUseId: "tu_1",
+      },
+      { type: "user", text: "result text", toolResultIds: ["tu_1"] },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    // First: in_progress when the subagent starts.
+    expect(toolCalls[0].status).toBe("in_progress");
+    // Last: a bare completed flip keyed by the same toolCallId.
+    const flip = toolCalls[toolCalls.length - 1];
+    expect(flip.status).toBe("completed");
+    expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
+  });
+
+  it("stays in_progress if no tool_result has arrived yet", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Task",
+        toolInput: { description: "investigate" },
+        toolUseId: "tu_2",
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].status).toBe("in_progress");
+  });
+
+  it("non-subagent tools stay completed immediately (no lifecycle)", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Read",
+        toolInput: { file_path: "/x" },
+        toolUseId: "tu_3",
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].status).toBe("completed");
+  });
+});

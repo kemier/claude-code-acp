@@ -25,6 +25,10 @@ export interface StreamEvent {
  text?: string;
  toolName?: string;
  toolInput?: unknown;
+ /** Claude's native tool_use id (from the assistant content block). */
+ toolUseId?: string;
+ /** Claude tool_use ids resolved by a following user/tool_result message. */
+ toolResultIds?: string[];
  sessionId?: string;
  permissionId?: string;
  usage?: { input_tokens?: number; output_tokens?: number };
@@ -401,6 +405,7 @@ export class ClaudeRunner {
            type: "tool_use",
            toolName: block.name,
            toolInput: block.input,
+           toolUseId: typeof block.id === "string" ? block.id : undefined,
          });
        } else if (block.type === "thinking") {
          onEvent({ type: "thinking", text: block.thinking });
@@ -412,12 +417,16 @@ export class ClaudeRunner {
     // Handle user message (tool results) — emit for context estimation.
     // Claude CLI stream-json emits {"type":"user","message":{"content":[{"type":"tool_result","content":"..."}]}}
     if (parsed.type === "user" && parsed.message?.content) {
+      // Collect the tool_use_ids this message resolves, so the agent can flip
+      // any in_progress tool calls (e.g. a running subagent) to completed.
+      const toolResultIds: string[] = [];
       // Emit a "user" event so the context estimator can accumulate tool results.
       const toolResultText = Array.isArray(parsed.message.content)
         ? parsed.message.content
             .map((b: any) => {
               if (typeof b === "string") return b;
               if (b.type === "tool_result") {
+                if (typeof b.tool_use_id === "string") toolResultIds.push(b.tool_use_id);
                 return typeof b.content === "string"
                   ? b.content
                   : JSON.stringify(b.content ?? "");
@@ -426,7 +435,11 @@ export class ClaudeRunner {
             })
             .join("")
         : "";
-      onEvent({ type: "user", text: toolResultText });
+      onEvent({
+        type: "user",
+        text: toolResultText,
+        ...(toolResultIds.length ? { toolResultIds } : {}),
+      });
       return;
     }
 

@@ -589,6 +589,16 @@ export function createClaudeCodeAgent(
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
 
+  // ─── Subagent (Agent tool) lifecycle tracking ─────────────────────────────
+  // The Agent tool spawns a subagent that runs for an extended period. We
+  // must NOT mark it "completed" the instant its tool_use block appears (as
+  // we do for Read/Edit/etc.) — the subagent is still running and the UI
+  // should reflect that. Instead we emit status:"in_progress" when the
+  // tool_use fires and flip to "completed" only when the matching tool_result
+  // arrives (the user/tool_result message Claude emits once the subagent
+  // finishes). Maps Claude's native tool_use id → our ACP toolCallId.
+  const sessionPendingAgents = new Map<string, Map<string, string>>();
+
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
   // We mirror them into ACP `session/update` with sessionUpdate:"plan" +
@@ -767,6 +777,12 @@ export function createClaudeCodeAgent(
       store.clearPersistedSession(cwd);
       store.setClaudeSessionId(sessionId, "");
       sessionGoals.delete(sessionId);
+      sessionTodos.delete(sessionId);
+      // Clearing drops the entire conversation, so the context estimate must
+      // reset too — otherwise the ring would keep showing the pre-clear size.
+      const clearedEstimator = sessionEstimators.get(sessionId);
+      if (clearedEstimator) clearedEstimator.reset();
+      sessionLastUsage.delete(sessionId);
       await connection.sessionUpdate({
         sessionId,
         update: {
@@ -1050,6 +1066,9 @@ export function createClaudeCodeAgent(
       store.setClaudeSessionId(sessionId, newResult.sessionId);
       // Clear usage tracking so auto-compact doesn't immediately re-trigger.
       sessionLastUsage.delete(sessionId);
+      // Compaction replaces the whole conversation with a summary, so any
+      // todo list from the prior context no longer applies.
+      sessionTodos.delete(sessionId);
       // Reset the context estimator: compaction replaced the entire
       // conversation with a short summary, so the pre-compaction content the
       // estimator accumulated no longer reflects the session's real context.
@@ -1430,8 +1449,16 @@ export function createClaudeCodeAgent(
 
       // Real-time context estimator — tracks conversation content to estimate
       // context size during the turn (before the result event arrives).
-      const ctxEstimator = new TurnContextEstimator();
-      // Register on the session map so doCompact() can reset it after a compact.
+      // REUSE the session-persistent estimator across turns: a fresh estimator
+      // each turn would reset to ~overhead-only and the usage ring would DROP
+      // at the start of every new turn (then climb again as content streams),
+      // making the context usage visibly flip down→up non-monotonically. By
+      // persisting accumulated content across turns, the estimate stays
+      // monotonic-growing (as a real context window does). Only /clear,
+      // /compact, and auto-compact reset it (see dispatchSlashCommand /
+      // doCompact).
+      const existing = sessionEstimators.get(sessionId);
+      const ctxEstimator = existing ?? new TurnContextEstimator();
       sessionEstimators.set(sessionId, ctxEstimator);
       // Accumulate the user's prompt text (it's part of the conversation).
       ctxEstimator.addText(effectivePrompt);
@@ -1488,6 +1515,32 @@ export function createClaudeCodeAgent(
       // Handle user event (tool results) — accumulate for context estimation.
       if (event.type === "user" && event.text) {
         ctxEstimator.addText(event.text);
+      }
+      // A tool_result resolves any in_progress subagent tool calls. Flip them
+      // to "completed" now that the subagent has finished and returned. This
+      // keeps the UI honest: the Agent tool shows as running while the
+      // subagent works, then completes only when its result actually lands.
+      if (event.type === "user" && event.toolResultIds?.length) {
+        const pending = sessionPendingAgents.get(sessionId);
+        if (pending) {
+          for (const claudeId of event.toolResultIds) {
+            const acpCallId = pending.get(claudeId);
+            if (acpCallId) {
+              pending.delete(claudeId);
+              connection
+                .sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: acpCallId,
+                    status: "completed",
+                  } as any,
+                })
+                .catch(() => {});
+            }
+          }
+          if (pending.size === 0) sessionPendingAgents.delete(sessionId);
+        }
       }
     // Handle result event — Claude CLI reports CUMULATIVE usage across all
     // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
@@ -1560,13 +1613,39 @@ export function createClaudeCodeAgent(
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
          const toolCallId = `call_${++toolCallCounter}`;
          logger.debug(`Tool call: ${event.toolName}`);
+         // TaskCreate/TaskUpdate/TaskList maintain a todo list — mirror it
+         // into an ACP `plan` update so the chat UI shows a plan bar with
+         // the current task count (like codex-acp's update_plan). The plan
+         // is a full snapshot, so the count reflects the live list size
+         // rather than a running total of updates.
+         handleTaskTool(sessionId, event.toolName, event.toolInput);
          // Build a descriptive title + kind + (for edits) diff content +
          // locations, mirroring codex-acp, so the chat UI shows the action
          // verb and a click-to-open diff instead of a bare filename.
-         const update = buildToolCallUpdate(toolCallId, event.toolName, event.toolInput);
+         const isSubagent =
+           event.toolName === "Task" || event.toolName === "Agent";
+         const update = buildToolCallUpdate(
+           toolCallId,
+           event.toolName,
+           event.toolInput,
+         );
+         // A subagent runs long after its tool_use block appears. Emit it as
+         // in_progress (not completed) and record the Claude tool_use id so
+         // we can flip it to completed when the subagent's tool_result lands.
+         const emitted = isSubagent
+           ? { ...update, status: "in_progress" as const }
+           : update;
+         if (isSubagent && event.toolUseId) {
+           let pending = sessionPendingAgents.get(sessionId);
+           if (!pending) {
+             pending = new Map();
+             sessionPendingAgents.set(sessionId, pending);
+           }
+           pending.set(event.toolUseId, toolCallId);
+         }
          connection.sessionUpdate({
            sessionId,
-           update,
+           update: emitted,
          });
        } else if (event.type === "permission_request" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
@@ -1751,10 +1830,33 @@ export function createClaudeCodeAgent(
           }
 
         try {
+          // Steer-drain guard: a steered message is a FOLLOW-UP user
+          // instruction delivered after the previous turn completed — Claude
+          // CLI can't inject mid-turn, so we resume the session here. To stop
+          // the model from misreading the prior turn's (possibly subagent-
+          // produced) output as an interruption it must diagnose, frame the
+          // steer as a fresh instruction. Also, if a subagent is somehow still
+          // marked in_progress (result fired before its tool_result), defer
+          // the drain rather than yanking the session into a new context.
+          const stillPending = sessionPendingAgents.get(sessionId);
+          if (stillPending && stillPending.size > 0) {
+            logger.info(
+              `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
+            );
+            // Re-queue at the front so it drains once the subagent resolves.
+            const q = steerQueues.get(sessionId) ?? [];
+            q.unshift(steerText);
+            steerQueues.set(sessionId, q);
+            break;
+          }
+
           // Prepend goal to steer messages too
-          const steerPrompt = activeGoal && !activeGoal.paused
+          const basePrompt = activeGoal && !activeGoal.paused
             ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
             : steerText;
+          // Frame as a follow-up so the model treats this as a new user
+          // instruction rather than a description of interrupted state.
+          const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
           ctxEstimator.addText(steerPrompt);
           await runner.continueSessionStreaming(
               claudeSid,
