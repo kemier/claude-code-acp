@@ -224,6 +224,12 @@ function getAutoCompactThreshold(modelId: string | undefined): number {
 // can run after the turn finishes.
 const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
 
+// Per-session context estimator for the in-flight prompt() turn. Stored on a
+// map (not a local) so doCompact() — which runs in its own scope — can reset
+// it after compaction replaces the conversation with a short summary. Without
+// a reset, the estimator keeps counting pre-compaction content and over-reports.
+const sessionEstimators = new Map<string, TurnContextEstimator>();
+
 // ─── Real-time context estimation ──────────────────────────────────────────
 // Claude CLI only reports usage in the result event at turn END (cumulative).
 // To show usage DURING the turn, we estimate context size from stream events:
@@ -253,6 +259,17 @@ class TurnContextEstimator {
   /** Accumulate text content (assistant messages, thinking, tool results). */
   addText(text: string): void {
     if (text) this.contentBytes += text.length;
+  }
+
+  /**
+   * Reset accumulated conversation content (keep the fixed overhead).
+   * Called after compaction, which replaces the entire conversation with a
+   * short summary — without this, the estimator would keep counting the
+   * pre-compaction content and over-report context size.
+   */
+  reset(): void {
+    this.contentBytes = 0;
+    this.apiCallCount = 0;
   }
 
   /** Accumulate tool call content (JSON-serialized input). */
@@ -451,6 +468,268 @@ export function createClaudeCodeAgent(
    *
    * Returns true if compaction succeeded.
    */
+  /**
+   * Dispatch a built-in slash command (/ps, /clear, /compact, /status,
+   * /skills, /goal). Shared by prompt() and the steer-drain loop so both entry
+   * points behave identically — previously the steer path was a hand-rewritten
+   * copy that silently dropped several cases.
+   *
+   * Returns:
+   *   - { handled: false }            — not a slash command (or unknown); caller should send it as a plain prompt.
+   *   - { handled: true, startTurn? } — command handled. If startTurn is set, the caller should start an LLM turn with that prompt (the /goal case). Otherwise the command was fully serviced (read-only, /clear, /compact, /goal clear|pause|resume) and the caller should do nothing further.
+   */
+  async function dispatchSlashCommand(
+    sessionId: string,
+    connection: AgentSideConnection,
+    runner: ClaudeRunner,
+    store: SessionStore,
+    text: string,
+  ): Promise<{ handled: boolean; startTurn?: string }> {
+    const command = parseSlashCommand(text);
+    if (!command) return { handled: false };
+    const { name, rest } = command;
+
+    if (name === "ps") {
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "No background terminals running." },
+        } as any,
+      });
+      return { handled: true };
+    }
+
+    if (name === "clear") {
+      const cwd = store.getCwd(sessionId)!;
+      store.clearPersistedSession(cwd);
+      store.setClaudeSessionId(sessionId, "");
+      sessionGoals.delete(sessionId);
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Conversation cleared. Starting fresh." },
+        } as any,
+      });
+      return { handled: true };
+    }
+
+    if (name === "compact") {
+      const compactEffort = resolveEffort(store, sessionId);
+      await doCompact(sessionId, connection, runner, store, store.getConfigOverrides(sessionId)["model"] as string | undefined, compactEffort, true);
+      return { handled: true };
+    }
+
+    if (name === "status") {
+      const cwd = store.getCwd(sessionId)!;
+      const configOverrides = store.getConfigOverrides(sessionId);
+      const currentModel = (configOverrides["model"] as string) || process.env.ANTHROPIC_MODEL || "glm-5.2";
+      const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+      const goal = sessionGoals.get(sessionId);
+      const lines = [
+        `**Model:** ${currentModel}`,
+        `**Mode:** ${currentMode}`,
+        `**Directory:** ${cwd}`,
+        `**Session:** \`${sessionId}\``,
+        goal ? `**Goal:** ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "**Goal:** none",
+      ];
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: lines.join("\n") },
+        } as any,
+      });
+      return { handled: true };
+    }
+
+    if (name === "skills") {
+      const { readdirSync, readFileSync, existsSync } = await import("node:fs");
+      const { join: joinPath, dirname } = await import("node:path");
+      const { homedir } = await import("node:os");
+
+      const cwd = store.getCwd(sessionId)!;
+      const skillsMap = new Map<string, { description: string; source: string }>();
+
+      const scanSkillsDir = (skillsDir: string, source: string) => {
+        if (!existsSync(skillsDir)) return;
+        let entries;
+        try {
+          entries = readdirSync(skillsDir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const skillFile = joinPath(skillsDir, entry.name, "SKILL.md");
+          let description = "";
+          if (existsSync(skillFile)) {
+            try {
+              const content = readFileSync(skillFile, "utf-8");
+              const descMatch = content.match(/^description:\s*(.+)$/m);
+              if (descMatch) {
+                description = descMatch[1].trim().replace(/^[\'"]|[\'"]$/g, "");
+              } else {
+                const headingMatch = content.match(/^#\s+(.+)$/m);
+                if (headingMatch) description = headingMatch[1].trim();
+              }
+            } catch {
+              // skip unreadable
+            }
+          }
+          if (!skillsMap.has(entry.name)) {
+            skillsMap.set(entry.name, { description, source });
+          }
+        }
+      };
+
+      scanSkillsDir(joinPath(homedir(), ".claude", "skills"), "global");
+      scanSkillsDir(joinPath(cwd, ".agents", "skills"), "project");
+      let dir = cwd;
+      for (let i = 0; i < 10; i++) {
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        scanSkillsDir(joinPath(parent, ".agents", "skills"), "workspace");
+        dir = parent;
+      }
+
+      let skillsList: string;
+      if (skillsMap.size === 0) {
+        skillsList = "No skills configured.\n\nSkills are loaded from:\n- ~/.claude/skills/\n- <project>/.agents/skills/\n- <workspace>/.agents/skills/";
+      } else {
+        const lines: string[] = ["Available skills:\n"];
+        for (const [sname, info] of skillsMap) {
+          const desc = info.description ? `: ${info.description}` : "";
+          lines.push(`- /${sname}${desc}`);
+        }
+        skillsList = lines.join("\n");
+      }
+
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: skillsList },
+        } as any,
+      });
+      return { handled: true };
+    }
+
+    if (name === "goal") {
+      const argument = rest.trim();
+      if (!argument) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: 'Command "/goal" requires [<objective>|clear|pause|resume].' },
+          } as any,
+        });
+        return { handled: true };
+      }
+
+      const lowerArg = argument.toLowerCase();
+      if (lowerArg === "clear") {
+        sessionGoals.delete(sessionId);
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Goal cleared." },
+          } as any,
+        });
+        return { handled: true };
+      }
+      if (lowerArg === "pause") {
+        const goal = sessionGoals.get(sessionId);
+        if (goal) {
+          goal.paused = true;
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
+            } as any,
+          });
+        } else {
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "No goal to pause. Set one with /goal <objective>." },
+            } as any,
+          });
+        }
+        return { handled: true };
+      }
+      if (lowerArg === "resume") {
+        const goal = sessionGoals.get(sessionId);
+        if (goal) {
+          goal.paused = false;
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
+            } as any,
+          });
+        } else {
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "No goal to resume. Set one with /goal <objective>." },
+            } as any,
+          });
+        }
+        return { handled: true };
+      }
+
+      if (argument.length > 4000) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: 'Command "/goal" requires goal text of at most 4000 characters.' },
+          } as any,
+        });
+        return { handled: true };
+      }
+      sessionGoals.set(sessionId, { text: argument, paused: false });
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
+        } as any,
+      });
+      // Caller should start an LLM turn pursuing the goal.
+      return { handled: true, startTurn: `Please start working toward this goal now:\n\n${argument}` };
+    }
+
+    // Unknown slash command — let the caller send it as a plain prompt
+    // (Claude CLI may handle it natively).
+    return { handled: false };
+  }
+
+  /**
+   * Resolve the effort to pass to claude CLI for a session: the stored override
+   * if the current model supports it, otherwise the model's default effort.
+   * Centralized so /compact, normal turns, steer drains, and auto-compact all
+   * agree on the effort for a given model+session (previously /compact via
+   * prompt() used getDefaultEffort=high while steer/auto /compact passed
+   * undefined for reasoning models).
+   */
+  function resolveEffort(store: SessionStore, sessionId: string): string | undefined {
+    const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+    const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+    const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+    const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
+    if (effortOverride && modelEfforts.includes(effortOverride)) return effortOverride;
+    return getDefaultEffort(effectiveModel);
+  }
+
   async function doCompact(
     sessionId: string,
     connection: AgentSideConnection,
@@ -509,6 +788,17 @@ export function createClaudeCodeAgent(
       store.setClaudeSessionId(sessionId, newResult.sessionId);
       // Clear usage tracking so auto-compact doesn't immediately re-trigger.
       sessionLastUsage.delete(sessionId);
+      // Reset the context estimator: compaction replaced the entire
+      // conversation with a short summary, so the pre-compaction content the
+      // estimator accumulated no longer reflects the session's real context.
+      // Re-seed with the summary prompt that started the fresh session.
+      const estimator = sessionEstimators.get(sessionId);
+      if (estimator) {
+        estimator.reset();
+        estimator.addText(
+          `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
+        );
+      }
       if (announce) {
         await connection.sessionUpdate({
           sessionId,
@@ -838,268 +1128,22 @@ export function createClaudeCodeAgent(
       }
 
       // ── Slash command handling ──────────────────────────────────
-      // Intercept built-in commands (/ps, /goal, /skills, /status) before
-      // starting an LLM turn. Read-only commands (ps, status, skills) return
-      // immediately. /goal sets session state and starts a turn.
-      const command = parseSlashCommand(text);
-      // When /goal sets a new objective, this holds the prompt to send
-      // to the LLM to start working on it immediately.
-      let goalPrompt: string | null = null;
-      if (command) {
-        const { name, rest } = command;
-
-        // /ps — list background processes (always empty for claude-code-acp,
-        // but vscode-acp expects the agent to handle it when not done client-side)
-        if (name === "ps") {
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: "No background terminals running." },
-            } as any,
-          });
-          return { stopReason: "end_turn" };
-        }
-
-        // /clear — clear conversation history and start fresh.
-        // Claude Code doesn't have a --clear flag, so we drop the persisted
-        // Claude session ID. The next prompt will start a brand new session
-        // instead of --resume-ing into the old one.
-        if (name === "clear") {
-          const cwd = store.getCwd(sessionId)!;
-          store.clearPersistedSession(cwd);
-          // Also clear the in-memory claude session ID
-          store.setClaudeSessionId(sessionId, "");
-          // Clear any active goal too
-          sessionGoals.delete(sessionId);
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: "Conversation cleared. Starting fresh." },
-            } as any,
-          });
-          return { stopReason: "end_turn" };
-        }
-
-        // /compact — summarize the conversation to reduce context.
-        // Claude Code CLI doesn't expose a compact API, so we ask the LLM
-        // to summarize the conversation so far, then clear the old session
-        // and start fresh with the summary as the first message.
-        if (name === "compact") {
-          const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-          const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
-          const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-          const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
-          const compactEffort =
-            effortOverride && modelEfforts.includes(effortOverride)
-              ? effortOverride
-              : getDefaultEffort(effectiveModel);
-          await doCompact(sessionId, connection, runner, store, modelOverride, compactEffort, true);
-          return { stopReason: "end_turn" };
-        }
-
-        // /status — show session info
-        if (name === "status") {
-          const cwd = store.getCwd(sessionId)!;
-          const configOverrides = store.getConfigOverrides(sessionId);
-          const currentModel = (configOverrides["model"] as string) || process.env.ANTHROPIC_MODEL || "glm-5.2";
-          const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
-          const goal = sessionGoals.get(sessionId);
-          const lines = [
-            `**Model:** ${currentModel}`,
-            `**Mode:** ${currentMode}`,
-            `**Directory:** ${cwd}`,
-            `**Session:** \`${sessionId}\``,
-            goal ? `**Goal:** ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "**Goal:** none",
-          ];
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: lines.join("\n") },
-            } as any,
-          });
-          return { stopReason: "end_turn" };
-        }
-
-        // /skills — list available Claude Code skills.
-        // Scans: ~/.claude/skills/, <cwd>/.agents/skills/, and parent
-        // workspace .agents/skills/ directories (mirrors codex-acp skill
-        // discovery which checks .agents/skills subdirectories).
-        if (name === "skills") {
-          const { readdirSync, readFileSync, existsSync } = await import("node:fs");
-          const { join: joinPath, dirname } = await import("node:path");
-          const { homedir } = await import("node:os");
-
-          const cwd = store.getCwd(sessionId)!;
-          const skillsMap = new Map<string, { description: string; source: string }>();
-
-          const scanSkillsDir = (skillsDir: string, source: string) => {
-            if (!existsSync(skillsDir)) return;
-            let entries;
-            try {
-              entries = readdirSync(skillsDir, { withFileTypes: true });
-            } catch {
-              return;
-            }
-            for (const entry of entries) {
-              if (!entry.isDirectory()) continue;
-              const skillFile = joinPath(skillsDir, entry.name, "SKILL.md");
-              let description = "";
-              if (existsSync(skillFile)) {
-                try {
-                  const content = readFileSync(skillFile, "utf-8");
-                  const descMatch = content.match(/^description:\s*(.+)$/m);
-                  if (descMatch) {
-                    description = descMatch[1].trim().replace(/^[\'"]|[\'"]$/g, "");
-                  } else {
-                    const headingMatch = content.match(/^#\s+(.+)$/m);
-                    if (headingMatch) description = headingMatch[1].trim();
-                  }
-                } catch {
-                  // skip unreadable
-                }
-              }
-              if (!skillsMap.has(entry.name)) {
-                skillsMap.set(entry.name, { description, source });
-              }
-            }
-          };
-
-          // 1. Global skills: ~/.claude/skills/
-          scanSkillsDir(joinPath(homedir(), ".claude", "skills"), "global");
-
-          // 2. Project-level skills: <cwd>/.agents/skills/
-          scanSkillsDir(joinPath(cwd, ".agents", "skills"), "project");
-
-          // 3. Walk up from cwd to find parent .agents/skills/
-          let dir = cwd;
-          for (let i = 0; i < 10; i++) {
-            const parent = dirname(dir);
-            if (parent === dir) break;
-            scanSkillsDir(joinPath(parent, ".agents", "skills"), "workspace");
-            dir = parent;
-          }
-
-          let skillsList: string;
-          if (skillsMap.size === 0) {
-            skillsList = "No skills configured.\n\nSkills are loaded from:\n- ~/.claude/skills/\n- <project>/.agents/skills/\n- <workspace>/.agents/skills/";
-          } else {
-            const lines: string[] = ["Available skills:\n"];
-            for (const [sname, info] of skillsMap) {
-              const desc = info.description ? `: ${info.description}` : "";
-              lines.push(`- /${sname}${desc}`);
-            }
-            skillsList = lines.join("\n");
-          }
-
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: skillsList },
-            } as any,
-          });
-          return { stopReason: "end_turn" };
-        }
-
-        // /goal — set/clear/pause/resume a persistent goal
-        if (name === "goal") {
-          const argument = rest.trim();
-          if (!argument) {
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: 'Command "/goal" requires [<objective>|clear|pause|resume].' },
-              } as any,
-            });
-            return { stopReason: "end_turn" };
-          }
-
-          const lowerArg = argument.toLowerCase();
-          if (lowerArg === "clear") {
-            sessionGoals.delete(sessionId);
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "Goal cleared." },
-              } as any,
-            });
-            return { stopReason: "end_turn" };
-          }
-          if (lowerArg === "pause") {
-            const goal = sessionGoals.get(sessionId);
-            if (goal) {
-              goal.paused = true;
-              await connection.sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "agent_message_chunk",
-                  content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
-                } as any,
-              });
-            } else {
-              await connection.sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "agent_message_chunk",
-                  content: { type: "text", text: "No goal to pause. Set one with /goal <objective>." },
-                } as any,
-              });
-            }
-            return { stopReason: "end_turn" };
-          }
-          if (lowerArg === "resume") {
-            const goal = sessionGoals.get(sessionId);
-            if (goal) {
-              goal.paused = false;
-              await connection.sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "agent_message_chunk",
-                  content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
-                } as any,
-              });
-            } else {
-              await connection.sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "agent_message_chunk",
-                  content: { type: "text", text: "No goal to resume. Set one with /goal <objective>." },
-                } as any,
-              });
-            }
-            return { stopReason: "end_turn" };
-          }
-
-          // Set a new goal — store it and immediately start working toward it
-          if (argument.length > 4000) {
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: 'Command "/goal" requires goal text of at most 4000 characters.' },
-              } as any,
-            });
-            return { stopReason: "end_turn" };
-          }
-          sessionGoals.set(sessionId, { text: argument, paused: false });
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
-            } as any,
-          });
-          // Fall through to start an actual LLM turn pursuing the goal.
-          // Mirrors codex-acp's setGoal which calls runGoalSet() to start
-          // an actual turn. We set goalPrompt so the LLM turn uses it.
-          goalPrompt = `Please start working toward this goal now:\n\n${argument}`;
-        }
-      }
+      // Intercept built-in commands (/ps, /goal, /skills, /status, /clear,
+      // /compact) before starting an LLM turn. Shared dispatch logic lives in
+      // dispatchSlashCommand() so prompt() and the steer-drain loop behave
+      // identically. Read-only commands and /clear|/compact|/goal clear|pause
+      // |resume are fully serviced and return immediately. /goal <objective>
+      // returns a goalPrompt to start an LLM turn with.
+      const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, text);
+      // When /goal sets a new objective, this holds the prompt to send to the
+      // LLM to start working on it immediately.
+      const goalPrompt = dispatchResult.startTurn ?? null;
+      // A fully-serviced command (read-only, /clear, /compact, /goal subcmds)
+      // needs no main LLM turn — but we still drain any steers queued during it
+      // (e.g. steers queued while /compact was summarizing) and run the
+      // auto-compact check, so we skip the main turn rather than returning early.
+      const skipMainTurn = dispatchResult.handled && !goalPrompt;
+      const command = dispatchResult.handled ? parseSlashCommand(text) : null;
 
       // If there's an active (non-paused) goal, prepend it to the prompt.
      // goalPrompt is set when /goal just set a new objective — use it directly.
@@ -1125,20 +1169,22 @@ export function createClaudeCodeAgent(
       // Real-time context estimator — tracks conversation content to estimate
       // context size during the turn (before the result event arrives).
       const ctxEstimator = new TurnContextEstimator();
+      // Register on the session map so doCompact() can reset it after a compact.
+      sessionEstimators.set(sessionId, ctxEstimator);
       // Accumulate the user's prompt text (it's part of the conversation).
       ctxEstimator.addText(effectivePrompt);
 
       // Get model and effort overrides from session config (set via pickers)
       const configOverrides = store.getConfigOverrides(sessionId);
       const modelOverride = configOverrides["model"] as string | undefined;
-      const effortOverride = configOverrides["effort"] as string | undefined;
-      // Only pass effort if the selected model actually supports it
+      // Only pass effort if the selected model actually supports it; otherwise
+      // fall back to the model's default effort. Using resolveEffort() keeps
+      // the actually-sent effort consistent with what the picker shows and
+      // what /compact, steer drains, and auto-compact use (previously normal
+      // turns fell back to undefined for reasoning models, while /compact via
+      // prompt() used the default "high").
       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-      const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
-      const effectiveEffort =
-        effortOverride && modelEfforts.includes(effortOverride)
-          ? effortOverride
-          : undefined;
+      const effectiveEffort = resolveEffort(store, sessionId);
 
       logger.info(`Prompt for session ${sessionId}: ${text.length} chars`);
       logger.debug(
@@ -1233,7 +1279,14 @@ export function createClaudeCodeAgent(
            } as any,
          });
        } else if (event.type === "text_delta" && event.text) {
-         ctxEstimator.addText(event.text);
+         // In --verbose mode Claude CLI emits BOTH streaming content_block_delta
+         // text AND the final assistant message block's full text. To avoid
+         // double-counting assistant content in the context estimate, we count
+         // only the final-block text (fromAssistantBlock) and ignore the
+         // streaming deltas. UI rendering is unaffected — both still render.
+         if (event.fromAssistantBlock) {
+           ctxEstimator.addText(event.text);
+         }
          connection.sessionUpdate({
            sessionId,
            update: {
@@ -1339,6 +1392,7 @@ export function createClaudeCodeAgent(
 
       try {
         let result;
+        if (!skipMainTurn) {
         if (claudeSessionId) {
           try {
             result = await runner.continueSessionStreaming(
@@ -1387,6 +1441,7 @@ export function createClaudeCodeAgent(
           }
           store.setClaudeSessionId(sessionId, result.sessionId);
         }
+        }
 
         // Wait for all pending permission requests to resolve
         await Promise.all(permissionPromises);
@@ -1425,60 +1480,29 @@ export function createClaudeCodeAgent(
        permissionPromises.length = 0;
        logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
 
-          // Check if the steered text is a slash command. If so, handle it
-          // via the same slash command logic as prompt() instead of sending
-          // it as raw text to Claude CLI. This ensures /goal, /clear, etc.
-          // work correctly when queued via steering during /compact or
-          // another in-flight turn.
-          const steerCmd = parseSlashCommand(steerText);
-          if (steerCmd) {
-            const { name: cmdName, rest: cmdRest } = steerCmd;
-            logger.info(`Steer drain: handling slash command /${cmdName} for session ${sessionId}`);
-
-            if (cmdName === "goal") {
-              const argument = cmdRest.trim();
-              const lowerArg = argument.toLowerCase();
-              if (argument && lowerArg !== "clear" && lowerArg !== "pause" && lowerArg !== "resume" && argument.length <= 4000) {
-                sessionGoals.set(sessionId, { text: argument, paused: false });
-                await connection.sessionUpdate({
-                  sessionId,
-                  update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` } } as any,
-                });
-                const goalPromptText = `Please start working toward this goal now:\n\n${argument}`;
-                try {
-                  ctxEstimator.addText(goalPromptText);
-                  await runner.continueSessionStreaming(claudeSid, goalPromptText, onEvent, sessionId, modelOverride, effectiveEffort);
-                  await Promise.all(permissionPromises);
-                } catch (goalErr) {
-                  logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
-                }
-              } else if (lowerArg === "clear") {
-                sessionGoals.delete(sessionId);
-                await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Goal cleared." } } as any });
-              } else if (lowerArg === "pause") {
-                const g = sessionGoals.get(sessionId);
-                if (g) { g.paused = true; await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Goal paused." } } as any }); }
-              } else if (lowerArg === "resume") {
-                const g = sessionGoals.get(sessionId);
-                if (g) { g.paused = false; await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Goal resumed: ${g.text.slice(0, 100)}` } } as any }); }
+          // If the steered text is a slash command, dispatch it through the
+          // SAME handler prompt() uses (dispatchSlashCommand) so the two entry
+          // points behave identically. Previously this was a hand-rewritten
+          // copy that silently dropped several cases (/goal with empty/over-
+          // length arg, /goal pause|resume with no goal, and /ps|/status|
+          // /skills fell through to raw text).
+          const steerDispatch = await dispatchSlashCommand(sessionId, connection, runner, store, steerText);
+          if (steerDispatch.handled) {
+            logger.info(`Steer drain: handled slash command for session ${sessionId}`);
+            if (steerDispatch.startTurn) {
+              // /goal <objective> — start an LLM turn pursuing it.
+              try {
+                ctxEstimator.addText(steerDispatch.startTurn);
+                await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, modelOverride, effectiveEffort);
+                await Promise.all(permissionPromises);
+              } catch (goalErr) {
+                logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
               }
-              continue;
             }
-
-            if (cmdName === "clear") {
-              const clearCwd = store.getCwd(sessionId)!;
-              store.clearPersistedSession(clearCwd);
-              store.setClaudeSessionId(sessionId, "");
-              sessionGoals.delete(sessionId);
-              await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Conversation cleared. Starting fresh." } } as any });
-              continue;
-            }
-
-            if (cmdName === "compact") {
-              await doCompact(sessionId, connection, runner, store, modelOverride, effectiveEffort, true);
-              continue;
-            }
-            // Read-only commands (ps, status, skills) fall through to raw text
+            // /clear wipes the Claude session ID — there's no session to
+            // continue into, so stop draining remaining queued steers.
+            if (parseSlashCommand(steerText)?.name === "clear") break;
+            continue;
           }
 
         try {

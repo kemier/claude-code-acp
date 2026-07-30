@@ -31,6 +31,14 @@ export interface StreamEvent {
   slashCommands?: string[];
   /** For assistant events: marks an API call boundary (for context estimation). */
   apiCallIndex?: number;
+  /**
+   * For text_delta events: true when the text comes from the final `assistant`
+   * message block (not a streaming content_block_delta). The context estimator
+   * uses this to avoid double-counting assistant text in --verbose streams,
+   * where the same content arrives both as streaming deltas and as the final
+   * block. UI rendering treats both identically.
+   */
+  fromAssistantBlock?: boolean;
 }
 
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
@@ -387,7 +395,7 @@ export class ClaudeRunner {
       onEvent({ type: "assistant", apiCallIndex: 0 });
      for (const block of parsed.message.content) {
        if (block.type === "text") {
-         onEvent({ type: "text_delta", text: block.text });
+         onEvent({ type: "text_delta", text: block.text, fromAssistantBlock: true });
        } else if (block.type === "tool_use") {
          onEvent({
            type: "tool_use",
