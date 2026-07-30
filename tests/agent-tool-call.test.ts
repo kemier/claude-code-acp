@@ -172,6 +172,28 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].title).toBe("CustomTool");
     expect(toolCalls[0].kind).toBe("execute");
   });
+
+  it("Skill tool → 'Read skill: <name>' title (categorizes as a skill load)", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Skill",
+        toolInput: { skill: "graphify", args: "some input" },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("Read skill: graphify");
+    // rawInput keeps the skill name so vscode-acp's detectSkillLoad can read it.
+    expect(toolCalls[0].rawInput.skill).toBe("graphify");
+  });
+
+  it("Skill tool without a name → bare 'Read skill' title", async () => {
+    const { updates } = await runWithEvents([
+      { type: "tool_use", toolName: "Skill", toolInput: {} },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("Read skill");
+  });
 });
 
 describe("Agent todo/plan updates", () => {

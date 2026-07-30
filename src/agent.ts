@@ -472,6 +472,25 @@ function buildToolCallUpdate(
         rawInput: toolInput ?? {},
       };
     }
+    case "Skill": {
+      // Claude Code's Skill tool invokes a skill (loading its SKILL.md and
+      // references). Mirror ericli's "Read skill: <name>" convention so
+      // vscode-acp's detectSkillLoad() recognizes it and folds it into the
+      // collapsed "loaded N skill(s)" summary instead of counting it as a
+      // generic execute/command. rawInput keeps the skill name under `skill`
+      // (detectSkillLoad's EricCLI branch reads ri.name || ri.skill).
+      const skillName =
+        typeof input.skill === "string" ? input.skill :
+        typeof input.name === "string" ? input.name : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: skillName ? `Read skill: ${skillName}` : "Read skill",
+        kind: "execute",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
     default: {
       return {
         sessionUpdate: "tool_call",
