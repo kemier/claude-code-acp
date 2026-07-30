@@ -33,6 +33,17 @@ vi.mock("../src/claude-runner.js", () => {
     this.startSessionStreaming = vi.fn().mockImplementation(
       async (_cwd: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
+        // Sentinel prompt to simulate a Claude CLI error result (e.g. the
+        // model hit the turn ceiling). Used by the error-surfacing test.
+        if (_prompt === "__error_max_turns__") {
+          onEvent({
+            type: "result",
+            usage: { input_tokens: 10, output_tokens: 5 },
+            stopReason: "error_max_turns",
+            isError: true,
+          });
+          return { text: "", sessionId: "claude-uuid-abc" };
+        }
         // Emit both a streaming text delta AND the final assistant block with
         // the same text — this is what --verbose mode does. The estimator must
         // count the text only once.
@@ -185,6 +196,22 @@ describe("slash commands & estimator", () => {
     // Turn 2 starts with turn 1's accumulated content carried forward plus
     // the new prompt, so it must NOT drop below turn 1's final value.
     expect(firstTurn2).toBeGreaterThanOrEqual(lastTurn1);
+  });
+
+  it("surfaces an error_max_turns result to the user instead of a silent end_turn", async () => {
+    const sid = await newSession();
+    // Sentinel prompt makes the mock emit an isError result with
+    // stopReason "error_max_turns" (model hit the turn ceiling mid-task).
+    const res = await prompt(sid, "__error_max_turns__");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const messages = calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk")
+      .map((c: any) => c[0].update.content.text);
+    // The user must see a visible message explaining the premature stop.
+    expect(messages.some((m: string) => /maximum number of turns/i.test(m))).toBe(true);
+    // The prompt still resolves (does not throw) — end_turn is returned.
+    expect(res.stopReason).toBe("end_turn");
   });
 });
 

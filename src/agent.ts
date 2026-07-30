@@ -699,11 +699,15 @@ export function createClaudeCodeAgent(
    * map and emit a `plan` session update snapshot. Returns true if the event
    * was a task tool (and thus handled here).
    *
-   * Claude tool_input shapes:
-   * - TaskCreate: { tasks: [{ subject, description, activeForm }] }
-   *   (ids are assigned by Claude CLI and surface only in the tool_result,
-   *    so we assign synthetic ids in creation order)
-   * - TaskUpdate: { taskId, status, subject?, description? }
+   * Claude tool_input shapes observed from GLM-5.2 (two valid TaskCreate forms):
+   * - Batch:    { tasks: [{ subject, description, activeForm }] }
+   * - Scalar:   { subject, description, activeForm }   (one task, top-level)
+   *   ids are assigned by Claude CLI and surface only in the tool_result, so
+   *   we assign synthetic ids `task-N` in creation order.
+   * - TaskUpdate: { taskId, status?, subject?, addBlockedBy?, owner? }
+   *   `taskId` is a numeric string ("1", "2") referencing the Nth task, OR a
+   *   Claude-internal id we never saw. We match by synthetic id (`task-N`),
+   *   then by `task-N` derived from a bare numeric id, then by subject.
    * - TaskList: {} (no-op; the list is already tracked)
    */
   function handleTaskTool(
@@ -723,33 +727,52 @@ export function createClaudeCodeAgent(
     const input = (toolInput ?? {}) as Record<string, any>;
 
     if (toolName === "TaskCreate") {
-      const tasks: Array<{ subject?: string; description?: string }> =
-        Array.isArray(input.tasks) ? input.tasks : [];
+      // Accept BOTH schemas: a `tasks` array (batch) OR a single task
+      // described by top-level subject/description/activeForm (scalar).
+      // GLM-5.2 emits the scalar form most often.
+      const batch: Array<Record<string, any>> = Array.isArray(input.tasks)
+        ? input.tasks
+        : [];
+      const scalar =
+        typeof input.subject === "string" || typeof input.description === "string"
+          ? [input]
+          : [];
+      const tasks = batch.length ? batch : scalar;
       for (const t of tasks) {
-        const content = t.subject || t.description || "task";
+        const content =
+          (typeof t.subject === "string" && t.subject) ||
+          (typeof t.description === "string" && t.description) ||
+          (typeof t.activeForm === "string" && t.activeForm) ||
+          "task";
         // Assign a synthetic id in creation order. Claude's real task ids
         // only surface in the tool_result (not the tool_use input), so we
-        // can't key on them; we match TaskUpdate by subject below instead.
+        // can't key on them; we match TaskUpdate by derived id/subject below.
         const id = `task-${todos.size + 1}`;
         todos.set(id, { content, status: "pending" });
       }
       logger.debug(`TaskCreate: +${tasks.length} task(s), list now ${todos.size}`);
     } else if (toolName === "TaskUpdate") {
-      const taskId = String(input.taskId ?? input.task_id ?? "");
+      const rawTaskId = String(input.taskId ?? input.task_id ?? "");
       const status = toPlanStatus(input.status);
       const subject =
         typeof input.subject === "string" && input.subject.trim()
           ? input.subject.trim()
           : "";
-      // Try to match an existing entry: by synthetic id first, then by
-      // subject content. Claude's TaskUpdate references Claude-internal ids
-      // we never saw, so id matching usually fails — subject matching is the
-      // reliable path. We must NOT add a spurious new entry on a failed
+      // Resolve a bare numeric id ("1") to our synthetic `task-N` form so a
+      // status flip keyed only by position still lands on the right entry.
+      let synthId = rawTaskId;
+      if (rawTaskId && !todos.has(rawTaskId) && /^\d+$/.test(rawTaskId)) {
+        synthId = `task-${rawTaskId}`;
+      }
+      // Try to match an existing entry: synthetic id first, then by subject
+      // content. Claude's TaskUpdate sometimes references Claude-internal ids
+      // we never saw, so id matching can fail — subject matching is the
+      // reliable fallback. We must NOT add a spurious new entry on a failed
       // match (that would inflate the count and is what caused "3 created,
       // only N shown" drift).
       let matchedId: string | null = null;
-      if (taskId && todos.has(taskId)) {
-        matchedId = taskId;
+      if (synthId && todos.has(synthId)) {
+        matchedId = synthId;
       } else if (subject) {
         for (const [id, t] of todos) {
           if (t.content === subject) { matchedId = id; break; }
@@ -758,7 +781,10 @@ export function createClaudeCodeAgent(
       if (matchedId) {
         const existing = todos.get(matchedId)!;
         if (subject) existing.content = subject;
-        existing.status = status;
+        // Only mutate status when the update actually carries one. A
+        // TaskUpdate with only `addBlockedBy`/`owner` (no `status`) must not
+        // reset an in_progress task back to pending.
+        if (input.status !== undefined) existing.status = status;
       } else if (subject) {
         // Update for a task we didn't see created AND we can't match by
         // subject — only then add it, so the count reflects a genuinely new
@@ -767,7 +793,7 @@ export function createClaudeCodeAgent(
         const id = `task-${todos.size + 1}`;
         todos.set(id, { content: subject, status });
       }
-      logger.debug(`TaskUpdate: taskId=${taskId} status=${status} matched=${matchedId ?? "none"}, list ${todos.size}`);
+      logger.debug(`TaskUpdate: taskId=${rawTaskId} status=${input.status ?? "(none)"} matched=${matchedId ?? "none"}, list ${todos.size}`);
     }
     // TaskList: nothing to apply; we already track the list.
 
@@ -1582,6 +1608,12 @@ export function createClaudeCodeAgent(
       const permissionPromises: Promise<void>[] = [];
 
       let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
+      // Track whether Claude CLI's final result was an error (e.g.
+      // error_max_turns) so we can surface it to the user instead of
+      // returning a silent end_turn. Mirrors codex-acp, which maps upstream
+      // turn failures to a visible error rather than an empty success.
+      let turnErrored = false;
+      let turnStopReason: string | undefined;
       const onEvent = (event: StreamEvent) => {
         // Handle system/init — extract native Claude CLI slash commands and
         // surface them to vscode-acp via available_commands_update.
@@ -1660,8 +1692,13 @@ export function createClaudeCodeAgent(
      //   value (sum of all API calls) is inflated on multi-call turns and
      //   triggers compaction way too early (e.g. 340k for a 27k context).
      //   Our estimate tracks actual conversation growth and is accurate.
-     if (event.type === "result" && event.usage) {
-      lastUsage = event.usage;
+     if (event.type === "result") {
+      // Capture the stop reason / error flag for the prompt return path.
+      // This runs even when the result carries no usage (some error results
+      // omit it), so an error_max_turns / failed turn is never silently
+      // swallowed as a plain end_turn.
+      turnStopReason = event.stopReason;
+      if (event.isError) turnErrored = true;
       // Log the stop reason so premature turn termination (end_turn vs
       // max_turns vs error) is diagnosable from the ACP stderr log.
       if (event.stopReason || event.isError) {
@@ -1669,6 +1706,8 @@ export function createClaudeCodeAgent(
           `Turn result: stopReason=${event.stopReason ?? "unknown"} isError=${!!event.isError}`,
         );
       }
+      if (event.usage) {
+      lastUsage = event.usage;
       const inputTokens = event.usage.input_tokens ?? 0;
       const outputTokens = event.usage.output_tokens ?? 0;
       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
@@ -1689,6 +1728,7 @@ export function createClaudeCodeAgent(
        }).catch(() => {
          // Best effort — don't fail the turn if usage_update fails.
        });
+      }
      }
        if ((event as any).type === "thinking" && (event as any).text) {
          ctxEstimator.addText((event as any).text);
@@ -2055,6 +2095,27 @@ export function createClaudeCodeAgent(
          }
         }
 
+        // If Claude CLI reported an error result (e.g. error_max_turns — the
+        // model hit the turn ceiling mid-task), surface it to the user as an
+        // agent message instead of a silent end_turn. This is what makes a
+        // genuinely premature stop distinguishable from a normal one; codex-acp
+        // does the same by mapping upstream failures to a visible error.
+        if (turnErrored) {
+          const reason = turnStopReason ?? "error";
+          await connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                type: "text",
+                text:
+                  reason === "error_max_turns"
+                    ? `Reached the maximum number of turns (${reason}) before finishing. The task may be incomplete — continue to resume.`
+                    : `Turn ended with status: ${reason}.`,
+              },
+            },
+          }).catch(() => {});
+        }
         return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
       } catch (err) {
         // Check if cancelled

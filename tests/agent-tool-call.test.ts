@@ -337,6 +337,101 @@ describe("Agent todo/plan updates", () => {
     expect(lastPlan.entries).toHaveLength(1);
     expect(lastPlan.entries[0].content).toBe("Only");
   });
+
+  it("TaskCreate scalar form (top-level subject) populates the plan — the GLM-5.2 live shape", async () => {
+    // Reproduces the exact traffic from ACP log 20260730T181212: GLM-5.2
+    // calls TaskCreate three times, each with a single task described by
+    // top-level subject/description/activeForm (NOT a `tasks` array).
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          activeForm: "Creating initial tasks",
+          description: "First test task — verify TaskCreate works.",
+          subject: "Create initial test task",
+        },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          activeForm: "Creating dependent task",
+          description: "Second test task that depends on task #1.",
+          subject: "Create dependent task",
+        },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          activeForm: "Creating standalone task",
+          description: "Third independent task for testing.",
+          subject: "Create standalone cleanup task",
+        },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    // All three scalar tasks must show up (previously emitted empty plans).
+    expect(lastPlan.entries).toHaveLength(3);
+    expect(lastPlan.entries.map((e: any) => e.content)).toEqual([
+      "Create initial test task",
+      "Create dependent task",
+      "Create standalone cleanup task",
+    ]);
+    expect(lastPlan.entries[0].status).toBe("pending");
+  });
+
+  it("TaskUpdate by bare numeric id flips the Nth task status (live shape)", async () => {
+    // Live traffic: TaskUpdate { taskId: "1", status: "in_progress" }.
+    // The numeric "1" must map to the first synthetic task (task-1).
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "First" }, { subject: "Second" }] },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        toolInput: { taskId: "1", status: "in_progress", owner: "claude" },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    expect(lastPlan.entries).toHaveLength(2);
+    expect(lastPlan.entries[0].status).toBe("in_progress");
+    expect(lastPlan.entries[1].status).toBe("pending");
+  });
+
+  it("TaskUpdate with only addBlockedBy (no status) does not reset status", async () => {
+    // Live traffic: TaskUpdate { taskId: "2", addBlockedBy: ["1"] }.
+    // No status field — an in_progress task must NOT be reset to pending.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "A" }, { subject: "B" }] },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        toolInput: { taskId: "1", status: "in_progress" },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        toolInput: { taskId: "2", addBlockedBy: ["1"] },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    // Task A stays in_progress; the dependency-only update didn't touch it.
+    expect(lastPlan.entries[0].status).toBe("in_progress");
+    // Task B is still pending (addBlockedBy doesn't carry a status).
+    expect(lastPlan.entries[1].status).toBe("pending");
+  });
 });
 
 describe("Subagent (Task tool) lifecycle", () => {
