@@ -491,6 +491,63 @@ function buildToolCallUpdate(
         rawInput: toolInput ?? {},
       };
     }
+    case "NotebookEdit": {
+      // Notebook cell edit — treat like a file edit (kind:edit) so it
+      // categorizes with the other edits in the collapsed summary.
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: filePath ? `Edit notebook '${name}'` : "Edit notebook",
+        kind: "edit",
+        status: "completed",
+        rawInput: toolInput ?? {},
+        ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      };
+    }
+    case "WebSearch": {
+      // Mirrors codex-acp/ericli: kind:search, "Web search: <query>".
+      const query =
+        typeof input.query === "string" ? input.query :
+        typeof input.prompt === "string" ? input.prompt : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: query ? `Web search: ${query}` : "Web search",
+        kind: "search",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+    case "WebFetch": {
+      // kind:fetch (the only ACP fetch kind), "Fetch '<url>'".
+      const url = typeof input.url === "string" ? input.url : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: url ? `Fetch '${url}'` : "Fetch URL",
+        kind: "fetch",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+    case "Task":
+    case "Agent": {
+      // Subagent spawn. Title from the task description/prompt (codex-acp
+      // uses "Start subagent <name>"); fall back to a generic label. Status
+      // is overridden to in_progress by the caller's subagent lifecycle.
+      const desc =
+        typeof input.description === "string" ? input.description :
+        typeof input.prompt === "string" ? input.prompt :
+        typeof input.subagent_type === "string" ? input.subagent_type : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: desc ? `Start subagent: ${desc.slice(0, 60)}` : "Start subagent",
+        kind: "other",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
     default: {
       return {
         sessionUpdate: "tool_call",
@@ -670,24 +727,47 @@ export function createClaudeCodeAgent(
         Array.isArray(input.tasks) ? input.tasks : [];
       for (const t of tasks) {
         const content = t.subject || t.description || "task";
+        // Assign a synthetic id in creation order. Claude's real task ids
+        // only surface in the tool_result (not the tool_use input), so we
+        // can't key on them; we match TaskUpdate by subject below instead.
         const id = `task-${todos.size + 1}`;
         todos.set(id, { content, status: "pending" });
       }
+      logger.debug(`TaskCreate: +${tasks.length} task(s), list now ${todos.size}`);
     } else if (toolName === "TaskUpdate") {
       const taskId = String(input.taskId ?? input.task_id ?? "");
       const status = toPlanStatus(input.status);
+      const subject =
+        typeof input.subject === "string" && input.subject.trim()
+          ? input.subject.trim()
+          : "";
+      // Try to match an existing entry: by synthetic id first, then by
+      // subject content. Claude's TaskUpdate references Claude-internal ids
+      // we never saw, so id matching usually fails — subject matching is the
+      // reliable path. We must NOT add a spurious new entry on a failed
+      // match (that would inflate the count and is what caused "3 created,
+      // only N shown" drift).
+      let matchedId: string | null = null;
       if (taskId && todos.has(taskId)) {
-        const existing = todos.get(taskId)!;
-        if (typeof input.subject === "string") existing.content = input.subject;
-        existing.status = status;
-      } else if (taskId) {
-        // Update for a task we didn't see created (e.g. list was pruned) —
-        // add it so the count stays accurate.
-        todos.set(taskId, {
-          content: typeof input.subject === "string" ? input.subject : `task ${taskId}`,
-          status,
-        });
+        matchedId = taskId;
+      } else if (subject) {
+        for (const [id, t] of todos) {
+          if (t.content === subject) { matchedId = id; break; }
+        }
       }
+      if (matchedId) {
+        const existing = todos.get(matchedId)!;
+        if (subject) existing.content = subject;
+        existing.status = status;
+      } else if (subject) {
+        // Update for a task we didn't see created AND we can't match by
+        // subject — only then add it, so the count reflects a genuinely new
+        // tracked item. Bare taskId with no subject is ignored (can't render
+        // it meaningfully and it's almost certainly a Claude-internal id).
+        const id = `task-${todos.size + 1}`;
+        todos.set(id, { content: subject, status });
+      }
+      logger.debug(`TaskUpdate: taskId=${taskId} status=${status} matched=${matchedId ?? "none"}, list ${todos.size}`);
     }
     // TaskList: nothing to apply; we already track the list.
 
@@ -1582,6 +1662,13 @@ export function createClaudeCodeAgent(
      //   Our estimate tracks actual conversation growth and is accurate.
      if (event.type === "result" && event.usage) {
       lastUsage = event.usage;
+      // Log the stop reason so premature turn termination (end_turn vs
+      // max_turns vs error) is diagnosable from the ACP stderr log.
+      if (event.stopReason || event.isError) {
+        logger.info(
+          `Turn result: stopReason=${event.stopReason ?? "unknown"} isError=${!!event.isError}`,
+        );
+      }
       const inputTokens = event.usage.input_tokens ?? 0;
       const outputTokens = event.usage.output_tokens ?? 0;
       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;

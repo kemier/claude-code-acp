@@ -293,6 +293,50 @@ describe("Agent todo/plan updates", () => {
     const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
     expect(plans).toHaveLength(0);
   });
+
+  it("TaskUpdate matches by subject when taskId is Claude-internal", async () => {
+    // Claude's TaskUpdate references an internal id we never saw at create
+    // time. It must match the existing entry by subject, NOT add a duplicate.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "Alpha" }, { subject: "Beta" }, { subject: "Gamma" }] },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        // Claude-internal id "10" we never issued; subject carries the match.
+        toolInput: { taskId: "10", status: "in_progress", subject: "Beta" },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    // Still 3 — no spurious 4th entry from the unmatched id.
+    expect(lastPlan.entries).toHaveLength(3);
+    const beta = lastPlan.entries.find((e: any) => e.content === "Beta");
+    expect(beta.status).toBe("in_progress");
+  });
+
+  it("TaskUpdate with an unmatched id and no subject does not inflate the list", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: { tasks: [{ subject: "Only" }] },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        // Bare Claude-internal id, no subject to match — must be ignored.
+        toolInput: { taskId: "99", status: "completed" },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    expect(lastPlan.entries).toHaveLength(1);
+    expect(lastPlan.entries[0].content).toBe("Only");
+  });
 });
 
 describe("Subagent (Task tool) lifecycle", () => {

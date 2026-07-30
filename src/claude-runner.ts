@@ -33,6 +33,10 @@ export interface StreamEvent {
  permissionId?: string;
  usage?: { input_tokens?: number; output_tokens?: number };
   slashCommands?: string[];
+  /** Claude CLI result stop reason (e.g. "end_turn", "max_turns"). */
+  stopReason?: string;
+  /** True when Claude CLI reports the result as an error (e.g. max turns). */
+  isError?: boolean;
   /** For assistant events: marks an API call boundary (for context estimation). */
   apiCallIndex?: number;
   /**
@@ -488,6 +492,11 @@ export class ClaudeRunner {
         text: parsed.result,
         sessionId: parsed.session_id,
         usage: parsed.usage,
+        // Claude CLI's stop reason/subtype — e.g. "end_turn", "max_turns",
+        // "stop_sequence". Surfaced so the agent can log/diagnose premature
+        // turn termination (vs a model that kept calling tools).
+        stopReason: parsed.subtype ?? parsed.stop_reason ?? parsed.stopReason,
+        isError: parsed.is_error === true || parsed.subtype === "error_max_turns",
       });
     }
   }
