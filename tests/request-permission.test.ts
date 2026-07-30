@@ -102,7 +102,8 @@ describe("session/request_permission", () => {
     const callArgs = (conn.requestPermission as any).mock.calls[0][0];
     expect(callArgs.sessionId).toBe(sessionId);
     expect(callArgs.toolCall).toBeDefined();
-    expect(callArgs.toolCall.title).toBe("Edit");
+    expect(callArgs.toolCall.title).toBe("Edit file 'test.ts'");
+    expect(callArgs.toolCall.kind).toBe("edit");
   });
 
   it("should include allow_once and reject_once options", async () => {
@@ -148,7 +149,21 @@ describe("session/request_permission", () => {
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     const pendingCall = toolCalls.find((u: any) => u.status === "pending");
     expect(pendingCall).toBeDefined();
-    expect(pendingCall.title).toBe("Edit");
+    // buildToolCallUpdate gives Edit a descriptive title + kind:edit + diff
+    // content + locations, carried through the pending → completed/failed
+    // lifecycle.
+    expect(pendingCall.title).toBe("Edit file 'test.ts'");
+    expect(pendingCall.kind).toBe("edit");
+    expect(pendingCall.content).toEqual([
+      {
+        type: "diff",
+        path: "/tmp/test.ts",
+        oldText: "foo",
+        newText: "bar",
+        _meta: { kind: "update" },
+      },
+    ]);
+    expect(pendingCall.locations).toEqual([{ path: "/tmp/test.ts" }]);
   });
 
   it("should send tool_call update with completed status after allow_once", async () => {

@@ -17,7 +17,10 @@ vi.mock("../src/validation.js", () => ({
   validateMcpArgs: vi.fn(),
 }));
 
-// Mock that simulates tool_use events in streaming
+// Shared, mutable event script. Each test sets `scriptedEvents` before
+// driving a prompt; the mock runner replays them.
+let scriptedEvents: StreamEvent[] = [];
+
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
     this.startSessionStreaming = vi.fn().mockImplementation(
@@ -26,15 +29,8 @@ vi.mock("../src/claude-runner.js", () => {
         _prompt: string,
         onEvent: (event: StreamEvent) => void
       ) => {
-        // Simulate text + tool_use events
-        onEvent({ type: "text_delta", text: "Let me read that file." });
-        onEvent({
-          type: "tool_use",
-          toolName: "Read",
-          toolInput: { file_path: "/tmp/test.ts" },
-        });
-        onEvent({ type: "text_delta", text: " Done reading." });
-        return { text: "Let me read that file. Done reading.", sessionId: "uuid-1" };
+        for (const e of scriptedEvents) onEvent(e);
+        return { text: "done", sessionId: "uuid-1" };
       }
     );
     this.continueSessionStreaming = vi.fn().mockResolvedValue({
@@ -58,48 +54,122 @@ function createMockConnection() {
   } as unknown as AgentSideConnection;
 }
 
-describe("Agent tool_call notifications", () => {
-  let conn: ReturnType<typeof createMockConnection>;
-  let agent: ReturnType<typeof createClaudeCodeAgent>;
+async function runWithEvents(events: StreamEvent[]) {
+  scriptedEvents = events;
+  const conn = createMockConnection();
+  const agent = createClaudeCodeAgent(conn);
+  await agent.initialize({
+    protocolVersion: 1,
+    clientCapabilities: {},
+    clientInfo: { name: "test", version: "1.0" },
+  });
+  const session = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  await agent.prompt({
+    sessionId: session.sessionId,
+    prompt: [{ type: "text", text: "go" }],
+  });
+  const calls = (conn.sessionUpdate as any).mock.calls;
+  const updates = calls.map((c: any) => c[0].update);
+  return { updates, conn };
+}
 
+describe("Agent tool_call notifications", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    conn = createMockConnection();
-    agent = createClaudeCodeAgent(conn);
+    scriptedEvents = [];
   });
 
-  it("should send tool_call updates for tool_use events", async () => {
-    await agent.initialize({
-      protocolVersion: 1,
-      clientCapabilities: {},
-      clientInfo: { name: "test", version: "1.0" },
-    });
-    const session = await agent.newSession({
-      cwd: "/tmp",
-      mcpServers: [],
-    });
-
-    await agent.prompt({
-      sessionId: session.sessionId,
-      prompt: [{ type: "text", text: "read the file" }],
-    });
-
-    const calls = (conn.sessionUpdate as any).mock.calls;
-    const updates = calls.map((c: any) => c[0].update);
-
-    // Should have text chunks and a tool_call
-    const textChunks = updates.filter(
-      (u: any) => u.sessionUpdate === "agent_message_chunk"
-    );
-    const toolCalls = updates.filter(
-      (u: any) => u.sessionUpdate === "tool_call"
-    );
-
-    expect(textChunks.length).toBeGreaterThanOrEqual(2);
+  it("Read tool → descriptive title + kind:read + locations", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Read",
+        toolInput: { file_path: "/tmp/test.ts" },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     expect(toolCalls).toHaveLength(1);
-    expect(toolCalls[0].title).toBe("Read");
-    expect(toolCalls[0].rawInput).toEqual({
-      file_path: "/tmp/test.ts",
-    });
+    expect(toolCalls[0].title).toBe("Read file 'test.ts'");
+    expect(toolCalls[0].kind).toBe("read");
+    expect(toolCalls[0].locations).toEqual([{ path: "/tmp/test.ts" }]);
+  });
+
+  it("Edit tool → kind:edit + diff content (old/new) + locations", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Edit",
+        toolInput: {
+          file_path: "/tmp/foo.ts",
+          old_string: "a",
+          new_string: "b",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].title).toBe("Edit file 'foo.ts'");
+    expect(toolCalls[0].kind).toBe("edit");
+    expect(toolCalls[0].content).toEqual([
+      {
+        type: "diff",
+        path: "/tmp/foo.ts",
+        oldText: "a",
+        newText: "b",
+        _meta: { kind: "update" },
+      },
+    ]);
+    expect(toolCalls[0].locations).toEqual([{ path: "/tmp/foo.ts" }]);
+  });
+
+  it("Write tool → kind:edit + diff content (oldText null) + _meta kind:add", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Write",
+        toolInput: { file_path: "/tmp/new.ts", content: "hello" },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("Write file 'new.ts'");
+    expect(toolCalls[0].kind).toBe("edit");
+    expect(toolCalls[0].content[0].oldText).toBeNull();
+    expect(toolCalls[0].content[0].newText).toBe("hello");
+    expect(toolCalls[0].content[0]._meta).toEqual({ kind: "add" });
+  });
+
+  it("Bash tool → kind:execute + command title", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: { command: "npm test" },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("npm test");
+    expect(toolCalls[0].kind).toBe("execute");
+  });
+
+  it("Grep tool → kind:search + 'Search for' title", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Grep",
+        toolInput: { pattern: "TODO", path: "/tmp/src" },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].kind).toBe("search");
+    expect(toolCalls[0].title).toContain("Search for 'TODO'");
+  });
+
+  it("unknown tool → falls back to tool name + kind:execute", async () => {
+    const { updates } = await runWithEvents([
+      { type: "tool_use", toolName: "CustomTool", toolInput: { x: 1 } },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("CustomTool");
+    expect(toolCalls[0].kind).toBe("execute");
   });
 });

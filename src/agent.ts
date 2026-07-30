@@ -20,6 +20,9 @@ import {
   type SetSessionModeResponse,
   type SetSessionConfigOptionRequest,
   type SetSessionConfigOptionResponse,
+  type ToolKind,
+  type ToolCallContent,
+  type ToolCallLocation,
 } from "@agentclientprotocol/sdk";
 import { SessionStore } from "./session-store.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
@@ -316,6 +319,172 @@ function sendEstimatedUsage(
   });
 }
 
+/**
+ * Basename of a file path for compact titles (e.g. "/a/b/c.ts" → "c.ts").
+ * Falls back to the full path if it's already short or not a string.
+ */
+function shortName(filePath: unknown): string {
+  const p = typeof filePath === "string" ? filePath : "";
+  if (!p) return "";
+  const base = p.split("/").pop() || p;
+  return base.length <= 48 ? base : base.slice(0, 45) + "…";
+}
+
+/**
+ * Build an ACP tool_call session update from a Claude CLI tool_use event,
+ * mirroring codex-acp's CodexToolCallMapper: a descriptive title, the correct
+ * `kind`, and — for file edits — a diff `content` block plus `locations` so
+ * vscode-acp renders the action verb and a click-to-open diff instead of a
+ * bare filename + checkmark.
+ *
+ * Claude tool_input shapes:
+ * - Read / Write / Edit: { file_path, ... }
+ * - Edit: { file_path, old_string, new_string }
+ * - MultiEdit: { file_path, edits: [{ old_string, new_string }] }
+ * - Bash: { command }
+ * - Glob: { pattern }, Grep: { pattern, path? }, etc.
+ */
+function buildToolCallUpdate(
+  toolCallId: string,
+  toolName: string,
+  toolInput: unknown,
+): {
+  sessionUpdate: "tool_call";
+  toolCallId: string;
+  title: string;
+  kind: ToolKind;
+  status: "completed";
+  rawInput: unknown;
+  content?: ToolCallContent[];
+  locations?: ToolCallLocation[];
+} {
+  const input = (toolInput ?? {}) as Record<string, any>;
+  const filePath: string | undefined =
+    typeof input.file_path === "string" ? input.file_path : undefined;
+  const name = shortName(filePath);
+
+  switch (toolName) {
+    case "Read": {
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: filePath ? `Read file '${name}'` : "Read file",
+        kind: "read",
+        status: "completed",
+        rawInput: toolInput ?? {},
+        ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      };
+    }
+    case "Write": {
+      // New/overwritten file: oldText null, newText = full content.
+      const content = typeof input.content === "string" ? input.content : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: filePath ? `Write file '${name}'` : "Write file",
+        kind: "edit",
+        status: "completed",
+        rawInput: toolInput ?? {},
+        content: filePath
+          ? [{ type: "diff", path: filePath, oldText: null, newText: content, _meta: { kind: "add" } }]
+          : undefined,
+        ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      };
+    }
+    case "Edit": {
+      const oldText = typeof input.old_string === "string" ? input.old_string : "";
+      const newText = typeof input.new_string === "string" ? input.new_string : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: filePath ? `Edit file '${name}'` : "Edit file",
+        kind: "edit",
+        status: "completed",
+        rawInput: toolInput ?? {},
+        content: filePath
+          ? [{ type: "diff", path: filePath, oldText, newText, _meta: { kind: "update" } }]
+          : undefined,
+        ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      };
+    }
+    case "MultiEdit": {
+      // Merge all edits into one diff: oldText = joined old_strings,
+      // newText = joined new_strings (good enough for a visual diff preview).
+      const edits: Array<{ old_string?: string; new_string?: string }> =
+        Array.isArray(input.edits) ? input.edits : [];
+      const oldText = edits.map((e) => e.old_string ?? "").join("\n");
+      const newText = edits.map((e) => e.new_string ?? "").join("\n");
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: filePath ? `Edit file '${name}'` : "Edit file",
+        kind: "edit",
+        status: "completed",
+        rawInput: toolInput ?? {},
+        content: filePath
+          ? [{ type: "diff", path: filePath, oldText, newText, _meta: { kind: "update" } }]
+          : undefined,
+        ...(filePath ? { locations: [{ path: filePath }] } : {}),
+      };
+    }
+    case "Bash":
+    case "bash": {
+      const command =
+        typeof input.command === "string"
+          ? input.command
+          : Array.isArray(input.command)
+            ? input.command.join(" ")
+            : toolName;
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: command,
+        kind: "execute",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+    case "Glob": {
+      const pattern = typeof input.pattern === "string" ? input.pattern : "";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: pattern ? `Search for '${pattern}'` : "Search files",
+        kind: "search",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+    case "Grep": {
+      const pattern = typeof input.pattern === "string" ? input.pattern : "";
+      const path = typeof input.path === "string" ? input.path : "";
+      const title = pattern && path
+        ? `Search for '${pattern}' in ${shortName(path)}`
+        : pattern
+          ? `Search for '${pattern}'`
+          : "Search";
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title,
+        kind: "search",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+    default: {
+      return {
+        sessionUpdate: "tool_call",
+        toolCallId,
+        title: toolName,
+        kind: "execute",
+        status: "completed",
+        rawInput: toolInput ?? {},
+      };
+    }
+  }
+}
+
 /** Parse a slash command from prompt text. Returns null if not a command. */
 function parseSlashCommand(prompt: string): { name: string; rest: string } | null {
   const trimmed = prompt.trim();
@@ -419,6 +588,99 @@ export function createClaudeCodeAgent(
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
+
+  // ─── Todo list (plan) tracking ───────────────────────────────────────────
+  // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
+  // We mirror them into ACP `session/update` with sessionUpdate:"plan" +
+  // entries:PlanEntry[] so vscode-acp renders a plan bar with the task count
+  // (like codex-acp's update_plan). The plan is a full snapshot replacement
+  // each time, so the count reflects the current list size — not a running
+  // total of updates (the user wants "how many todo list", not "how many
+  // updates").
+  // taskId → { content, status }. Order preserved by insertion.
+  const sessionTodos = new Map<string, Map<string, { content: string; status: string }>>();
+
+  /** Normalize Claude's task status to an ACP PlanEntryStatus. */
+  function toPlanStatus(s: unknown): "pending" | "in_progress" | "completed" {
+    const v = String(s ?? "").toLowerCase();
+    if (v === "completed" || v === "done") return "completed";
+    if (v === "in_progress" || v === "in-progress" || v === "running") return "in_progress";
+    return "pending";
+  }
+
+  /**
+   * Apply a TaskCreate/TaskUpdate/TaskList tool call to the per-session todo
+   * map and emit a `plan` session update snapshot. Returns true if the event
+   * was a task tool (and thus handled here).
+   *
+   * Claude tool_input shapes:
+   * - TaskCreate: { tasks: [{ subject, description, activeForm }] }
+   *   (ids are assigned by Claude CLI and surface only in the tool_result,
+   *    so we assign synthetic ids in creation order)
+   * - TaskUpdate: { taskId, status, subject?, description? }
+   * - TaskList: {} (no-op; the list is already tracked)
+   */
+  function handleTaskTool(
+    sessionId: string,
+    toolName: string,
+    toolInput: unknown,
+  ): boolean {
+    if (toolName !== "TaskCreate" && toolName !== "TaskUpdate" && toolName !== "TaskList") {
+      return false;
+    }
+    let todos = sessionTodos.get(sessionId);
+    if (!todos) {
+      todos = new Map();
+      sessionTodos.set(sessionId, todos);
+    }
+
+    const input = (toolInput ?? {}) as Record<string, any>;
+
+    if (toolName === "TaskCreate") {
+      const tasks: Array<{ subject?: string; description?: string }> =
+        Array.isArray(input.tasks) ? input.tasks : [];
+      for (const t of tasks) {
+        const content = t.subject || t.description || "task";
+        const id = `task-${todos.size + 1}`;
+        todos.set(id, { content, status: "pending" });
+      }
+    } else if (toolName === "TaskUpdate") {
+      const taskId = String(input.taskId ?? input.task_id ?? "");
+      const status = toPlanStatus(input.status);
+      if (taskId && todos.has(taskId)) {
+        const existing = todos.get(taskId)!;
+        if (typeof input.subject === "string") existing.content = input.subject;
+        existing.status = status;
+      } else if (taskId) {
+        // Update for a task we didn't see created (e.g. list was pruned) —
+        // add it so the count stays accurate.
+        todos.set(taskId, {
+          content: typeof input.subject === "string" ? input.subject : `task ${taskId}`,
+          status,
+        });
+      }
+    }
+    // TaskList: nothing to apply; we already track the list.
+
+    // Emit a full plan snapshot. vscode-acp replaces the plan with each
+    // update and renders the entry count.
+    const entries = Array.from(todos.entries()).map(([_id, t]) => ({
+      content: t.content,
+      priority: "medium" as const,
+      status: t.status as "pending" | "in_progress" | "completed",
+    }));
+    connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "plan",
+        entries,
+      } as any,
+    }).catch(() => {
+      // Best effort.
+    });
+    return true;
+  }
+
 
   /**
    * Steering notification — injects a user message into the active turn.
@@ -1298,16 +1560,13 @@ export function createClaudeCodeAgent(
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
          const toolCallId = `call_${++toolCallCounter}`;
          logger.debug(`Tool call: ${event.toolName}`);
+         // Build a descriptive title + kind + (for edits) diff content +
+         // locations, mirroring codex-acp, so the chat UI shows the action
+         // verb and a click-to-open diff instead of a bare filename.
+         const update = buildToolCallUpdate(toolCallId, event.toolName, event.toolInput);
          connection.sessionUpdate({
            sessionId,
-           update: {
-             sessionUpdate: "tool_call",
-             toolCallId,
-             title: event.toolName,
-             kind: "execute",
-             status: "completed",
-             rawInput: event.toolInput ?? {},
-           },
+           update,
          });
        } else if (event.type === "permission_request" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
@@ -1316,17 +1575,14 @@ export function createClaudeCodeAgent(
          const toolInput = event.toolInput ?? {};
          logger.info(`Permission request: ${toolName}`);
 
+          // Build the descriptive title + kind + diff content once, then reuse
+          // across the pending → completed/failed lifecycle.
+          const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput);
+
           // Send pending tool_call status
           connection.sessionUpdate({
             sessionId,
-            update: {
-              sessionUpdate: "tool_call",
-              toolCallId,
-              title: toolName,
-              kind: "execute",
-              status: "pending",
-              rawInput: toolInput,
-            },
+            update: { ...baseUpdate, status: "pending" },
           });
 
           // Request permission from client (track promise for awaiting)
@@ -1335,8 +1591,8 @@ export function createClaudeCodeAgent(
               sessionId,
               toolCall: {
                 toolCallId,
-                title: toolName,
-                kind: "execute",
+                title: baseUpdate.title,
+                kind: baseUpdate.kind as any,
                 status: "pending",
                 rawInput: toolInput,
               },
@@ -1360,12 +1616,8 @@ export function createClaudeCodeAgent(
               connection.sessionUpdate({
                 sessionId,
                 update: {
-                  sessionUpdate: "tool_call",
-                  toolCallId,
-                  title: toolName,
-                  kind: "execute",
+                  ...baseUpdate,
                   status: isApproved ? "completed" : "failed",
-                  rawInput: toolInput,
                 },
               });
             })
@@ -1375,14 +1627,7 @@ export function createClaudeCodeAgent(
               );
               connection.sessionUpdate({
                 sessionId,
-                update: {
-                  sessionUpdate: "tool_call",
-                  toolCallId,
-                  title: toolName,
-                  kind: "execute",
-                  status: "failed",
-                  rawInput: toolInput,
-                },
+                update: { ...baseUpdate, status: "failed" },
               });
             });
 
