@@ -1424,6 +1424,63 @@ export function createClaudeCodeAgent(
        toolCallCounter = 0;
        permissionPromises.length = 0;
        logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
+
+          // Check if the steered text is a slash command. If so, handle it
+          // via the same slash command logic as prompt() instead of sending
+          // it as raw text to Claude CLI. This ensures /goal, /clear, etc.
+          // work correctly when queued via steering during /compact or
+          // another in-flight turn.
+          const steerCmd = parseSlashCommand(steerText);
+          if (steerCmd) {
+            const { name: cmdName, rest: cmdRest } = steerCmd;
+            logger.info(`Steer drain: handling slash command /${cmdName} for session ${sessionId}`);
+
+            if (cmdName === "goal") {
+              const argument = cmdRest.trim();
+              const lowerArg = argument.toLowerCase();
+              if (argument && lowerArg !== "clear" && lowerArg !== "pause" && lowerArg !== "resume" && argument.length <= 4000) {
+                sessionGoals.set(sessionId, { text: argument, paused: false });
+                await connection.sessionUpdate({
+                  sessionId,
+                  update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` } } as any,
+                });
+                const goalPromptText = `Please start working toward this goal now:\n\n${argument}`;
+                try {
+                  ctxEstimator.addText(goalPromptText);
+                  await runner.continueSessionStreaming(claudeSid, goalPromptText, onEvent, sessionId, modelOverride, effectiveEffort);
+                  await Promise.all(permissionPromises);
+                } catch (goalErr) {
+                  logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
+                }
+              } else if (lowerArg === "clear") {
+                sessionGoals.delete(sessionId);
+                await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Goal cleared." } } as any });
+              } else if (lowerArg === "pause") {
+                const g = sessionGoals.get(sessionId);
+                if (g) { g.paused = true; await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Goal paused." } } as any }); }
+              } else if (lowerArg === "resume") {
+                const g = sessionGoals.get(sessionId);
+                if (g) { g.paused = false; await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `Goal resumed: ${g.text.slice(0, 100)}` } } as any }); }
+              }
+              continue;
+            }
+
+            if (cmdName === "clear") {
+              const clearCwd = store.getCwd(sessionId)!;
+              store.clearPersistedSession(clearCwd);
+              store.setClaudeSessionId(sessionId, "");
+              sessionGoals.delete(sessionId);
+              await connection.sessionUpdate({ sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Conversation cleared. Starting fresh." } } as any });
+              continue;
+            }
+
+            if (cmdName === "compact") {
+              await doCompact(sessionId, connection, runner, store, modelOverride, effectiveEffort, true);
+              continue;
+            }
+            // Read-only commands (ps, status, skills) fall through to raw text
+          }
+
         try {
           // Prepend goal to steer messages too
           const steerPrompt = activeGoal && !activeGoal.paused
