@@ -78,7 +78,7 @@ describe("ClaudeCodeAgent", () => {
       expect(result.protocolVersion).toBe(1);
       expect(result.agentInfo?.name).toBe("claude-code-acp");
       expect(result.agentCapabilities).toBeDefined();
-      expect(result.agentCapabilities?.loadSession).toBe(false);
+      expect(result.agentCapabilities?.loadSession).toBe(true);
     });
 
     it("should advertise no auth methods", async () => {

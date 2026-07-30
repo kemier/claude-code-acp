@@ -68,12 +68,12 @@ describe("Agent modes and config", () => {
       expect(result.sessionId).toBeDefined();
       expect((result as any).modes).toBeDefined();
       expect((result as any).modes.availableModes).toHaveLength(3);
-      expect((result as any).modes.currentModeId).toBe("code");
+      expect((result as any).modes.currentModeId).toBe("agent");
 
       const modeIds = (result as any).modes.availableModes.map((m: any) => m.id);
-      expect(modeIds).toContain("code");
-      expect(modeIds).toContain("ask");
-      expect(modeIds).toContain("architect");
+      expect(modeIds).toContain("read-only");
+      expect(modeIds).toContain("agent");
+      expect(modeIds).toContain("agent-full-access");
     });
 
     it("should include configOptions in newSession response", async () => {

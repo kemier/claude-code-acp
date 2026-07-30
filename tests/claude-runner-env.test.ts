@@ -27,12 +27,16 @@ function createMockProcess(output: string, exitCode = 0): ChildProcess {
   return proc;
 }
 
-describe("ClaudeRunner env sanitization", () => {
+// On the ericai-proxy branch, sanitizeEnv() keeps the entire process.env
+// (including ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN) so the claude CLI
+// routes through our CCR gateway → ericai-proxy → EricAI vLLM. The upstream
+// repo deletes these to force subscription auth; this branch needs them.
+describe("ClaudeRunner env preservation (ericai-proxy branch)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it("should not have ANTHROPIC_API_KEY key in env at all", async () => {
+  it("should keep ANTHROPIC_API_KEY in the subprocess env", async () => {
     process.env.ANTHROPIC_API_KEY = "sk-test-key";
 
     const runner = new ClaudeRunner({
@@ -50,12 +54,12 @@ describe("ClaudeRunner env sanitization", () => {
     await runner.startSession("/tmp", "test");
 
     const spawnEnv = (mockSpawn.mock.calls[0][2] as any).env;
-    expect("ANTHROPIC_API_KEY" in spawnEnv).toBe(false);
+    expect(spawnEnv.ANTHROPIC_API_KEY).toBe("sk-test-key");
 
     delete process.env.ANTHROPIC_API_KEY;
   });
 
-  it("should not have ANTHROPIC_AUTH_TOKEN key in env", async () => {
+  it("should keep ANTHROPIC_AUTH_TOKEN in the subprocess env", async () => {
     process.env.ANTHROPIC_AUTH_TOKEN = "token-test";
 
     const runner = new ClaudeRunner({
@@ -73,13 +77,14 @@ describe("ClaudeRunner env sanitization", () => {
     await runner.startSession("/tmp", "test");
 
     const spawnEnv = (mockSpawn.mock.calls[0][2] as any).env;
-    expect("ANTHROPIC_AUTH_TOKEN" in spawnEnv).toBe(false);
+    expect(spawnEnv.ANTHROPIC_AUTH_TOKEN).toBe("token-test");
 
     delete process.env.ANTHROPIC_AUTH_TOKEN;
   });
 
-  it("should preserve other env variables", async () => {
-    process.env.MY_CUSTOM_VAR = "keep-me";
+  it("should pass through ANTHROPIC_BASE_URL and ANTHROPIC_MODEL", async () => {
+    process.env.ANTHROPIC_BASE_URL = "http://127.0.0.1:3457";
+    process.env.ANTHROPIC_MODEL = "glm-5.2";
 
     const runner = new ClaudeRunner({
       model: undefined,
@@ -96,8 +101,10 @@ describe("ClaudeRunner env sanitization", () => {
     await runner.startSession("/tmp", "test");
 
     const spawnEnv = (mockSpawn.mock.calls[0][2] as any).env;
-    expect(spawnEnv.MY_CUSTOM_VAR).toBe("keep-me");
+    expect(spawnEnv.ANTHROPIC_BASE_URL).toBe("http://127.0.0.1:3457");
+    expect(spawnEnv.ANTHROPIC_MODEL).toBe("glm-5.2");
 
-    delete process.env.MY_CUSTOM_VAR;
+    delete process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_MODEL;
   });
 });
