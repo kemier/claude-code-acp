@@ -338,6 +338,22 @@ describe("Agent todo/plan updates", () => {
     expect(lastPlan.entries[0].content).toBe("Only");
   });
 
+  it("TaskUpdate with NO prior TaskCreate emits no plan (no empty 'Plan (no content)')", async () => {
+    // Reproduces the memory-replay bug from ACP log 20260730T192213: in a new
+    // session GLM-5.2 read prior context and called TaskUpdate {taskId:"1"/"2"/"3",
+    // status:"completed"} WITHOUT any TaskCreate. sessionTodos was empty, so each
+    // TaskUpdate emitted entries:[] — the UI flashed an empty "Plan (no content)".
+    // Fix: when there is nothing tracked, skip the plan emission entirely.
+    const { updates } = await runWithEvents([
+      { type: "tool_use", toolName: "TaskUpdate", toolInput: { taskId: "1", status: "completed" } },
+      { type: "tool_use", toolName: "TaskUpdate", toolInput: { taskId: "2", status: "completed" } },
+      { type: "tool_use", toolName: "TaskUpdate", toolInput: { taskId: "3", status: "completed" } },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    // No empty plan frames — nothing to show.
+    expect(plans).toHaveLength(0);
+  });
+
   it("TaskCreate scalar form (top-level subject) populates the plan — the GLM-5.2 live shape", async () => {
     // Reproduces the exact traffic from ACP log 20260730T181212: GLM-5.2
     // calls TaskCreate three times, each with a single task described by

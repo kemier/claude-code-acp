@@ -797,8 +797,15 @@ export function createClaudeCodeAgent(
     }
     // TaskList: nothing to apply; we already track the list.
 
-    // Emit a full plan snapshot. vscode-acp replaces the plan with each
-    // update and renders the entry count.
+    // Emit a full plan snapshot — but ONLY when there is at least one tracked
+    // todo. An empty snapshot would render as "Plan (no content)" in the UI,
+    // which happens when the model calls TaskUpdate on tasks it never created
+    // (e.g. GLM-5.2 replaying task ids it saw in memory/prior context across a
+    // new session where sessionTodos is empty). In that case there is genuinely
+    // nothing to plan, so we skip the emission rather than flash an empty bar.
+    if (todos.size === 0) {
+      return true;
+    }
     const entries = Array.from(todos.entries()).map(([_id, t]) => ({
       content: t.content,
       priority: "medium" as const,
