@@ -149,6 +149,12 @@ export class ClaudeRunner {
       "--output-format",
       "stream-json",
       "--verbose",
+      // Emit per-token deltas (wrapped in `stream_event`) so assistant text
+      // renders progressively instead of landing as one large chunk. Without
+      // this the CLI only sends the completed `assistant` message, so the
+      // client creates a bubble and immediately supersedes it — a visibly
+      // empty bubble that flashes and disappears at each text→tool boundary.
+      "--include-partial-messages",
       ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
     return this.runStreaming(args, cwd, onEvent, trackingId);
@@ -170,6 +176,12 @@ export class ClaudeRunner {
       "--output-format",
       "stream-json",
       "--verbose",
+      // Emit per-token deltas (wrapped in `stream_event`) so assistant text
+      // renders progressively instead of landing as one large chunk. Without
+      // this the CLI only sends the completed `assistant` message, so the
+      // client creates a bubble and immediately supersedes it — a visibly
+      // empty bubble that flashes and disappears at each text→tool boundary.
+      "--include-partial-messages",
       ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
     return this.runStreaming(args, undefined, onEvent, trackingId);
@@ -190,6 +202,7 @@ export class ClaudeRunner {
         "--output-format",
         "stream-json",
         "--verbose",
+        "--include-partial-messages",
         ...this.buildExtraArgs(),
         ...mcpArgs,
       ];
@@ -400,6 +413,16 @@ export class ClaudeRunner {
       return;
     }
 
+    // Unwrap the `--include-partial-messages` envelope. Claude CLI does NOT emit
+    // bare `content_block_delta` / `message_delta` lines — it nests them as
+    // {"type":"stream_event","event":{"type":"content_block_delta","delta":{…}}}.
+    // The handlers below match on the INNER shape, so without this unwrap they
+    // never fire and all assistant text arrives only as the completed
+    // `assistant` message (one big chunk → the empty-bubble flash).
+    if (parsed.type === "stream_event" && parsed.event && typeof parsed.event === "object") {
+      parsed = parsed.event;
+    }
+
    // Handle content_block_delta (streaming text)
     if (
       parsed.type === "content_block_delta" &&
@@ -511,11 +534,11 @@ export class ClaudeRunner {
    // Handle message_delta — carries per-call usage (the REAL current
    // context size), unlike the result event which has cumulative usage.
    if (parsed.type === "message_delta" && parsed.usage) {
-      // NOTE: Claude CLI does NOT forward message_delta events to stdout in
-      // stream-json mode (includePartialMessages defaults to false in
-      // QueryEngine.ts). This handler exists for future-proofing but will
-      // never fire with current Claude CLI versions. Usage tracking relies on
-      // the result event instead (see agent.ts).
+      // Reachable now that --include-partial-messages is passed and the
+      // `stream_event` envelope is unwrapped above. Emitted for completeness;
+      // agent.ts does not consume it, because per-call usage is taken from each
+      // `assistant` message's `message.usage`, which carries the full prompt
+      // size (input + cache tokens) rather than just the output delta.
       onEvent({
         type: "message_delta",
         usage: {

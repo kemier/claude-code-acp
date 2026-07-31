@@ -1908,16 +1908,16 @@ export function createClaudeCodeAgent(
       // turn failures to a visible error rather than an empty success.
       let turnErrored = false;
       let turnStopReason: string | undefined;
-      // In --verbose mode Claude CLI emits per-token content_block_delta text
-      // DURING generation, then a final `assistant` message block re-emitting
-      // the FULL text immediately before the tool_use in the same content
-      // array. Emitting that final-block text as an agent_message_chunk lands
-      // it ~1ms before the tool_call, which defeats vscode-acp's 80ms streaming
-      // render window → an empty assistant bubble at every text→tool transition
-      // (codex-acp streams per-token only and never re-emits, so it doesn't hit
-      // this). Track whether we already streamed deltas for the current
-      // assistant message; if so, the final-block text is redundant for the UI
-      // and is dropped (context estimation still counts it, see below).
+      // Claude CLI emits per-token text deltas only when launched with
+      // --include-partial-messages (claude-runner passes it), and wraps them in
+      // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
+      // completed `assistant` message block re-stating the FULL text. Emitting
+      // both would duplicate the reply, so the final block is dropped for the
+      // UI when deltas already delivered it (context estimation still counts
+      // the final block — see below). Before the flag was passed there were no
+      // deltas at all, so the whole reply arrived as one chunk and the client
+      // painted a bubble it immediately superseded: the empty bubble that
+      // flashed and vanished at every text→tool boundary.
       let streamedTextThisMessage = false;
       const onEvent = (event: StreamEvent) => {
         // Handle system/init — extract native Claude CLI slash commands and
@@ -1992,10 +1992,9 @@ export function createClaudeCodeAgent(
      // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
      // but real context is ~20k).
      //
-     // Claude CLI does NOT forward message_delta events to stdout in
-     // stream-json mode (includePartialMessages defaults to false), so we
-     // cannot get per-call usage from the stream. The result event is our
-     // only source.
+     // Per-call usage comes from each `assistant` message's `message.usage`
+     // (see the assistant handler above), which is exact. The result event's
+     // usage is only a fallback for the pre-first-call window.
      //
     // Strategy:
     // - For the UI: use our real-time estimate (ctxEstimator), which is more
