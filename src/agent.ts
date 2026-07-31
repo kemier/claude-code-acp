@@ -234,17 +234,28 @@ const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: 
 const sessionEstimators = new Map<string, TurnContextEstimator>();
 
 // ─── Real-time context estimation ──────────────────────────────────────────
-// Claude CLI only reports usage in the result event at turn END (cumulative).
-// To show usage DURING the turn, we estimate context size from stream events:
-// accumulate conversation content (text, tool calls, tool results) and add
-// the fixed overhead (system prompt + tool definitions).
-// Approximate token count: ~4 chars per token (rough heuristic).
-const CHARS_PER_TOKEN = 4;
+// Claude CLI reports the REAL prompt size on every `assistant` message
+// (`message.usage.input_tokens` + cache read/creation tokens = the exact
+// number of prompt tokens the provider counted for that API call). That value
+// is authoritative and is used as the context size whenever available.
+//
+// Character-based estimation is only a fallback for the window before the
+// first assistant message of a session arrives, and as a short-lived
+// increment on top of the last real count so the usage ring still moves while
+// a long tool sequence runs. Measured against a real 118k-token transcript,
+// the old pure-character estimate was off by ~25% (it read 91,336 for a real
+// 118,035), and it counted subagent traffic that never enters the parent's
+// context at all — which is what made the ring diverge from reality and let
+// auto-compact fire at the wrong time.
+//
+// Approximate token count for the fallback path: ~3 chars per token. (4 was
+// measured to under-report by ~25% on code/JSON-heavy conversations.)
+const CHARS_PER_TOKEN = 3;
 // Claude CLI system prompt is ~7KB. Tools (24 defs) are ~65KB. These are sent
 // on EVERY API call. Pre-computed: 7148 + 65600 = 72748 bytes overhead.
 const CLAUDE_OVERHEAD_BYTES = 72748;
 
-/** Estimate tokens from a character count (rough: 4 chars ≈ 1 token). */
+/** Estimate tokens from a character count (rough: 3 chars ≈ 1 token). */
 function estimateTokensFromChars(chars: number): number {
   return Math.ceil(chars / CHARS_PER_TOKEN);
 }
@@ -253,42 +264,80 @@ function estimateTokensFromChars(chars: number): number {
 class TurnContextEstimator {
   private contentBytes = 0;
   private apiCallCount = 0;
+  /**
+   * Real prompt tokens from the most recent non-sidechain assistant message.
+   * 0 until the first one arrives. Authoritative when > 0.
+   */
+  private realTokens = 0;
+  /** Content accumulated since `realTokens` was last refreshed. */
+  private bytesSinceReal = 0;
 
   /** Called when a new assistant event arrives (marks an API call boundary). */
   markApiCall(): void {
     this.apiCallCount++;
   }
 
+  /**
+   * Record the REAL prompt size reported by Claude CLI for one API call.
+   * Supersedes character estimation from this point on. Callers must skip
+   * sidechain (subagent) events — those measure a different conversation.
+   */
+  setRealTokens(tokens: number): void {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    this.realTokens = tokens;
+    this.bytesSinceReal = 0;
+  }
+
+  /** True once a real per-call token count has been observed. */
+  hasRealTokens(): boolean {
+    return this.realTokens > 0;
+  }
+
   /** Accumulate text content (assistant messages, thinking, tool results). */
   addText(text: string): void {
-    if (text) this.contentBytes += text.length;
+    if (text) {
+      this.contentBytes += text.length;
+      this.bytesSinceReal += text.length;
+    }
   }
 
   /**
    * Reset accumulated conversation content (keep the fixed overhead).
    * Called after compaction, which replaces the entire conversation with a
    * short summary — without this, the estimator would keep counting the
-   * pre-compaction content and over-report context size.
+   * pre-compaction content and over-report context size. The real count is
+   * cleared too: it describes the pre-compaction conversation, so keeping it
+   * would pin usage at its pre-compaction value until the next API call.
    */
   reset(): void {
     this.contentBytes = 0;
     this.apiCallCount = 0;
+    this.realTokens = 0;
+    this.bytesSinceReal = 0;
   }
 
   /** Accumulate tool call content (JSON-serialized input). */
   addToolCall(toolName: string, toolInput: unknown): void {
-    this.contentBytes += toolName.length;
+    let added = toolName.length;
     try {
-      this.contentBytes += JSON.stringify(toolInput ?? {}).length;
+      added += JSON.stringify(toolInput ?? {}).length;
     } catch {
-      this.contentBytes += 50; // fallback estimate
+      added += 50; // fallback estimate
     }
+    this.contentBytes += added;
+    this.bytesSinceReal += added;
   }
 
-  /** Get the estimated context size (overhead + conversation content). */
+  /**
+   * Get the context size in tokens: the last real per-call prompt count plus
+   * whatever has streamed since, or the character estimate when no real count
+   * has arrived yet.
+   */
   getEstimatedTokens(): number {
-    const totalBytes = CLAUDE_OVERHEAD_BYTES + this.contentBytes;
-    return estimateTokensFromChars(totalBytes);
+    if (this.realTokens > 0) {
+      return this.realTokens + estimateTokensFromChars(this.bytesSinceReal);
+    }
+    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
   }
 
   getApiCallCount(): number {
@@ -1745,6 +1794,10 @@ export function createClaudeCodeAgent(
       const permissionPromises: Promise<void>[] = [];
 
       let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
+      // Output tokens of the most recent non-sidechain API call. The result
+      // event's output_tokens is summed over every call in the turn, which
+      // over-states how much the conversation actually grew.
+      let lastRealOutputTokens = 0;
       // Track whether Claude CLI's final result was an error (e.g.
       // error_max_turns) so we can surface it to the user instead of
       // returning a silent end_turn. Mirrors codex-acp, which maps upstream
@@ -1789,6 +1842,19 @@ export function createClaudeCodeAgent(
       // Send a real-time usage_update so the context ring shows during the turn.
       if (event.type === "assistant") {
         ctxEstimator.markApiCall();
+        // Adopt the REAL prompt size Claude CLI reported for this API call.
+        // input_tokens + cache reads/creations = every prompt token the
+        // provider counted, i.e. the exact current context size. Sidechain
+        // (subagent) messages describe a separate conversation whose content
+        // never enters this session's context, so their usage is ignored.
+        if (event.usage && !event.isSidechain) {
+          const real =
+            (event.usage.input_tokens ?? 0) +
+            (event.usage.cache_read_input_tokens ?? 0) +
+            (event.usage.cache_creation_input_tokens ?? 0);
+          ctxEstimator.setRealTokens(real);
+          lastRealOutputTokens = event.usage.output_tokens ?? 0;
+        }
         sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
         // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`
         // event fires at the START of the final assistant block (after the
@@ -1854,9 +1920,18 @@ export function createClaudeCodeAgent(
       const outputTokens = event.usage.output_tokens ?? 0;
       const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
       const contextWindow = getContextWindowForModel(effectiveModel);
-      // For auto-compact: use ONLY our estimate (not the cumulative result value).
+      // Context size for both the UI and auto-compact. Once a real per-call
+      // prompt count has been seen (message.usage on an assistant event) the
+      // estimator returns that; the result event's own usage is accumulated
+      // across every API call in the turn and would over-report badly on
+      // multi-tool turns, so it is never used for sizing.
       const estimatedTokens = ctxEstimator.getEstimatedTokens();
-      sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: outputTokens });
+      // The next request's prompt = this prompt + this turn's final output, so
+      // add the LAST call's output rather than the turn-cumulative figure.
+      const trailingOutput = ctxEstimator.hasRealTokens()
+        ? lastRealOutputTokens
+        : outputTokens;
+      sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: trailingOutput });
       // For the UI: use our real-time estimate (more accurate than cumulative).
       // Cap at contextWindow so it never shows >100%.
       const cappedUsed = Math.min(estimatedTokens, contextWindow);

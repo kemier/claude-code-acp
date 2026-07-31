@@ -168,11 +168,61 @@ describe("slash commands & estimator", () => {
     // assistant text (plus overhead + the user prompt), not a double count.
     const usage = calls.find((c: any) => c[0]?.update?.sessionUpdate === "usage_update");
     expect(usage).toBeTruthy();
-    const used: number = usage[0].update.used;
-    // Overhead alone is ~18187 tokens (72748 bytes / 4). With a single count of
-    // " streamed" (9 chars) and the user prompt "hello" (5 chars), the estimate
-    // must be just above the overhead — NOT 2x the assistant text on top.
-    expect(used).toBeLessThan(18210);
+    // Assert the LAST usage_update (sent with the result event, after all text
+    // has been accumulated) — the first one is emitted at the `assistant` event
+    // before the final block arrives.
+    const usedValues: number[] = calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "usage_update")
+      .map((c: any) => c[0].update.used as number);
+    const used: number = usedValues[usedValues.length - 1];
+    // This mock emits no `message.usage`, so the character fallback applies:
+    // ceil((72748 overhead + 5 for "hello" + 9 for " streamed") / 3) = 24254.
+    // Counting " streamed" twice would yield 24257, so an exact match proves
+    // the assistant text is counted once.
+    expect(used).toBe(24254);
+  });
+
+  it("prefers real per-call token usage over the character estimate", async () => {
+    const sid = await newSession();
+    await prompt(sid, "hello");
+    // Feed a real per-call usage report, as Claude CLI does on every
+    // `assistant` message, and confirm it becomes the reported context size
+    // instead of the character guess.
+    (conn.sessionUpdate as any).mockClear();
+    capturedOnEvent!({
+      type: "assistant",
+      apiCallIndex: 0,
+      usage: {
+        input_tokens: 118035,
+        output_tokens: 1271,
+        cache_read_input_tokens: 200,
+        cache_creation_input_tokens: 100,
+      },
+    });
+    const usage = (conn.sessionUpdate as any).mock.calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "usage_update",
+    );
+    expect(usage).toBeTruthy();
+    // 118035 + 200 + 100 = 118335 real prompt tokens, reported verbatim.
+    expect(usage[0].update.used).toBe(118335);
+  });
+
+  it("ignores subagent (sidechain) usage — it is a separate context window", async () => {
+    const sid = await newSession();
+    await prompt(sid, "hello");
+    (conn.sessionUpdate as any).mockClear();
+    capturedOnEvent!({
+      type: "assistant",
+      apiCallIndex: 0,
+      isSidechain: true,
+      usage: { input_tokens: 150000, output_tokens: 10 },
+    });
+    const usage = (conn.sessionUpdate as any).mock.calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "usage_update",
+    );
+    expect(usage).toBeTruthy();
+    // Still the character fallback — the subagent's 150k must not be adopted.
+    expect(usage[0].update.used).toBeLessThan(30000);
   });
 
   it("usage estimate does not flip down at the start of a new turn (monotonic across turns)", async () => {

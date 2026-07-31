@@ -31,7 +31,20 @@ export interface StreamEvent {
  toolResultIds?: string[];
  sessionId?: string;
  permissionId?: string;
- usage?: { input_tokens?: number; output_tokens?: number };
+ usage?: {
+   input_tokens?: number;
+   output_tokens?: number;
+   /** Prompt tokens served from the cache — part of the real context size. */
+   cache_read_input_tokens?: number;
+   /** Prompt tokens written to the cache — part of the real context size. */
+   cache_creation_input_tokens?: number;
+ };
+ /**
+  * True when the event belongs to a subagent (sidechain) conversation, i.e.
+  * Claude CLI reported a non-null `parent_tool_use_id`. Subagents have their
+  * own context window, so their usage must not be attributed to the parent.
+  */
+ isSidechain?: boolean;
   slashCommands?: string[];
   /** Claude CLI result stop reason (e.g. "end_turn", "max_turns"). */
   stopReason?: string;
@@ -400,7 +413,35 @@ export class ClaudeRunner {
    if (parsed.type === "assistant" && parsed.message?.content) {
       // Emit an "assistant" event FIRST — this marks an API call boundary
       // for context estimation (each assistant message = one LLM API call).
-      onEvent({ type: "assistant", apiCallIndex: 0 });
+      //
+      // Each assistant message carries the REAL per-call usage for the API
+      // call that produced it. `input_tokens` (+ cache reads/creations, which
+      // are prompt tokens served from cache) is the exact prompt size the
+      // provider counted — i.e. the true current context size. This is
+      // authoritative and replaces character-based guessing. Unlike the
+      // `result` event (whose usage is accumulated across every call in the
+      // turn, so it over-reports on multi-tool turns), this value is per-call.
+      //
+      // `parent_tool_use_id` is non-null for subagent (sidechain) messages.
+      // A subagent runs its own separate conversation, so its context size
+      // must NOT be attributed to the parent session.
+      const u = parsed.message.usage;
+      const isSidechain = parsed.parent_tool_use_id != null;
+      onEvent({
+        type: "assistant",
+        apiCallIndex: 0,
+        isSidechain,
+        ...(u
+          ? {
+              usage: {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_read_input_tokens: u.cache_read_input_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens,
+              },
+            }
+          : {}),
+      });
      for (const block of parsed.message.content) {
        if (block.type === "text") {
          onEvent({ type: "text_delta", text: block.text, fromAssistantBlock: true });
