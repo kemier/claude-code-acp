@@ -1727,6 +1727,17 @@ export function createClaudeCodeAgent(
       // turn failures to a visible error rather than an empty success.
       let turnErrored = false;
       let turnStopReason: string | undefined;
+      // In --verbose mode Claude CLI emits per-token content_block_delta text
+      // DURING generation, then a final `assistant` message block re-emitting
+      // the FULL text immediately before the tool_use in the same content
+      // array. Emitting that final-block text as an agent_message_chunk lands
+      // it ~1ms before the tool_call, which defeats vscode-acp's 80ms streaming
+      // render window → an empty assistant bubble at every text→tool transition
+      // (codex-acp streams per-token only and never re-emits, so it doesn't hit
+      // this). Track whether we already streamed deltas for the current
+      // assistant message; if so, the final-block text is redundant for the UI
+      // and is dropped (context estimation still counts it, see below).
+      let streamedTextThisMessage = false;
       const onEvent = (event: StreamEvent) => {
         // Handle system/init — extract native Claude CLI slash commands and
         // surface them to vscode-acp via available_commands_update.
@@ -1755,6 +1766,12 @@ export function createClaudeCodeAgent(
       if (event.type === "assistant") {
         ctxEstimator.markApiCall();
         sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
+        // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`
+        // event fires at the START of the final assistant block (after the
+        // per-token content_block_delta stream for the same message already
+        // arrived). Resetting here would wipe the flag right before the
+        // final-block text_delta below checks it. The flag is consumed and
+        // cleared by the final-block text_delta itself.
       }
       // Handle user event (tool results) — accumulate for context estimation.
       if (event.type === "user" && event.text) {
@@ -1845,17 +1862,35 @@ export function createClaudeCodeAgent(
          // text AND the final assistant message block's full text. To avoid
          // double-counting assistant content in the context estimate, we count
          // only the final-block text (fromAssistantBlock) and ignore the
-         // streaming deltas. UI rendering is unaffected — both still render.
+         // streaming deltas.
          if (event.fromAssistantBlock) {
            ctxEstimator.addText(event.text);
+         } else {
+           // Mark that this message streamed its text via per-token deltas.
+           streamedTextThisMessage = true;
          }
-         connection.sessionUpdate({
-           sessionId,
-           update: {
-             sessionUpdate: "agent_message_chunk",
-             content: { type: "text", text: event.text },
-           },
-         });
+         // Emit the chunk to the UI — EXCEPT for the final-block text when the
+         // same message was already streamed token-by-token. The final block's
+         // full text would land ~1ms before the tool_use in the same content
+         // array (claude-runner.ts emits them back-to-back), beating vscode-acp's
+         // 80ms streaming render and leaving an empty bubble at every
+         // text→tool transition. The per-token deltas already delivered this
+         // text; re-emitting it also duplicates it in currentAssistantText.
+         // When there were NO streaming deltas (text only in the final block,
+         // e.g. non-verbose or a non-streaming model), emit it as the sole
+         // source of the text. The final-block text consumes and clears the
+         // flag so it applies per message.
+         const dropAsDuplicate = event.fromAssistantBlock && streamedTextThisMessage;
+         if (event.fromAssistantBlock) streamedTextThisMessage = false;
+         if (!dropAsDuplicate) {
+           connection.sessionUpdate({
+             sessionId,
+             update: {
+               sessionUpdate: "agent_message_chunk",
+               content: { type: "text", text: event.text },
+             },
+           });
+         }
        } else if (event.type === "tool_use" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
          const toolCallId = `call_${++toolCallCounter}`;
