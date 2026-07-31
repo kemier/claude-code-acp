@@ -456,7 +456,7 @@ describe("Subagent (Task tool) lifecycle", () => {
     scriptedEvents = [];
   });
 
-  it("emits in_progress on Task tool_use, completed on tool_result", async () => {
+  it("emits in_progress on Task tool_use, completed at turn end (not on tool_result)", async () => {
     const { updates } = await runWithEvents([
       {
         type: "tool_use",
@@ -464,18 +464,24 @@ describe("Subagent (Task tool) lifecycle", () => {
         toolInput: { description: "investigate", subagent_type: "general-purpose" },
         toolUseId: "tu_1",
       },
+      // Claude Code's Task tool_result is a launch ack ("Async agent launched
+      // successfully..."), NOT a completion signal — the subagent keeps running
+      // after it. So this must NOT flip the tool_call to completed.
       { type: "user", text: "result text", toolResultIds: ["tu_1"] },
     ]);
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     // First: in_progress when the subagent starts.
     expect(toolCalls[0].status).toBe("in_progress");
-    // Last: a bare completed flip keyed by the same toolCallId.
+    // The tool_result launch ack must NOT produce a completed flip — only two
+    // frames exist (the in_progress emit + the turn-end flush).
+    expect(toolCalls).toHaveLength(2);
+    // Last: the turn-end flush flips the same toolCallId to completed.
     const flip = toolCalls[toolCalls.length - 1];
     expect(flip.status).toBe("completed");
     expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
-  it("stays in_progress if no tool_result has arrived yet", async () => {
+  it("stays in_progress across the launch-ack tool_result, then completes at turn end", async () => {
     const { updates } = await runWithEvents([
       {
         type: "tool_use",
@@ -485,8 +491,11 @@ describe("Subagent (Task tool) lifecycle", () => {
       },
     ]);
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
-    expect(toolCalls).toHaveLength(1);
+    // in_progress emit + turn-end flush = 2 frames.
+    expect(toolCalls).toHaveLength(2);
     expect(toolCalls[0].status).toBe("in_progress");
+    expect(toolCalls[1].status).toBe("completed");
+    expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
   it("non-subagent tools stay completed immediately (no lifecycle)", async () => {

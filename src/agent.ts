@@ -1685,32 +1685,20 @@ export function createClaudeCodeAgent(
       if (event.type === "user" && event.text) {
         ctxEstimator.addText(event.text);
       }
-      // A tool_result resolves any in_progress subagent tool calls. Flip them
-      // to "completed" now that the subagent has finished and returned. This
-      // keeps the UI honest: the Agent tool shows as running while the
-      // subagent works, then completes only when its result actually lands.
-      if (event.type === "user" && event.toolResultIds?.length) {
-        const pending = sessionPendingAgents.get(sessionId);
-        if (pending) {
-          for (const claudeId of event.toolResultIds) {
-            const acpCallId = pending.get(claudeId);
-            if (acpCallId) {
-              pending.delete(claudeId);
-              connection
-                .sessionUpdate({
-                  sessionId,
-                  update: {
-                    sessionUpdate: "tool_call",
-                    toolCallId: acpCallId,
-                    status: "completed",
-                  } as any,
-                })
-                .catch(() => {});
-            }
-          }
-          if (pending.size === 0) sessionPendingAgents.delete(sessionId);
-        }
-      }
+      // Claude Code's Task/Agent tool runs subagents ASYNCHRONOUSLY: the
+      // tool_result it emits ("Async agent launched successfully...") is a
+      // launch acknowledgment, NOT a completion signal. The subagent keeps
+      // running (and emitting its own nested tool calls) for seconds to
+      // minutes after this tool_result lands. Flipping the parent tool_call
+      // to "completed" here would mark it done at spawn time — leaving the UI
+      // spinner stuck on a card whose nested work is still streaming.
+      //
+      // Instead we leave subagent tool_calls in_progress and flush them all to
+      // "completed" at turn end (see the post-stream flush below). The parent
+      // turn cannot end while a subagent it spawned is still running — Claude
+      // awaits them — so turn end is a reliable completion signal.
+      // Non-subagent tool_result ids are ignored here (they were never added to
+      // sessionPendingAgents; they completed inline at their tool_use).
     // Handle result event — Claude CLI reports CUMULATIVE usage across all
     // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
     // single-call turn, input_tokens = real context size (accurate). For a
@@ -1953,6 +1941,28 @@ export function createClaudeCodeAgent(
 
         // Wait for all pending permission requests to resolve
         await Promise.all(permissionPromises);
+
+        // Turn end = all spawned subagents have finished (Claude awaits them
+        // before ending the turn). Flush any still-in_progress subagent
+        // tool_calls to "completed" now. This is the real completion signal
+        // for the Task/Agent tool — its tool_result was only a launch ack.
+        const pendingAgents = sessionPendingAgents.get(sessionId);
+        if (pendingAgents && pendingAgents.size > 0) {
+          for (const acpCallId of pendingAgents.values()) {
+            connection
+              .sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: acpCallId,
+                  status: "completed",
+                } as any,
+              })
+              .catch(() => {});
+          }
+          pendingAgents.clear();
+          sessionPendingAgents.delete(sessionId);
+        }
 
         // Check if this session was cancelled while running
         if (cancelledSessions.has(sessionId)) {
