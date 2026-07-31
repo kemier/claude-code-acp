@@ -218,6 +218,45 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].title).toBe("grep -rnE 'command' ../codex-acp/src");
   });
 
+  it("Bash tool → standalone `cd <dir>` (no suffix) uses description, not the bare cd path", async () => {
+    // A standalone `cd <dir>` with no `&&` suffix and no following command line
+    // has no real command to show. Falling back to the last line would render
+    // the bare `cd /workspace/…` path as the title. Claude Code supplies a
+    // description for ~97% of Bash commands — prefer it here.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "cd /workspace/git/ezennin/claude-code-acp",
+          description: "Change to project directory",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("Change to project directory");
+    // Full command still preserved in rawInput.
+    expect(toolCalls[0].rawInput.command).toBe(
+      "cd /workspace/git/ezennin/claude-code-acp",
+    );
+  });
+
+  it("Bash tool → standalone `cd <dir>` with no description falls back to the cd line", async () => {
+    // No description available — the bare cd line is the honest fallback
+    // (the command really is just `cd <dir>`).
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "cd /workspace/git/ezennin/claude-code-acp",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("cd /workspace/git/ezennin/claude-code-acp");
+  });
+
   it("Bash tool → multi-line `node -e '…'` uses description (unclosed quote on line 1)", async () => {
     // A multi-line quoted script opens its quote on line 1 (`node -e '`) and
     // closes it many lines later. The first line renders as a truncated

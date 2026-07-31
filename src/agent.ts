@@ -389,7 +389,16 @@ function titleForCommand(command: string, description?: string): string {
     }
     return t.length <= 120 ? t : t.slice(0, 117) + "…";
   }
-  // Only `cd`/comment/blank lines (or empty) — return whatever remains.
+  // Only `cd`/comment/blank lines (or empty) — no real command was found. This
+  // happens for a standalone `cd <dir>` with no `&&` suffix and no following
+  // command line: the loop skipped the `cd` line and found nothing after it,
+  // so falling back to the last line would render the bare `cd /workspace/…`
+  // path as the title. Claude Code supplies a meaningful `description` for
+  // ~97% of Bash commands (e.g. "Change to project directory"), so prefer it;
+  // only fall back to the raw last line when no description exists.
+  if (description) {
+    return description.length <= 120 ? description : description.slice(0, 117) + "…";
+  }
   const last = lines[lines.length - 1]?.trim() ?? c;
   return last.length <= 120 ? last : last.slice(0, 117) + "…";
 }
