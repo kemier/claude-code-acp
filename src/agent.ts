@@ -27,6 +27,7 @@ import {
 import { SessionStore } from "./session-store.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
+import { getClaudeEnv } from "./claude-settings.js";
 import {
   validateCwd,
   validateMcpCommand,
@@ -219,32 +220,141 @@ export async function loadModelContextWindows(): Promise<void> {
 const cliReportedContextWindows = new Map<string, number>();
 
 /**
- * Resolve the context window (in tokens) for a given model.
- * Uses the cached proxy data; falls back to DEFAULT_CONTEXT_WINDOW.
+ * Resolve the full context window (in tokens) for a given model.
+ *
+ * This is the *display* window — the denominator for `usage_update`, matching
+ * how Claude Code's status line always uses the model's full window even when
+ * the compaction threshold is decoupled from it.
+ *
+ * Precedence mirrors Claude Code CLI:
+ *  1. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — the documented override for models the
+ *     CLI does not recognize as Claude models (i.e. anything routed through
+ *     `ANTHROPIC_BASE_URL`, which is exactly our case). Applied directly as of
+ *     CLI v2.1.193.
+ *  2. The proxy's advertised `context_length` from /v1/models — authoritative
+ *     for the real backend model.
+ *  3. The window Claude Code itself reported on the result event.
+ *  4. DEFAULT_CONTEXT_WINDOW.
+ *
+ * One deliberate deviation: the override is capped by the model's real window
+ * when we know it. The CLI applies the override globally to every model, which
+ * is harmless for a larger window (it just compacts earlier than needed) but
+ * unsafe for a smaller one — glm-5.1 and deepseek-v4-pro are 131072, so a
+ * global 196608 would put the threshold above their real limit and the
+ * conversation would overflow without ever compacting. Capping preserves exact
+ * parity for the model the override was written for while staying safe when the
+ * model picker switches to a smaller one.
  */
-function getContextWindowForModel(modelId: string | undefined): number {
-  if (modelId && modelContextWindows.has(modelId)) {
-    return modelContextWindows.get(modelId)!;
+export function getContextWindowForModel(modelId: string | undefined): number {
+  const known = modelId
+    ? modelContextWindows.get(modelId) ?? cliReportedContextWindows.get(modelId)
+    : undefined;
+  const override = parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
+  if (override !== undefined) {
+    return known !== undefined ? Math.min(override, known) : override;
   }
-  if (modelId && cliReportedContextWindows.has(modelId)) {
-    return cliReportedContextWindows.get(modelId)!;
-  }
-  return DEFAULT_CONTEXT_WINDOW;
+  return known ?? DEFAULT_CONTEXT_WINDOW;
+}
+
+// ─── Claude Code CLI auto-compact arithmetic ────────────────────────────────
+// These mirror the CLI's own constants (services/compact/autoCompact.ts) so the
+// ACP layer computes the same threshold the CLI does. Keeping the two in sync
+// matters because both can compact: if they disagree, whichever fires first
+// wins and the other becomes unreachable, making the configured behaviour a
+// coin flip that depends on undocumented internals.
+
+/** Tokens the CLI reserves for the compaction summary's own output. */
+const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000;
+/** Headroom the CLI keeps below the effective window before compacting. */
+const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
+/** The CLI's max-output default for model ids it does not recognize. */
+const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
+
+/** Parse an env var as a positive integer, or undefined when unset/invalid. */
+function parsePositiveIntEnv(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
+/** Match the CLI's `isEnvTruthy`: 1 / true / yes / on (case-insensitive). */
+function isEnvTruthy(value: string | undefined): boolean {
+  if (!value) return false;
+  return ["1", "true", "yes", "on"].includes(value.toLowerCase().trim());
 }
 
 /**
- * Auto-compact threshold = context_window * 9 / 10 (90%), mirroring Codex.
+ * Max output tokens per request, as the CLI resolves it:
+ * `CLAUDE_CODE_MAX_OUTPUT_TOKENS` when set, else 32000 for unrecognized models.
  */
-function getAutoCompactThreshold(modelId: string | undefined): number {
-  return Math.floor((getContextWindowForModel(modelId) * 9) / 10);
+export function getMaxOutputTokens(): number {
+  return (
+    parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_MAX_OUTPUT_TOKENS")) ??
+    DEFAULT_MAX_OUTPUT_TOKENS
+  );
+}
+
+/**
+ * The capacity used for compaction maths.
+ *
+ * `CLAUDE_CODE_AUTO_COMPACT_WINDOW` lets the compaction threshold be computed
+ * against a smaller window than the model really has; the CLI caps it at the
+ * real window, so it can only lower the figure.
+ */
+export function getAutoCompactWindow(modelId: string | undefined): number {
+  const full = getContextWindowForModel(modelId);
+  const configured = parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_AUTO_COMPACT_WINDOW"));
+  return configured !== undefined ? Math.min(full, configured) : full;
+}
+
+/**
+ * Effective window = compaction capacity minus the summary output reserve.
+ * Mirrors the CLI's `getEffectiveContextWindowSize()`.
+ */
+export function getEffectiveContextWindowSize(modelId: string | undefined): number {
+  const reserved = Math.min(getMaxOutputTokens(), MAX_OUTPUT_TOKENS_FOR_SUMMARY);
+  return getAutoCompactWindow(modelId) - reserved;
+}
+
+/**
+ * Auto-compact threshold, matching Claude Code CLI exactly:
+ *
+ *   threshold = effectiveWindow - 13000
+ *   with CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=N:
+ *     threshold = min(floor(effectiveWindow * N/100), threshold)
+ *
+ * The percentage applies to the *effective* window (not the raw context
+ * window) and can only lower the threshold — values above the default have no
+ * effect, per the CLI's own implementation.
+ */
+export function getAutoCompactThreshold(modelId: string | undefined): number {
+  const effective = getEffectiveContextWindowSize(modelId);
+  const base = effective - AUTOCOMPACT_BUFFER_TOKENS;
+  const pct = parsePositiveIntEnv(getClaudeEnv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"));
+  if (pct !== undefined && pct <= 100) {
+    return Math.min(Math.floor((effective * pct) / 100), base);
+  }
+  return base;
+}
+
+/**
+ * Whether auto-compaction should run at all, honoring the CLI's kill switches.
+ * `DISABLE_COMPACT` disables everything; `DISABLE_AUTO_COMPACT` disables only
+ * the automatic pass and leaves manual /compact working.
+ */
+export function isAutoCompactEnabled(): boolean {
+  if (isEnvTruthy(getClaudeEnv("DISABLE_COMPACT"))) return false;
+  if (isEnvTruthy(getClaudeEnv("DISABLE_AUTO_COMPACT"))) return false;
+  return true;
 }
 
 // ─── Auto-compact ───────────────────────────────────────────────────────────
-// Mirrors Codex core's auto-compact: trigger compaction when token usage
-// reaches 90% of the context window (context_window * 9 / 10).
-// Codex checks after each API response mid-turn; Claude CLI manages turns
-// internally, so we check between turns — after the prompt finishes but
-// before the next user prompt is processed. The compaction replaces the
+// Trigger compaction when token usage reaches the same threshold Claude Code
+// CLI would use (see getAutoCompactThreshold above), so the two layers agree.
+// The CLI checks mid-turn; Claude CLI manages turns internally here, so we
+// check between turns — after the prompt finishes but before the next user
+// prompt is processed. The compaction replaces the
 // old Claude session with a fresh one seeded with a summary.
 // Track the last reported usage per session so the auto-compact check
 // can run after the turn finishes.
@@ -1235,12 +1345,25 @@ export function createClaudeCodeAgent(
       const currentModel = (configOverrides["model"] as string) || process.env.ANTHROPIC_MODEL || "glm-5.2";
       const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
       const goal = sessionGoals.get(sessionId);
+      // Context usage, using the same figures that drive auto-compaction so
+      // what /status reports and what actually triggers cannot disagree.
+      const contextWindow = getContextWindowForModel(currentModel);
+      const threshold = getAutoCompactThreshold(currentModel);
+      const usage = sessionLastUsage.get(sessionId);
+      const usedTokens = usage ? usage.input_tokens + usage.output_tokens : 0;
+      const usedPct = contextWindow > 0 ? (usedTokens / contextWindow) * 100 : 0;
+      const compactState = isAutoCompactEnabled()
+        ? `at ${threshold.toLocaleString()} tokens (${((threshold / contextWindow) * 100).toFixed(1)}% of window)`
+        : "disabled";
       const lines = [
         `**Model:** ${currentModel}`,
         `**Mode:** ${currentMode}`,
         `**Directory:** ${cwd}`,
         `**Session:** \`${sessionId}\``,
         goal ? `**Goal:** ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "**Goal:** none",
+        `**Context:** ${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${usedPct.toFixed(1)}%)`,
+        `**Max output:** ${getMaxOutputTokens().toLocaleString()} tokens`,
+        `**Auto-compact:** ${compactState}`,
       ];
       await connection.sessionUpdate({
         sessionId,
@@ -2589,20 +2712,19 @@ export function createClaudeCodeAgent(
         await drainSteerQueue();
 
         // ─── Auto-compact check ───────────────────────────────────────────
-        // Mirrors Codex core: after the turn finishes (including steer
-        // drains), check if token usage has reached 90% of the model's
-        // context window. If so, run the compaction flow to replace the
-        // session with a summary-seeded fresh one. This prevents context
-        // exhaustion on long conversations.
+        // Uses the same threshold Claude Code CLI computes (context window,
+        // output-token reserve, 13k buffer and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE),
+        // and honors the CLI's DISABLE_AUTO_COMPACT / DISABLE_COMPACT switches,
+        // so enabling or tuning compaction in one place affects both layers.
         const lastUsageEntry = sessionLastUsage.get(sessionId);
-        if (lastUsageEntry) {
+        if (lastUsageEntry && isAutoCompactEnabled()) {
           const threshold = getAutoCompactThreshold(
             modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id,
           );
           const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
           if (used >= threshold) {
             logger.info(
-              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (90% of ${getContextWindowForModel(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)})`,
+              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (effectiveWindow=${getEffectiveContextWindowSize(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)}, contextWindow=${getContextWindowForModel(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)})`,
             );
             // The compaction notice is emitted by doCompact as a dedicated
             // `_meta.contextCompaction` lifecycle, not as assistant text. An
