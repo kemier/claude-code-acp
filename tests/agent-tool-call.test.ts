@@ -218,6 +218,43 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].title).toBe("grep -rnE 'command' ../codex-acp/src");
   });
 
+  it("Bash tool → multi-line `node -e '…'` uses description (unclosed quote on line 1)", async () => {
+    // A multi-line quoted script opens its quote on line 1 (`node -e '`) and
+    // closes it many lines later. The first line renders as a truncated
+    // `node -e '` title; prefer the tool's `description` when present.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "node -e '\nfunction titleForCommand(command) {\n  return command;\n}\nconsole.log(titleForCommand(\"x\"));\n'",
+          description: "Test titleForCommand edge cases",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("Test titleForCommand edge cases");
+    // Full command still preserved in rawInput.
+    expect(toolCalls[0].rawInput.command).toContain("node -e '");
+  });
+
+  it("Bash tool → single-line `node -e 'foo'` (closed quote) keeps the command", async () => {
+    // A CLOSED quote on line 1 is a complete one-line command — must NOT be
+    // replaced by the description.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "node -e 'console.log(1+1)'",
+          description: "Should be ignored — quote is closed",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("node -e 'console.log(1+1)'");
+  });
+
   it("Grep tool → kind:search + 'Search for' title", async () => {
     const { updates } = await runWithEvents([
       {

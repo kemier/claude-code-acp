@@ -331,6 +331,18 @@ function shortName(filePath: unknown): string {
 }
 
 /**
+ * True if `line` ends with an unclosed single or double quote — i.e. an odd
+ * number of that quote char on the line, so the quoted region opens here and
+ * closes on a later line (e.g. `node -e '`, `bash -c "…`). Used to detect
+ * multi-line quoted scripts whose first line would render as a truncated title.
+ */
+function hasUnclosedQuote(line: string): boolean {
+  const single = (line.match(/'/g) ?? []).length;
+  const double = (line.match(/"/g) ?? []).length;
+  return single % 2 === 1 || double % 2 === 1;
+}
+
+/**
  * Derive a one-line title for a Bash command. Claude Code prefixes commands
  * with `cd <cwd>` (either as a leading `cd <dir> && <cmd>` on one line, or as
  * a `cd <dir>` line followed by `\n<cmd>`). vscode-acp renders only the first
@@ -339,7 +351,7 @@ function shortName(filePath: unknown): string {
  * command is visible. Multi-line commands collapse to their first non-empty,
  * non-`cd` line. The full command is still preserved in `rawInput`.
  */
-function titleForCommand(command: string): string {
+function titleForCommand(command: string, description?: string): string {
   const c = command.trim();
   // Claude Code prefixes commands with `cd <cwd>`. Two shapes occur:
   //   1. `cd <dir> && <cmd>` — cd and the real command on ONE line.
@@ -367,6 +379,14 @@ function titleForCommand(command: string): string {
     // Skip comment-only lines so a `# note` after `cd` isn't shown as the
     // title instead of the actual command.
     if (/^(#|\/\/)/.test(t)) continue;
+    // A line ending in an UNCLOSED quote (e.g. `node -e '`, `bash -c "`)
+    // opens a multi-line quoted script that closes many lines later. Showing
+    // it verbatim renders as a truncated `node -e '` title. If the quote is
+    // unclosed on this line, prefer the tool's `description` field; otherwise
+    // append an ellipsis so it reads as a continuation rather than complete.
+    if (hasUnclosedQuote(t) && description) {
+      return description.length <= 120 ? description : description.slice(0, 117) + "…";
+    }
     return t.length <= 120 ? t : t.slice(0, 117) + "…";
   }
   // Only `cd`/comment/blank lines (or empty) — return whatever remains.
@@ -479,10 +499,12 @@ function buildToolCallUpdate(
           : Array.isArray(input.command)
             ? input.command.join(" ")
             : toolName;
+      const description =
+        typeof input.description === "string" ? input.description : undefined;
       return {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: titleForCommand(command),
+        title: titleForCommand(command, description),
         kind: "execute",
         status: "completed",
         rawInput: toolInput ?? {},
