@@ -340,19 +340,36 @@ function shortName(filePath: unknown): string {
  * non-`cd` line. The full command is still preserved in `rawInput`.
  */
 function titleForCommand(command: string): string {
-  let c = command.trim();
-  // `cd <dir> && <rest>` on a single line → drop the cd clause.
-  c = c.replace(/^cd\s+\S[^&]*&&\s*/, "");
-  // Leading `cd <dir>` on its own line (followed by \n + real command) →
-  // drop it and take the next non-empty line.
+  const c = command.trim();
+  // Claude Code prefixes commands with `cd <cwd>`. Two shapes occur:
+  //   1. `cd <dir> && <cmd>` — cd and the real command on ONE line.
+  //   2. `cd <dir>\n<cmd>`  — cd alone on its own line, command on the next.
+  // vscode-acp renders only the first line of the title, so the raw command
+  // would show as `✓ cd /workspace/...` with the real command hidden. Strip
+  // the leading `cd` clause and collapse to the first meaningful line.
+  //
+  // Process line-by-line from the top so the `&&` strip never crosses a
+  // newline (a prior `[^&]*&&` regex ate across `\n` and dropped real
+  // commands like `git diff --stat` when a later line contained `&&`).
   const lines = c.split("\n");
   for (const ln of lines) {
-    const t = ln.trim();
+    let t = ln.trim();
     if (!t) continue;
-    if (/^cd\s+\S/.test(t)) continue;
+    // `cd <dir> && <rest>` on a single line → keep just <rest>.
+    const cdAnd = t.match(/^cd\s+\S[^&]*&&\s*(.*)$/);
+    if (cdAnd) {
+      t = cdAnd[1].trim();
+      if (!t) continue; // `cd <dir> && ` with nothing after — next line.
+    } else if (/^cd\s+\S/.test(t)) {
+      // Bare leading `cd <dir>` line — the real command is on a later line.
+      continue;
+    }
+    // Skip comment-only lines so a `# note` after `cd` isn't shown as the
+    // title instead of the actual command.
+    if (/^(#|\/\/)/.test(t)) continue;
     return t.length <= 120 ? t : t.slice(0, 117) + "…";
   }
-  // Only a `cd` line (or empty) — return whatever remains.
+  // Only `cd`/comment/blank lines (or empty) — return whatever remains.
   const last = lines[lines.length - 1]?.trim() ?? c;
   return last.length <= 120 ? last : last.slice(0, 117) + "…";
 }

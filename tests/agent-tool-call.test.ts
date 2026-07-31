@@ -183,6 +183,41 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].title).toBe("npm run build");
   });
 
+  it("Bash tool → `cd <dir>\\n<cmd> && ...` keeps the real first command (&& must not cross newlines)", async () => {
+    // Regression: a prior `[^&]*&&` regex was greedy across `\n`, so for
+    // `cd <dir>\ngit diff --stat && echo ...` it ate up to the first `&&` on
+    // the SECOND line and the title lost `git diff --stat`.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command:
+            'cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat && echo "=== diff ===" && git diff src/agent.ts',
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe('git diff --stat && echo "=== diff ===" && git diff src/agent.ts');
+  });
+
+  it("Bash tool → skips a `# comment` line after `cd` so the real command is the title", async () => {
+    // Claude Code sometimes emits `cd <dir>\n# <note>\n<cmd>`. The title must
+    // be the command, not the comment.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command:
+            "cd /workspace/git/ezennin\n# codex-acp is TypeScript.\ngrep -rnE 'command' ../codex-acp/src",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("grep -rnE 'command' ../codex-acp/src");
+  });
+
   it("Grep tool → kind:search + 'Search for' title", async () => {
     const { updates } = await runWithEvents([
       {
