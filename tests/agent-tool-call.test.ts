@@ -151,6 +151,38 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].kind).toBe("execute");
   });
 
+  it("Bash tool → strips leading `cd <dir>\\n` so the title shows the real command", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("git diff --stat");
+    // Full command preserved in rawInput for the client.
+    expect(toolCalls[0].rawInput.command).toBe(
+      "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
+    );
+  });
+
+  it("Bash tool → strips leading `cd <dir> && ` on a single line", async () => {
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Bash",
+        toolInput: {
+          command: "cd /workspace/git/ezennin/claude-code-acp && npm run build",
+        },
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("npm run build");
+  });
+
   it("Grep tool → kind:search + 'Search for' title", async () => {
     const { updates } = await runWithEvents([
       {

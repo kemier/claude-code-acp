@@ -331,6 +331,33 @@ function shortName(filePath: unknown): string {
 }
 
 /**
+ * Derive a one-line title for a Bash command. Claude Code prefixes commands
+ * with `cd <cwd>` (either as a leading `cd <dir> && <cmd>` on one line, or as
+ * a `cd <dir>` line followed by `\n<cmd>`). vscode-acp renders only the first
+ * line of the title, so the raw command would show as `✓ cd /workspace/...`
+ * with the real command hidden. Strip the leading `cd` so the meaningful
+ * command is visible. Multi-line commands collapse to their first non-empty,
+ * non-`cd` line. The full command is still preserved in `rawInput`.
+ */
+function titleForCommand(command: string): string {
+  let c = command.trim();
+  // `cd <dir> && <rest>` on a single line → drop the cd clause.
+  c = c.replace(/^cd\s+\S[^&]*&&\s*/, "");
+  // Leading `cd <dir>` on its own line (followed by \n + real command) →
+  // drop it and take the next non-empty line.
+  const lines = c.split("\n");
+  for (const ln of lines) {
+    const t = ln.trim();
+    if (!t) continue;
+    if (/^cd\s+\S/.test(t)) continue;
+    return t.length <= 120 ? t : t.slice(0, 117) + "…";
+  }
+  // Only a `cd` line (or empty) — return whatever remains.
+  const last = lines[lines.length - 1]?.trim() ?? c;
+  return last.length <= 120 ? last : last.slice(0, 117) + "…";
+}
+
+/**
  * Build an ACP tool_call session update from a Claude CLI tool_use event,
  * mirroring codex-acp's CodexToolCallMapper: a descriptive title, the correct
  * `kind`, and — for file edits — a diff `content` block plus `locations` so
@@ -438,7 +465,7 @@ function buildToolCallUpdate(
       return {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: command,
+        title: titleForCommand(command),
         kind: "execute",
         status: "completed",
         rawInput: toolInput ?? {},
