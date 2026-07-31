@@ -843,6 +843,11 @@ export function createClaudeCodeAgent(
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
+  // Sessions whose steer queue is currently being drained. drainSteerQueue()
+  // awaits LLM turns, so without this a second call (pre-turn vs post-turn vs
+  // post-compaction) could run concurrently and interleave two consumers over
+  // the same queue, delivering messages out of order.
+  const steerDraining = new Set<string>();
 
   // ─── Per-session prompt serialization ─────────────────────────────────────
   // The ACP SDK dispatches each incoming `session/prompt` request concurrently
@@ -2194,13 +2199,154 @@ export function createClaudeCodeAgent(
         }
       };
 
+  /**
+   * Deliver every queued steer message as a follow-up `--resume` prompt.
+   *
+   * Claude CLI cannot inject mid-turn, so steers are queued (handleSteer) and
+   * delivered here. Called at THREE points so delivery order always matches
+   * the order the user typed in:
+   *  1. BEFORE the main turn — a steer that landed in the drain tail of the
+   *     previous turn (after that drain took the queue but before the prompt
+   *     lock cleared) must go out before the newer prompt, not after it.
+   *  2. AFTER the main turn — the normal case.
+   *  3. AFTER compaction — /compact and auto-compact each run extra LLM calls,
+   *     and anything steered during them would otherwise sit in the queue
+   *     until the next user prompt.
+   *
+   * The queue is drained IN PLACE (shift from the live array) instead of being
+   * copied out and deleted. That way a steer arriving mid-drain is picked up by
+   * the same pass, and an early exit leaves the undelivered remainder queued
+   * rather than silently dropping it.
+   */
+  const drainSteerQueue = async (): Promise<void> => {
+    const queue = steerQueues.get(sessionId);
+    if (!queue || queue.length === 0) return;
+    // Re-entrancy guard: draining awaits LLM turns, so a nested call (e.g. the
+    // post-compaction drain starting while the post-turn drain is still
+    // awaiting) would interleave two consumers over one queue.
+    if (steerDraining.has(sessionId)) return;
+    steerDraining.add(sessionId);
+    let deliveredAny = false;
+    try {
+      while (queue.length > 0) {
+        const steerText = queue.shift()!;
+        // Cancellation discards the rest — the user asked to stop.
+        if (cancelledSessions.has(sessionId)) {
+          queue.length = 0;
+          break;
+        }
+        const claudeSid = store.getClaudeSessionId(sessionId);
+        // No Claude session to resume into (e.g. straight after /clear). Put it
+        // back so a later drain delivers it once a session exists again.
+        if (!claudeSid) {
+          queue.unshift(steerText);
+          break;
+        }
+        deliveredAny = true;
+       toolCallCounter = 0;
+       permissionPromises.length = 0;
+       logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
+
+          // If the steered text is a slash command, dispatch it through the
+          // SAME handler prompt() uses (dispatchSlashCommand) so the two entry
+          // points behave identically. Previously this was a hand-rewritten
+          // copy that silently dropped several cases (/goal with empty/over-
+          // length arg, /goal pause|resume with no goal, and /ps|/status|
+          // /skills fell through to raw text).
+          const steerDispatch = await dispatchSlashCommand(sessionId, connection, runner, store, steerText);
+          if (steerDispatch.handled) {
+            logger.info(`Steer drain: handled slash command for session ${sessionId}`);
+            if (steerDispatch.startTurn) {
+              // /goal <objective> — start an LLM turn pursuing it.
+              try {
+                ctxEstimator.addText(steerDispatch.startTurn);
+                await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, modelOverride, effectiveEffort);
+                await Promise.all(permissionPromises);
+              } catch (goalErr) {
+                logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
+              }
+            }
+            // /clear wipes the Claude session ID, so there is nothing to resume
+            // into — stop this pass. Anything still queued stays queued (the
+            // drain is non-destructive), and the `!claudeSid` guard puts it back
+            // until a later drain runs against the fresh session.
+            if (parseSlashCommand(steerText)?.name === "clear") break;
+            continue;
+          }
+
+        try {
+          // Steer-drain guard: a steered message is a FOLLOW-UP user
+          // instruction delivered after the previous turn completed — Claude
+          // CLI can't inject mid-turn, so we resume the session here. To stop
+          // the model from misreading the prior turn's (possibly subagent-
+          // produced) output as an interruption it must diagnose, frame the
+          // steer as a fresh instruction. Also, if a subagent is somehow still
+          // marked in_progress (result fired before its tool_result), defer
+          // the drain rather than yanking the session into a new context.
+          const stillPending = sessionPendingAgents.get(sessionId);
+          if (stillPending && stillPending.size > 0) {
+            logger.info(
+              `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
+            );
+            // Put it back at the front so it drains once the subagent resolves.
+            queue.unshift(steerText);
+            break;
+          }
+
+          // Prepend goal to steer messages too
+          const basePrompt = activeGoal && !activeGoal.paused
+            ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
+            : steerText;
+          // Frame as a follow-up so the model treats this as a new user
+          // instruction rather than a description of interrupted state.
+          const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
+          ctxEstimator.addText(steerPrompt);
+          await runner.continueSessionStreaming(
+              claudeSid,
+              steerPrompt,
+              onEvent,
+              sessionId,
+               modelOverride,
+                effectiveEffort
+              );
+              await Promise.all(permissionPromises);
+            } catch (steerErr) {
+              logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
+            }
+      }
+    } finally {
+      steerDraining.delete(sessionId);
+    }
+    if (deliveredAny) {
+      store.touch(sessionId);
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          updatedAt: store.getUpdatedAt(sessionId),
+        } as any,
+      }).catch(() => {});
+    }
+  };
+
       try {
+        // Deliver anything still queued from the PREVIOUS turn before starting
+        // this one. A steer can land in the previous turn's drain tail — after
+        // its drain emptied the queue but before the prompt lock cleared —
+        // and handleSteer accepts it because a prompt is still in flight. Left
+        // to the post-turn drain it would arrive AFTER this newer prompt, i.e.
+        // out of the order the user typed.
+        await drainSteerQueue();
+        // Re-read the Claude session id: the drain above can dispatch slash
+        // commands, and /clear wipes it. The id captured before the drain would
+        // then resume a conversation the user just cleared.
+        const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
         let result;
         if (!skipMainTurn) {
-        if (claudeSessionId) {
+        if (claudeSessionIdAfterDrain) {
           try {
             result = await runner.continueSessionStreaming(
-              claudeSessionId,
+              claudeSessionIdAfterDrain,
               effectivePrompt,
               onEvent,
               sessionId,
@@ -2210,7 +2356,7 @@ export function createClaudeCodeAgent(
           } catch (resumeErr) {
             // Resume failed (expired session, etc.) — fall back to new session
             logger.warn(
-              `Resume failed for ${claudeSessionId}, starting fresh: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
+              `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
             );
             store.clearPersistedSession(cwd);
             result = await runner.startSessionStreaming(
@@ -2291,97 +2437,8 @@ export function createClaudeCodeAgent(
 
        logger.info(`Prompt completed for session ${sessionId}`);
 
-        // Drain steering queue — send each queued steer message as a
-        // follow-up --resume prompt. Claude CLI doesn't support mid-turn
-        // injection, so steered messages are delivered sequentially after
-        // the current turn finishes.
-        const steerQueue = steerQueues.get(sessionId);
-        if (steerQueue && steerQueue.length > 0) {
-          steerQueues.delete(sessionId);
-          for (const steerText of steerQueue) {
-            if (cancelledSessions.has(sessionId)) break;
-            const claudeSid = store.getClaudeSessionId(sessionId);
-            if (!claudeSid) break;
-       toolCallCounter = 0;
-       permissionPromises.length = 0;
-       logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
-
-          // If the steered text is a slash command, dispatch it through the
-          // SAME handler prompt() uses (dispatchSlashCommand) so the two entry
-          // points behave identically. Previously this was a hand-rewritten
-          // copy that silently dropped several cases (/goal with empty/over-
-          // length arg, /goal pause|resume with no goal, and /ps|/status|
-          // /skills fell through to raw text).
-          const steerDispatch = await dispatchSlashCommand(sessionId, connection, runner, store, steerText);
-          if (steerDispatch.handled) {
-            logger.info(`Steer drain: handled slash command for session ${sessionId}`);
-            if (steerDispatch.startTurn) {
-              // /goal <objective> — start an LLM turn pursuing it.
-              try {
-                ctxEstimator.addText(steerDispatch.startTurn);
-                await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, modelOverride, effectiveEffort);
-                await Promise.all(permissionPromises);
-              } catch (goalErr) {
-                logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
-              }
-            }
-            // /clear wipes the Claude session ID — there's no session to
-            // continue into, so stop draining remaining queued steers.
-            if (parseSlashCommand(steerText)?.name === "clear") break;
-            continue;
-          }
-
-        try {
-          // Steer-drain guard: a steered message is a FOLLOW-UP user
-          // instruction delivered after the previous turn completed — Claude
-          // CLI can't inject mid-turn, so we resume the session here. To stop
-          // the model from misreading the prior turn's (possibly subagent-
-          // produced) output as an interruption it must diagnose, frame the
-          // steer as a fresh instruction. Also, if a subagent is somehow still
-          // marked in_progress (result fired before its tool_result), defer
-          // the drain rather than yanking the session into a new context.
-          const stillPending = sessionPendingAgents.get(sessionId);
-          if (stillPending && stillPending.size > 0) {
-            logger.info(
-              `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
-            );
-            // Re-queue at the front so it drains once the subagent resolves.
-            const q = steerQueues.get(sessionId) ?? [];
-            q.unshift(steerText);
-            steerQueues.set(sessionId, q);
-            break;
-          }
-
-          // Prepend goal to steer messages too
-          const basePrompt = activeGoal && !activeGoal.paused
-            ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
-            : steerText;
-          // Frame as a follow-up so the model treats this as a new user
-          // instruction rather than a description of interrupted state.
-          const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
-          ctxEstimator.addText(steerPrompt);
-          await runner.continueSessionStreaming(
-              claudeSid,
-              steerPrompt,
-              onEvent,
-              sessionId,
-               modelOverride,
-                effectiveEffort
-              );
-              await Promise.all(permissionPromises);
-            } catch (steerErr) {
-              logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
-            }
-          }
-          store.touch(sessionId);
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "session_info_update",
-              updatedAt: store.getUpdatedAt(sessionId),
-            } as any,
-          });
-        }
+        // Drain any steers queued during this turn (see drainSteerQueue).
+        await drainSteerQueue();
 
         // ─── Auto-compact check ───────────────────────────────────────────
         // Mirrors Codex core: after the turn finishes (including steer
@@ -2448,6 +2505,15 @@ export function createClaudeCodeAgent(
            }
          }
         }
+
+        // Compaction (manual /compact via dispatchSlashCommand above, or the
+        // auto-compact just run) performs its own LLM calls, during which a
+        // prompt is still in flight — so handleSteer keeps accepting steers.
+        // Drain them now instead of leaving them queued until the next user
+        // prompt. This mirrors the vscode-acp client, which holds its own
+        // message queue while `isCompacting` and drains it once compaction
+        // finishes. No-op when nothing was queued.
+        await drainSteerQueue();
 
         // If Claude CLI reported an error result (e.g. error_max_turns — the
         // model hit the turn ceiling mid-task), surface it to the user as an
