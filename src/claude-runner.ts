@@ -53,6 +53,14 @@ export interface StreamEvent {
   /** For assistant events: marks an API call boundary (for context estimation). */
   apiCallIndex?: number;
   /**
+   * For result events: the context window Claude Code resolved for the model
+   * (from `modelUsage[...].contextWindow`) and its max output tokens. These are
+   * the CLI's own figures, used here so the usage denominator doesn't rely on a
+   * hardcoded default.
+   */
+  contextWindow?: number;
+  maxOutputTokens?: number;
+  /**
    * For text_delta events: true when the text comes from the final `assistant`
    * message block (not a streaming content_block_delta). The context estimator
    * uses this to avoid double-counting assistant text in --verbose streams,
@@ -419,7 +427,13 @@ export class ClaudeRunner {
     // The handlers below match on the INNER shape, so without this unwrap they
     // never fire and all assistant text arrives only as the completed
     // `assistant` message (one big chunk → the empty-bubble flash).
+    //
+    // `parent_tool_use_id` lives on the WRAPPER, so capture it before replacing
+    // `parsed` — it is how a subagent's own API calls are told apart from the
+    // main conversation's.
+    let envelopeSidechain = false;
     if (parsed.type === "stream_event" && parsed.event && typeof parsed.event === "object") {
+      envelopeSidechain = parsed.parent_tool_use_id != null;
       parsed = parsed.event;
     }
 
@@ -531,19 +545,24 @@ export class ClaudeRunner {
       return;
     }
 
-   // Handle message_delta — carries per-call usage (the REAL current
-   // context size), unlike the result event which has cumulative usage.
+   // Handle message_delta — the ONLY real-time source of exact per-call usage.
+   //
+   // Verified against claude v2.1.220 through the CCR/proxy path: the completed
+   // `assistant` message reports `usage.input_tokens: 0`, and the `result` event
+   // reports usage ACCUMULATED over every API call in the turn (2 calls of ~22k
+   // showed as 44193). Only `message_delta` carries the true prompt size for the
+   // call that just finished — 20694 for a 20694-token prompt. This is the same
+   // number Claude Code and the Anthropic SDK use for their own context
+   // accounting, so surfacing it removes the need to estimate at all.
    if (parsed.type === "message_delta" && parsed.usage) {
-      // Reachable now that --include-partial-messages is passed and the
-      // `stream_event` envelope is unwrapped above. Emitted for completeness;
-      // agent.ts does not consume it, because per-call usage is taken from each
-      // `assistant` message's `message.usage`, which carries the full prompt
-      // size (input + cache tokens) rather than just the output delta.
       onEvent({
         type: "message_delta",
+        isSidechain: envelopeSidechain,
         usage: {
           input_tokens: parsed.usage.input_tokens ?? parsed.usage.inputTokens,
           output_tokens: parsed.usage.output_tokens ?? parsed.usage.outputTokens,
+          cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+          cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
         },
       });
       return;
@@ -551,11 +570,29 @@ export class ClaudeRunner {
 
     // Handle result event
     if (parsed.type === "result") {
+      // `modelUsage` reports the context window and max output tokens Claude
+      // Code itself resolved for the model — the same figures it uses for its
+      // own auto-compact threshold. Surfaced so the UI denominator comes from
+      // the CLI rather than a hardcoded default.
+      let contextWindow: number | undefined;
+      let maxOutputTokens: number | undefined;
+      const mu = parsed.modelUsage;
+      if (mu && typeof mu === "object") {
+        for (const entry of Object.values(mu) as any[]) {
+          if (entry && typeof entry.contextWindow === "number" && entry.contextWindow > 0) {
+            contextWindow = entry.contextWindow;
+            if (typeof entry.maxOutputTokens === "number") maxOutputTokens = entry.maxOutputTokens;
+            break;
+          }
+        }
+      }
       onEvent({
         type: "result",
         text: parsed.result,
         sessionId: parsed.session_id,
         usage: parsed.usage,
+        ...(contextWindow !== undefined ? { contextWindow } : {}),
+        ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
         // Claude CLI's stop reason/subtype — e.g. "end_turn", "max_turns",
         // "stop_sequence". Surfaced so the agent can log/diagnose premature
         // turn termination (vs a model that kept calling tools).

@@ -209,12 +209,25 @@ export async function loadModelContextWindows(): Promise<void> {
 }
 
 /**
+ * Context windows reported by Claude Code itself (`modelUsage[...].contextWindow`
+ * on the result event). Used when the proxy did not advertise a window for the
+ * model, so the denominator comes from the CLI rather than a hardcoded default.
+ * The proxy value still wins when present: it reflects the model's true window,
+ * whereas the CLI falls back to 200000 unless CLAUDE_CODE_MAX_CONTEXT_TOKENS is
+ * set.
+ */
+const cliReportedContextWindows = new Map<string, number>();
+
+/**
  * Resolve the context window (in tokens) for a given model.
  * Uses the cached proxy data; falls back to DEFAULT_CONTEXT_WINDOW.
  */
 function getContextWindowForModel(modelId: string | undefined): number {
   if (modelId && modelContextWindows.has(modelId)) {
     return modelContextWindows.get(modelId)!;
+  }
+  if (modelId && cliReportedContextWindows.has(modelId)) {
+    return cliReportedContextWindows.get(modelId)!;
   }
   return DEFAULT_CONTEXT_WINDOW;
 }
@@ -342,14 +355,19 @@ class TurnContextEstimator {
   }
 
   /**
-   * Get the context size in tokens: the last real per-call prompt count plus
-   * whatever has streamed since, or the character estimate when no real count
-   * has arrived yet.
+   * Context size in tokens.
+   *
+   * Once a real per-call count has arrived it is reported VERBATIM. Adding a
+   * character-based increment on top used to inflate it: tool results and
+   * subagent traffic were counted at a guessed chars-per-token ratio, and
+   * subagent content never enters this conversation's prompt at all. The real
+   * figure refreshes on every API call (message_delta), so holding it steady
+   * between calls is both accurate and what Claude Code's own UI does.
+   *
+   * The character estimate is only used before the first real count arrives.
    */
   getEstimatedTokens(): number {
-    if (this.realTokens > 0) {
-      return this.realTokens + estimateTokensFromChars(this.bytesSinceReal);
-    }
+    if (this.realTokens > 0) return this.realTokens;
     return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
   }
 
@@ -2048,11 +2066,10 @@ export function createClaudeCodeAgent(
       // Send a real-time usage_update so the context ring shows during the turn.
       if (event.type === "assistant") {
         ctxEstimator.markApiCall();
-        // Adopt the REAL prompt size Claude CLI reported for this API call.
-        // input_tokens + cache reads/creations = every prompt token the
-        // provider counted, i.e. the exact current context size. Sidechain
-        // (subagent) messages describe a separate conversation whose content
-        // never enters this session's context, so their usage is ignored.
+        // Secondary source. Through the CCR/proxy path the completed assistant
+        // message reports input_tokens: 0, so this usually contributes nothing;
+        // setRealTokens ignores non-positive values. `message_delta` below is
+        // the reliable source.
         if (event.usage && !event.isSidechain) {
           const real =
             (event.usage.input_tokens ?? 0) +
@@ -2062,12 +2079,30 @@ export function createClaudeCodeAgent(
           lastRealOutputTokens = event.usage.output_tokens ?? 0;
         }
         sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
-        // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`
-        // event fires at the START of the final assistant block (after the
+        // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`        // event fires at the START of the final assistant block (after the
         // per-token content_block_delta stream for the same message already
         // arrived). Resetting here would wipe the flag right before the
         // final-block text_delta below checks it. The flag is consumed and
         // cleared by the final-block text_delta itself.
+      }
+      // Handle message_delta — the authoritative per-call context size.
+      //
+      // This is the figure Claude Code and the Anthropic SDK use for their own
+      // context accounting: the exact prompt token count the provider charged
+      // for the API call that just completed. Adopting it verbatim is why the
+      // usage ring no longer needs an estimate. Subagent calls (non-null
+      // parent_tool_use_id on the stream envelope) measure a different
+      // conversation and must not be attributed here.
+      if (event.type === "message_delta" && event.usage && !event.isSidechain) {
+        const realPrompt =
+          (event.usage.input_tokens ?? 0) +
+          (event.usage.cache_read_input_tokens ?? 0) +
+          (event.usage.cache_creation_input_tokens ?? 0);
+        if (realPrompt > 0) {
+          ctxEstimator.setRealTokens(realPrompt);
+          lastRealOutputTokens = event.usage.output_tokens ?? lastRealOutputTokens;
+          sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
+        }
       }
       // Handle user event (tool results) — accumulate for context estimation.
       if (event.type === "user" && event.text) {
@@ -2112,6 +2147,18 @@ export function createClaudeCodeAgent(
       // swallowed as a plain end_turn.
       turnStopReason = event.stopReason;
       if (event.isError) turnErrored = true;
+      // Record the context window Claude Code resolved for this model, so the
+      // usage denominator can fall back to the CLI's own figure instead of a
+      // hardcoded 200k when the proxy advertises nothing.
+      if (event.contextWindow && event.contextWindow > 0) {
+        const cwModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+        if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
+          cliReportedContextWindows.set(cwModel, event.contextWindow);
+          logger.info(
+            `Claude Code reports contextWindow=${event.contextWindow} for ${cwModel}`
+          );
+        }
+      }
       // Log the stop reason so premature turn termination (end_turn vs
       // max_turns vs error) is diagnosable from the ACP stderr log.
       if (event.stopReason || event.isError) {

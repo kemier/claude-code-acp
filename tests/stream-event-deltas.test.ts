@@ -89,3 +89,76 @@ describe("streaming CLI args", () => {
     }
   });
 });
+
+describe("exact usage from message_delta", () => {
+  // Verified against claude v2.1.220 via the CCR/proxy path:
+  //   completed `assistant` message → usage.input_tokens: 0
+  //   `result`                      → 44193 (SUM of both calls)
+  //   `message_delta`               → 20702 then 23491 (true per-call prompts)
+  // Only message_delta is usable as the live context size.
+  it("forwards per-call prompt tokens with cache fields", () => {
+    const events = feed([
+      {
+        type: "stream_event",
+        parent_tool_use_id: null,
+        event: {
+          type: "message_delta",
+          usage: {
+            input_tokens: 20694,
+            output_tokens: 2,
+            cache_read_input_tokens: 100,
+            cache_creation_input_tokens: 50,
+          },
+        },
+      },
+    ]);
+    const md = events.find((e) => e.type === "message_delta");
+    expect(md?.usage?.input_tokens).toBe(20694);
+    expect(md?.usage?.cache_read_input_tokens).toBe(100);
+    expect(md?.usage?.cache_creation_input_tokens).toBe(50);
+    expect(md?.isSidechain).toBe(false);
+  });
+
+  it("flags subagent calls from the envelope's parent_tool_use_id", () => {
+    // The marker lives on the WRAPPER, so it must be captured before unwrapping.
+    const events = feed([
+      {
+        type: "stream_event",
+        parent_tool_use_id: "toolu_sub",
+        event: { type: "message_delta", usage: { input_tokens: 90000, output_tokens: 5 } },
+      },
+    ]);
+    expect(events.find((e) => e.type === "message_delta")?.isSidechain).toBe(true);
+  });
+
+  it("surfaces the context window Claude Code resolved for the model", () => {
+    const events = feed([
+      {
+        type: "result",
+        subtype: "success",
+        result: "ok",
+        session_id: "sid",
+        usage: { input_tokens: 44193, output_tokens: 27 },
+        modelUsage: {
+          "glm-5.2": {
+            inputTokens: 44193,
+            outputTokens: 27,
+            contextWindow: 200000,
+            maxOutputTokens: 32000,
+          },
+        },
+      },
+    ]);
+    const res = events.find((e) => e.type === "result");
+    expect(res?.contextWindow).toBe(200000);
+    expect(res?.maxOutputTokens).toBe(32000);
+  });
+
+  it("omits contextWindow when modelUsage is absent", () => {
+    const events = feed([
+      { type: "result", subtype: "success", result: "ok", session_id: "sid", usage: {} },
+    ]);
+    const res = events.find((e) => e.type === "result");
+    expect(res?.contextWindow).toBeUndefined();
+  });
+});
