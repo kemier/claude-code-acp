@@ -33,6 +33,24 @@ let nextStreamText = "streamed response";
 // steer time (handleSteer drops steers for idle sessions). Set true before
 // steering, false before the draining prompt.
 let running = false;
+// Optional gate: when set, startSessionStreaming/continueSessionStreaming
+// await it before resolving, letting a test fire a steer mid-turn (with
+// running=false to simulate the subprocess-closed-but-prompt-in-flight drain
+// tail window). `streamEntered` resolves once the gated streaming call has
+// begun (so the test can steer only after runPrompt is truly in flight).
+// Cleared after each use.
+let streamGate: (() => void) | null = null;
+let streamGatePromise: Promise<void> = new Promise(() => {});
+let streamEntered: () => void = () => {};
+let streamEnteredPromise: Promise<void> = new Promise(() => {});
+function setStreamGate() {
+  streamGatePromise = new Promise((resolve) => {
+    streamGate = resolve;
+  });
+  streamEnteredPromise = new Promise((resolve) => {
+    streamEntered = resolve;
+  });
+}
 
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
@@ -54,9 +72,11 @@ vi.mock("../src/claude-runner.js", () => {
         effortOverride?: string
       ) => {
         recorded.push({ kind: "start", cwd, prompt, modelOverride, effortOverride });
+        if (streamGate) streamEntered();
         onEvent({ type: "assistant", apiCallIndex: 0 });
         onEvent({ type: "text_delta", text: nextStreamText, fromAssistantBlock: true });
         onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
+        if (streamGate) await streamGatePromise;
         return { text: nextStreamText, sessionId: "claude-uuid-abc" };
       }
     );
@@ -70,9 +90,11 @@ vi.mock("../src/claude-runner.js", () => {
         effortOverride?: string
       ) => {
         recorded.push({ kind: "continue", prompt, modelOverride, effortOverride });
+        if (streamGate) streamEntered();
         onEvent({ type: "assistant", apiCallIndex: 0 });
         onEvent({ type: "text_delta", text: nextStreamText, fromAssistantBlock: true });
         onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
+        if (streamGate) await streamGatePromise;
         return { text: nextStreamText, sessionId: "claude-uuid-abc" };
       }
     );
@@ -99,6 +121,10 @@ async function setup() {
   recorded = [];
   nextStreamText = "streamed response";
   running = false;
+  streamGate = null;
+  streamGatePromise = new Promise(() => {});
+  streamEntered = () => {};
+  streamEnteredPromise = new Promise(() => {});
   const conn = createMockConnection();
   const agent = createClaudeCodeAgent(conn);
   await agent.initialize({
@@ -328,5 +354,50 @@ describe("steering (session/steer)", () => {
     expect(
       recorded.some((c) => c.kind === "start" && c.prompt.includes("Previous conversation summary"))
     ).toBe(true);
+  });
+
+  it("queues a steer arriving in the drain-tail window (subprocess closed, prompt in flight)", async () => {
+    // Regression: handleSteer used to gate on runner.isRunning() alone, which
+    // flips false the moment the Claude subprocess closes — BEFORE runPrompt's
+    // steer drain runs. A steer typed in the last moments of streaming thus
+    // arrived with running=false, was logged "no active turn", and silently
+    // dropped instead of queued — so it never showed before the next turn.
+    // The fix also treats a prompt-in-flight on the lock as "active".
+    const { conn, agent, sid } = await setup();
+    await prompt(agent, sid, "hello"); // establish Claude session
+
+    // Gate the main turn so it stays in flight while we steer.
+    setStreamGate();
+    running = false; // subprocess "closed" — but runPrompt is still in flight
+    const inflight = prompt(agent, sid, "main turn");
+    // Wait until runPrompt has actually entered streaming (in-flight flag set).
+    await streamEnteredPromise;
+    // While the main turn is gated (in flight, runner NOT running), steer.
+    await agent.extNotification("session/steer", { sessionId: sid, text: "late steer during drain tail" });
+    // The steer must still produce its visual user_message_chunk.
+    const userChunks = (conn.sessionUpdate as any).mock.calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
+      .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
+    expect(userChunks.some((t) => t.includes("late steer during drain tail"))).toBe(true);
+    // Release the main turn → drain tail runs and should drain the queued steer.
+    streamGate!();
+    await inflight;
+
+    const steerCall = recorded.find(
+      (c) => c.kind === "continue" && c.prompt.includes("late steer during drain tail")
+    );
+    expect(steerCall).toBeDefined();
+  });
+
+  it("drops a steer for a genuinely idle session (no prompt in flight)", async () => {
+    // When no turn is running AND no prompt is in flight, a steer is a no-op
+    // (matches codex-acp's "no active turn" rejection).
+    const { agent, sid } = await setup();
+    running = false;
+    await agent.extNotification("session/steer", { sessionId: sid, text: "orphan steer" });
+    recorded = [];
+    await prompt(agent, sid, "next");
+    // The orphan steer was dropped, not drained.
+    expect(recorded.some((c) => c.prompt.includes("orphan steer"))).toBe(false);
   });
 });

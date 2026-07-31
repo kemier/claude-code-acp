@@ -755,6 +755,17 @@ export function createClaudeCodeAgent(
   // queue behind the active turn as the user expects.
   const sessionPromptLocks = new Map<string, Promise<unknown>>();
 
+  // True for the entire duration of a runPrompt() call — from entry through
+  // the LLM turn, steer drain, auto-compact, and the end_turn return. Unlike
+  // runner.isRunning() (which flips false the moment the Claude subprocess
+  // closes, before the drain runs) this spans the whole turn tail. Used by
+  // handleSteer() to decide whether a steer should be queued vs. dropped: a
+  // steer typed in the last moments of streaming arrives after the subprocess
+  // closes but while a turn is still in flight, and must be queued (then
+  // drained at line ~2056) rather than silently dropped. Cleared in a finally
+  // so it can't get stuck true if runPrompt throws.
+  const sessionPromptInFlight = new Set<string>();
+
   // ─── Subagent (Agent tool) lifecycle tracking ─────────────────────────────
   // The Agent tool spawns a subagent that runs for an extended period. We
   // must NOT mark it "completed" the instant its tool_use block appears (as
@@ -929,7 +940,16 @@ export function createClaudeCodeAgent(
       logger.warn(`Steer request for unknown session ${sessionId}`);
       return;
     }
-    if (!runner.isRunning(sessionId)) {
+    // A turn is "active" for steering while EITHER the Claude subprocess is
+    // streaming OR a runPrompt() is still in flight. runner.isRunning() flips
+    // false the moment the subprocess closes (claude-runner.ts proc.on('close'))
+    // — but runPrompt() still runs the steer drain + auto-compact + return
+    // end_turn after that. Without the in-flight check, a steer typed in the
+    // last moments of streaming (subprocess closed, runPrompt in its drain
+    // tail) would hit this guard, log "no active turn", and be silently
+    // dropped instead of queued — so it never appeared in the chat before the
+    // next turn.
+    if (!runner.isRunning(sessionId) && !sessionPromptInFlight.has(sessionId)) {
       logger.info(`Steer request for idle session ${sessionId} — ignoring (no active turn)`);
       return;
     }
@@ -1639,6 +1659,10 @@ export function createClaudeCodeAgent(
       // replaced, so it never holds a stale promise across /clear (which
       // resolves quickly and clears per-session state under the lock too).
       const runPrompt = async (): Promise<PromptResponse> => {
+      // Mark this session as having a prompt in flight for the entire runPrompt
+      // body (LLM turn + steer drain + auto-compact + return). Cleared when the
+      // lock chain settles (below). See sessionPromptInFlight.
+      sessionPromptInFlight.add(sessionId);
       // If this prompt was cancelled while waiting in the serialization queue
       // behind a prior turn, don't start a new turn — drain-and-return.
       if (cancelledSessions.has(sessionId)) {
@@ -2308,6 +2332,13 @@ export function createClaudeCodeAgent(
       // failure) so a rejected prior prompt never blocks the next forever.
       const prev = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
       const next = prev.then(runPrompt, runPrompt);
+      // Clear the in-flight flag once runPrompt settles (success or failure).
+      // If a newer prompt queued behind this one has already re-added the flag
+      // by the time this fires, the delete is a harmless no-op on a re-added
+      // entry — but ordering (this finally registered before the newer prompt's
+      // runPrompt runs) means this clears first, then the newer runPrompt
+      // re-adds, so the flag stays accurate.
+      next.finally(() => sessionPromptInFlight.delete(sessionId));
       sessionPromptLocks.set(sessionId, next.catch(() => {}));
       return next;
     },
