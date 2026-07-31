@@ -19,6 +19,10 @@ vi.mock("../src/validation.js", () => ({
 // stream events (assistant block + streaming deltas) and assert the estimator
 // does not double-count assistant text.
 let capturedOnEvent: ((e: any) => void) | null = null;
+// Captures the prompt the agent sent to the runner (2nd arg of
+// startSessionStreaming / continueSessionStreaming) so slash-command tests can
+// assert the constructed prompt reaches the model.
+let capturedPrompt: string | null = null;
 
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
@@ -33,6 +37,7 @@ vi.mock("../src/claude-runner.js", () => {
     this.startSessionStreaming = vi.fn().mockImplementation(
       async (_cwd: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
+        capturedPrompt = _prompt;
         // Sentinel prompt to simulate a Claude CLI error result (e.g. the
         // model hit the turn ceiling). Used by the error-surfacing test.
         if (_prompt === "__error_max_turns__") {
@@ -57,6 +62,7 @@ vi.mock("../src/claude-runner.js", () => {
     this.continueSessionStreaming = vi.fn().mockImplementation(
       async (_sessionId: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
+        capturedPrompt = _prompt;
         onEvent({ type: "assistant", apiCallIndex: 0 });
         onEvent({ type: "text_delta", text: "continued", fromAssistantBlock: true });
         onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
@@ -87,6 +93,7 @@ describe("slash commands & estimator", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     capturedOnEvent = null;
+    capturedPrompt = null;
     conn = createMockConnection();
     agent = createClaudeCodeAgent(conn);
     await agent.initialize({
@@ -140,6 +147,44 @@ describe("slash commands & estimator", () => {
     expect(messages.some((m: string) => m.startsWith("Goal set:"))).toBe(true);
     // A streaming turn was started for the goal.
     expect(capturedOnEvent).not.toBeNull();
+  });
+
+  it("/review-branch with empty arg returns a usage message, not a turn", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/review-branch");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const msg = calls.find((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk");
+    expect(msg[0].update.content.text).toMatch(/requires branch name/);
+    expect(capturedOnEvent).toBeNull();
+  });
+
+  it("/review-branch <branch> starts a review turn referencing the branch diff", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/review-branch main");
+
+    expect(capturedOnEvent).not.toBeNull();
+    expect(capturedPrompt).toContain("git diff main...HEAD");
+    expect(capturedPrompt).toContain("main");
+  });
+
+  it("/review-commit with empty arg returns a usage message, not a turn", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/review-commit");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const msg = calls.find((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk");
+    expect(msg[0].update.content.text).toMatch(/requires commit sha/);
+    expect(capturedOnEvent).toBeNull();
+  });
+
+  it("/review-commit <sha> starts a review turn referencing the commit show", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/review-commit abc123");
+
+    expect(capturedOnEvent).not.toBeNull();
+    expect(capturedPrompt).toContain("git show abc123");
+    expect(capturedPrompt).toContain("abc123");
   });
 
   it("/clear wipes the session and does not start a turn", async () => {

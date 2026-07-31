@@ -138,6 +138,16 @@ const BUILTIN_COMMANDS = [
     input: null,
   },
   {
+    name: "review-branch",
+    description: "Review changes relative to a base branch.",
+    input: { hint: "branch name" },
+  },
+  {
+    name: "review-commit",
+    description: "Review a specific commit.",
+    input: { hint: "commit sha" },
+  },
+  {
     name: "compact",
     description: "Summarize conversation to reduce context usage.",
     input: null,
@@ -759,6 +769,25 @@ function isReadOnlyCommand(name: string): boolean {
   return name === "ps" || name === "status" || name === "skills";
 }
 
+/**
+ * Build the prompt for /review-branch and /review-commit. The model has Bash
+ * tool access, so it runs the diff command itself and reviews the result in a
+ * single turn — standing in for codex-acp's app-server-side review/start.
+ */
+function buildReviewTurnPrompt(diffCommand: string, scope: string): string {
+  return [
+    `Please review ${scope}.`,
+    ``,
+    `Run \`${diffCommand}\` to see the changes, then review them for:`,
+    `- correctness and potential bugs`,
+    `- security issues`,
+    `- readability and style`,
+    `- anything that could be simplified or is missing (e.g. tests, error handling)`,
+    ``,
+    `Report findings grouped by severity (critical → minor), each with the file and line. If there is nothing to review, say so.`,
+  ].join("\n");
+}
+
 function buildConfigOptions(store: SessionStore, sessionId: string) {
  const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
  const currentModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
@@ -1142,6 +1171,38 @@ export function createClaudeCodeAgent(
         } as any,
       });
       return { handled: true };
+    }
+
+    if (name === "review-branch") {
+      if (!rest) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: 'Command "/review-branch" requires branch name.' },
+          } as any,
+        });
+        return { handled: true };
+      }
+      // Like /goal, return a prompt the caller starts an LLM turn with. The
+      // model has Bash tool access, so it gathers the diff itself (mirrors how
+      // codex-acp's review delegates diff-gathering to its app-server, which
+      // here is just the agent's own tool use).
+      return { handled: true, startTurn: buildReviewTurnPrompt(`git diff ${rest}...HEAD`, `changes on this branch relative to \`${rest}\``) };
+    }
+
+    if (name === "review-commit") {
+      if (!rest) {
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: 'Command "/review-commit" requires commit sha.' },
+          } as any,
+        });
+        return { handled: true };
+      }
+      return { handled: true, startTurn: buildReviewTurnPrompt(`git show ${rest}`, `commit ${rest}`) };
     }
 
     if (name === "compact") {
