@@ -665,6 +665,21 @@ export function createClaudeCodeAgent(
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
 
+  // ─── Per-session prompt serialization ─────────────────────────────────────
+  // The ACP SDK dispatches each incoming `session/prompt` request concurrently
+  // — its read loop (acp.js #receive) calls #processMessage without awaiting
+  // it, so a second prompt that arrives while the first is still streaming
+  // (e.g. vscode-acp sends a read-only slash command like /skills mid-turn)
+  // runs a SECOND prompt() handler on the same session in parallel. That race
+  // corrupts shared per-session state (sessionTodos, sessionEstimators, the
+  // Claude --resume session id, the onEvent closure) and can drop the slash
+  // command's agent_message_chunk entirely. Serialize prompts per session: a
+  // prompt that arrives mid-turn simply waits for the in-flight one to finish
+  // before running. Read-only slash commands are fast (no LLM turn), so the
+  // wait is short; mutating commands (/compact, /clear) and regular prompts
+  // queue behind the active turn as the user expects.
+  const sessionPromptLocks = new Map<string, Promise<unknown>>();
+
   // ─── Subagent (Agent tool) lifecycle tracking ─────────────────────────────
   // The Agent tool spawns a subagent that runs for an extended period. We
   // must NOT mark it "completed" the instant its tool_use block appears (as
@@ -1540,6 +1555,22 @@ export function createClaudeCodeAgent(
         throw RequestError.invalidParams("Empty prompt text");
       }
 
+      // Serialize against any in-flight prompt on this session. See
+      // sessionPromptLocks above: the SDK runs concurrent prompt() handlers,
+      // so without this a mid-turn /skills (or any second prompt) would race
+      // with the active turn. We chain on the lock and run the whole prompt
+      // body — slash dispatch, LLM turn, steer drain, auto-compact — once the
+      // prior prompt finishes. The lock is keyed by session and always
+      // replaced, so it never holds a stale promise across /clear (which
+      // resolves quickly and clears per-session state under the lock too).
+      const runPrompt = async (): Promise<PromptResponse> => {
+      // If this prompt was cancelled while waiting in the serialization queue
+      // behind a prior turn, don't start a new turn — drain-and-return.
+      if (cancelledSessions.has(sessionId)) {
+        cancelledSessions.delete(sessionId);
+        logger.info(`Queued prompt cancelled before start for session ${sessionId}`);
+        return { stopReason: "cancelled" };
+      }
       // ── Slash command handling ──────────────────────────────────
       // Intercept built-in commands (/ps, /goal, /skills, /status, /clear,
       // /compact) before starting an LLM turn. Shared dispatch logic lives in
@@ -2150,6 +2181,15 @@ export function createClaudeCodeAgent(
 
         return { stopReason: "end_turn" };
       }
+      }; // end runPrompt
+
+      // Chain on the per-session lock so this prompt waits for any in-flight
+      // one. We always replace the lock with the new chain (success or
+      // failure) so a rejected prior prompt never blocks the next forever.
+      const prev = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+      const next = prev.then(runPrompt, runPrompt);
+      sessionPromptLocks.set(sessionId, next.catch(() => {}));
+      return next;
     },
 
     async cancel(params: CancelNotification): Promise<void> {

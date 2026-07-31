@@ -221,3 +221,8 @@ describe("slash commands & estimator", () => {
 // implementation. Driving the internal steer queue through the public ACP API
 // would require a full connection harness, so we rely on the shared-dispatch
 // unit tests above for coverage of the command behavior itself.
+
+// Per-session prompt serialization (the concurrent /skills-mid-turn
+// regression) is covered in tests/agent-prompt-serialization.test.ts — it
+// needs a runner mock whose startSessionStreaming blocks on a deferred
+// release, which is incompatible with this file's synchronous mock.
