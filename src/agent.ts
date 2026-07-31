@@ -227,6 +227,9 @@ function getAutoCompactThreshold(modelId: string | undefined): number {
 // can run after the turn finishes.
 const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
 
+// Monotonic id source for compaction lifecycle tool calls.
+let compactionCounter = 0;
+
 // Per-session context estimator for the in-flight prompt() turn. Stored on a
 // map (not a local) so doCompact() — which runs in its own scope — can reset
 // it after compaction replaces the conversation with a short summary. Without
@@ -1351,6 +1354,63 @@ export function createClaudeCodeAgent(
     return getDefaultEffort(effectiveModel);
   }
 
+  /**
+   * Emit the ACP compaction lifecycle that clients use to render a DEDICATED,
+   * transient compaction notice — mirroring codex-acp's `contextCompaction`
+   * tool-call pair instead of announcing compaction as assistant text.
+   *
+   * Why not `agent_message_chunk`: vscode-acp only treats compaction text as a
+   * standalone notice when nothing is mid-stream (`currentAssistantText.trim()
+   * .length === 0 && text.length < 200`). Auto-compact runs right after a turn
+   * in which the assistant just streamed text, so that guard fails and the
+   * notice is appended to the previous assistant bubble — concatenated with
+   * older output, and never dismissed because it lands in normal history.
+   *
+   * With `_meta.contextCompaction` the client instead:
+   *  - shows "Compacting conversation..." progress while `in_progress`;
+   *  - on `completed`, clears the compacted-away history and renders the notice
+   *    as a DOM-only `compact-notice` system message that is transient (not
+   *    persisted to history, cleared when the next user message arrives);
+   *  - on `failed`, hides progress and shows a "Compaction failed" error.
+   *
+   * The client supplies the notice text itself, so no assistant text is sent.
+   */
+  async function emitCompactionLifecycle(
+    connection: AgentSideConnection,
+    sessionId: string,
+    toolCallId: string,
+    phase: "start" | "completed" | "failed",
+    detail?: string,
+  ): Promise<void> {
+    const update =
+      phase === "start"
+        ? {
+            sessionUpdate: "tool_call",
+            toolCallId,
+            kind: "other",
+            title: "Context compacting",
+            status: "in_progress",
+            _meta: { contextCompaction: true },
+          }
+        : {
+            sessionUpdate: "tool_call_update",
+            toolCallId,
+            // On failure the client renders its own error text; the detail is
+            // kept in the title so it still shows in the ACP traffic log.
+            title:
+              phase === "completed"
+                ? "Context compacted"
+                : `Compaction failed${detail ? `: ${detail}` : ""}`,
+            status: phase === "completed" ? "completed" : "failed",
+            _meta: { contextCompaction: true },
+          };
+    await connection
+      .sessionUpdate({ sessionId, update: update as any })
+      .catch(() => {
+        // Best effort — a missing notice must not fail the compaction itself.
+      });
+  }
+
   async function doCompact(
     sessionId: string,
     connection: AgentSideConnection,
@@ -1373,15 +1433,12 @@ export function createClaudeCodeAgent(
       }
       return false;
     }
-    if (announce) {
-      await connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "Compacting conversation..." },
-        } as any,
-      });
-    }
+    // Announce compaction through the dedicated lifecycle instead of assistant
+    // text, so the client can render a standalone, self-dismissing notice.
+    // Emitted for BOTH manual /compact and auto-compact — the client tells them
+    // apart by whether it already set `isCompacting` from the user's command.
+    const compactionId = `compaction_${++compactionCounter}`;
+    await emitCompactionLifecycle(connection, sessionId, compactionId, "start");
     // Ask the LLM to produce a concise summary of the conversation.
     const compactPrompt =
       "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context.";
@@ -1423,28 +1480,18 @@ export function createClaudeCodeAgent(
           `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
         );
       }
-      if (announce) {
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Conversation compacted successfully." },
-          } as any,
-        });
-      }
+      // Completion drives the client's history clear + transient notice. The
+      // client renders the notice text itself, so nothing is sent as assistant
+      // text (which is what previously got concatenated onto the prior reply).
+      await emitCompactionLifecycle(connection, sessionId, compactionId, "completed");
       logger.info(`Compaction succeeded for session ${sessionId}`);
       return true;
     } catch (compactErr) {
-      logger.error(`Compaction failed for session ${sessionId}: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}`);
-      if (announce) {
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: `Compaction failed: ${compactErr instanceof Error ? compactErr.message : String(compactErr)}` },
-          } as any,
-        });
-      }
+      const detail = compactErr instanceof Error ? compactErr.message : String(compactErr);
+      logger.error(`Compaction failed for session ${sessionId}: ${detail}`);
+      // `failed` makes the client hide the progress indicator and surface an
+      // error instead of leaving a stuck "Compacting conversation..." banner.
+      await emitCompactionLifecycle(connection, sessionId, compactionId, "failed", detail);
       return false;
     }
   }
@@ -2352,14 +2399,12 @@ export function createClaudeCodeAgent(
             logger.info(
               `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (90% of ${getContextWindowForModel(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)})`,
             );
-            // Emit a compaction notice to the UI (matches Codex's style).
-            await connection.sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "agent_message_chunk",
-                content: { type: "text", text: "*Context compacted to fit the model's context window.*\n\n" },
-              } as any,
-            });
+            // The compaction notice is emitted by doCompact as a dedicated
+            // `_meta.contextCompaction` lifecycle, not as assistant text. An
+            // agent_message_chunk here would be appended to the reply that just
+            // streamed (vscode-acp only treats compaction text as standalone
+            // when nothing is mid-stream), which is exactly the concatenated,
+            // never-dismissed notice this replaces.
            await doCompact(
              sessionId,
              connection,
@@ -2367,7 +2412,7 @@ export function createClaudeCodeAgent(
              store,
              modelOverride,
              effectiveEffort,
-             false, // don't announce "Compacting..." — we already emitted the notice above
+             false, // no "No conversation to compact yet." text for auto-compact
            );
            // After compaction, re-send the original user prompt so the LLM
            // continues the task in the fresh (compacted) session. This matches

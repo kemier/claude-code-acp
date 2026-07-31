@@ -283,8 +283,29 @@ describe("/compact (doCompact)", () => {
     expect(fresh).toBeDefined();
     expect(fresh!.prompt).toContain("SUMMARY-TEXT");
 
-    expect(messages(conn).some((m) => m.includes("Compacting conversation"))).toBe(true);
-    expect(messages(conn).some((m) => m.includes("compacted successfully"))).toBe(true);
+    // Compaction is announced via the dedicated `_meta.contextCompaction`
+    // lifecycle, NOT as assistant text. Assistant text would be appended to
+    // the reply that just streamed and would never be dismissed.
+    const compactionUpdates = (conn.sessionUpdate as any).mock.calls
+      .map((c: any) => c[0]?.update)
+      .filter((u: any) => u?._meta?.contextCompaction === true);
+    expect(compactionUpdates).toHaveLength(2);
+    expect(compactionUpdates[0]).toMatchObject({
+      sessionUpdate: "tool_call",
+      kind: "other",
+      title: "Context compacting",
+      status: "in_progress",
+    });
+    expect(compactionUpdates[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      title: "Context compacted",
+      status: "completed",
+    });
+    // Same tool call id for both phases so the client can pair them.
+    expect(compactionUpdates[1].toolCallId).toBe(compactionUpdates[0].toolCallId);
+    // No compaction text leaks into the assistant stream.
+    expect(messages(conn).some((m) => m.includes("Compacting conversation"))).toBe(false);
+    expect(messages(conn).some((m) => m.includes("compacted successfully"))).toBe(false);
   });
 
   it("reports nothing to compact when there is no session", async () => {
@@ -348,9 +369,13 @@ describe("steering (session/steer)", () => {
     await steer(agent, sid, "/compact");
     recorded = [];
     await prompt(agent, sid, "next");
-    // /compact dispatched during drain → a compaction message was emitted and
-    // the fresh-session seed embeds the summary.
-    expect(messages(conn).some((m) => m.includes("ompact"))).toBe(true);
+    // /compact dispatched during drain → the compaction lifecycle was emitted
+    // and the fresh-session seed embeds the summary.
+    const compactionUpdates = (conn.sessionUpdate as any).mock.calls
+      .map((c: any) => c[0]?.update)
+      .filter((u: any) => u?._meta?.contextCompaction === true);
+    expect(compactionUpdates.length).toBeGreaterThanOrEqual(2);
+    expect(compactionUpdates.some((u: any) => u.status === "completed")).toBe(true);
     expect(
       recorded.some((c) => c.kind === "start" && c.prompt.includes("Previous conversation summary"))
     ).toBe(true);
