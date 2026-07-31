@@ -126,7 +126,7 @@ async function setup() {
   streamEntered = () => {};
   streamEnteredPromise = new Promise(() => {});
   const conn = createMockConnection();
-  const agent = createClaudeCodeAgent(conn);
+  const agent: any = createClaudeCodeAgent(conn);
   await agent.initialize({
     protocolVersion: 1,
     clientCapabilities: {},
@@ -302,7 +302,7 @@ describe("steering (session/steer)", () => {
     const userChunks = (conn.sessionUpdate as any).mock.calls
       .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
       .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
-    expect(userChunks.some((t) => t.includes("please also do X"))).toBe(true);
+    expect(userChunks.some((t: string) => t.includes("please also do X"))).toBe(true);
   });
 
   it("drains a queued plain-text steer as a follow-up --resume prompt", async () => {
@@ -378,7 +378,7 @@ describe("steering (session/steer)", () => {
     const userChunks = (conn.sessionUpdate as any).mock.calls
       .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
       .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
-    expect(userChunks.some((t) => t.includes("late steer during drain tail"))).toBe(true);
+    expect(userChunks.some((t: string) => t.includes("late steer during drain tail"))).toBe(true);
     // Release the main turn → drain tail runs and should drain the queued steer.
     streamGate!();
     await inflight;
