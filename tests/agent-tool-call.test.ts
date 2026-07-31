@@ -163,10 +163,11 @@ describe("Agent tool_call notifications", () => {
     ]);
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     expect(toolCalls[0].title).toBe("git diff --stat");
-    // Full command preserved in rawInput for the client.
-    expect(toolCalls[0].rawInput.command).toBe(
-      "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
-    );
+    // The `cd` prefix moves to `cwd` so the FIRST line of rawInput.command is
+    // the real command — vscode-acp derives its displayed title from that line
+    // and would otherwise overwrite the title with `cd /workspace/...`.
+    expect(toolCalls[0].rawInput.command).toBe("git diff --stat");
+    expect(toolCalls[0].rawInput.cwd).toBe("/workspace/git/ezennin/claude-code-acp");
   });
 
   it("Bash tool → strips leading `cd <dir> && ` on a single line", async () => {

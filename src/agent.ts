@@ -392,6 +392,48 @@ function hasUnclosedQuote(line: string): boolean {
 }
 
 /**
+ * Split Claude Code's `cd <cwd>` prefix off a Bash command.
+ *
+ * Claude Code CLI prepends the working directory to EVERY Bash command, as
+ * either `cd <dir> && <cmd>` or `cd <dir>\n<cmd>`. ACP clients surface the
+ * command from `rawInput.command`; vscode-acp specifically takes its FIRST
+ * line and, when it differs from the agent-supplied `title`, overwrites the
+ * title with it (ChatWebviewProvider.ts: `firstLine = detailHint.split('\n')[0]`
+ * → `displayTitle = firstLine`). With the `cd` still attached, every execute
+ * tool call therefore renders as `cd /workspace/...` and the real command is
+ * never shown.
+ *
+ * Reporting the directory out-of-band as `cwd` (the shape codex-acp uses:
+ * `rawInput: { command, cwd }`) makes the first line of `command` the actual
+ * command, so the client's override becomes a no-op and no information is lost.
+ *
+ * Returns the command with the `cd` clause removed plus the extracted `cwd`.
+ * When no `cd` prefix is present, the command is returned unchanged and `cwd`
+ * is undefined.
+ */
+export function splitCdPrefix(command: string): { command: string; cwd?: string } {
+  const nl = command.indexOf("\n");
+  const firstLine = (nl === -1 ? command : command.slice(0, nl)).trim();
+  const rest = nl === -1 ? "" : command.slice(nl + 1);
+
+  // `cd <dir> && <inline rest>` — cd and the command share the first line.
+  const cdAnd = firstLine.match(/^cd\s+(\S[^&]*?)\s*&&\s*(.+)$/);
+  if (cdAnd) {
+    const inline = cdAnd[2].trim();
+    const remainder = rest ? `${inline}\n${rest}` : inline;
+    return { command: remainder, cwd: cdAnd[1].trim() };
+  }
+
+  // Bare `cd <dir>` on its own line — the command starts on the next line.
+  const cdOnly = firstLine.match(/^cd\s+(\S.*)$/);
+  if (cdOnly && rest.trim()) {
+    return { command: rest.replace(/^\n+/, ""), cwd: cdOnly[1].trim() };
+  }
+
+  return { command };
+}
+
+/**
  * Derive a one-line title for a Bash command. Claude Code prefixes commands
  * with `cd <cwd>` (either as a leading `cd <dir> && <cmd>` on one line, or as
  * a `cd <dir>` line followed by `\n<cmd>`). vscode-acp renders only the first
@@ -559,13 +601,23 @@ function buildToolCallUpdate(
             : toolName;
       const description =
         typeof input.description === "string" ? input.description : undefined;
+      // Report the working directory out-of-band instead of leaving Claude
+      // Code's `cd <cwd>` prefix inside `command`. ACP clients derive the
+      // displayed command from the first line of `rawInput.command`, so the
+      // prefix would mask every command (see splitCdPrefix).
+      const split = splitCdPrefix(command);
+      const rawInput: Record<string, unknown> = {
+        ...(typeof toolInput === "object" && toolInput !== null ? input : {}),
+        command: split.command,
+      };
+      if (split.cwd !== undefined) rawInput.cwd = split.cwd;
       return {
         sessionUpdate: "tool_call",
         toolCallId,
         title: titleForCommand(command, description),
         kind: "execute",
         status: "completed",
-        rawInput: toolInput ?? {},
+        rawInput,
       };
     }
     case "Glob": {
