@@ -239,7 +239,26 @@ describe("Agent modes and config", () => {
       expect((result as any).modes).toBeDefined();
     });
 
-    it("should throw for unknown session", async () => {
+    it("rehydrates a session unknown to this process when cwd is given", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+
+      // The agent is respawned per client session, so a resumed session is
+      // routinely unknown to the new process. Throwing here made the resumed
+      // conversation render empty; it must load instead.
+      const res: any = await agent.loadSession!({
+        sessionId: "unknown",
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+      expect(res).toBeDefined();
+      expect(res.modes).toBeDefined();
+    });
+
+    it("still throws when there is no cwd to rehydrate from", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: {},
@@ -249,9 +268,8 @@ describe("Agent modes and config", () => {
       await expect(
         agent.loadSession!({
           sessionId: "unknown",
-          cwd: "/tmp",
           mcpServers: [],
-        })
+        } as any)
       ).rejects.toThrow();
     });
   });

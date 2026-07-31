@@ -1606,10 +1606,23 @@ export function createClaudeCodeAgent(
    ): Promise<LoadSessionResponse> {
      const { sessionId } = params;
 
+     // The agent is respawned per client session (and on window reload), so a
+     // session the client is resuming may not be in this process's map. The
+     // store rehydrates from disk at construction; if it still isn't there
+     // (nothing persisted yet, or persisted under a different key), recreate it
+     // from the cwd the client supplied. Throwing resourceNotFound here is what
+     // made a resumed session render completely empty.
      if (!store.has(sessionId)) {
-       throw RequestError.resourceNotFound(
-         `Session ${sessionId} not found`
-       );
+       if (typeof params.cwd === "string" && params.cwd) {
+         logger.info(
+           `Load session ${sessionId} unknown to this process — rehydrating from cwd ${params.cwd}`
+         );
+         store.ensure(sessionId, params.cwd, (params as any).mcpServers ?? []);
+       } else {
+         throw RequestError.resourceNotFound(
+           `Session ${sessionId} not found`
+         );
+       }
      }
 
      const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
@@ -1617,13 +1630,36 @@ export function createClaudeCodeAgent(
 
       // Replay conversation history from Claude CLI's JSONL transcript.
       // The transcript lives at ~/.claude/projects/<encoded-cwd>/<claude-session-id>.jsonl
-      const claudeSessionId = store.getClaudeSessionId(sessionId);
+      let claudeSessionId = store.getClaudeSessionId(sessionId);
+      const { homedir } = await import("node:os");
+      const replayCwd = store.getCwd(sessionId)!;
+      const projectDir = `${homedir()}/.claude/projects/${replayCwd.replace(/\//g, "-")}`;
+      if (!claudeSessionId) {
+        // Sessions created before full-record persistence have no mapping. Fall
+        // back to the most recent transcript for this directory so the resumed
+        // conversation still renders instead of coming up blank.
+        try {
+          const { readdirSync, statSync, existsSync } = await import("node:fs");
+          if (existsSync(projectDir)) {
+            const newest = readdirSync(projectDir)
+              .filter((f) => f.endsWith(".jsonl"))
+              .map((f) => ({ f, m: statSync(`${projectDir}/${f}`).mtimeMs }))
+              .sort((a, b) => b.m - a.m)[0];
+            if (newest) {
+              claudeSessionId = newest.f.replace(/\.jsonl$/, "");
+              logger.info(
+                `No Claude session mapped for ${sessionId}; replaying newest transcript ${claudeSessionId}`
+              );
+            }
+          }
+        } catch {
+          // Fall through — nothing to replay.
+        }
+      }
       if (claudeSessionId) {
         try {
-          const { homedir } = await import("node:os");
-          const cwd = store.getCwd(sessionId)!;
-          const encodedCwd = cwd.replace(/\//g, "-");
-          const transcriptPath = `${homedir()}/.claude/projects/${encodedCwd}/${claudeSessionId}.jsonl`;
+          const cwd = replayCwd;
+          const transcriptPath = `${projectDir}/${claudeSessionId}.jsonl`;
           const { readFileSync, existsSync } = await import("node:fs");
           if (existsSync(transcriptPath)) {
             const raw = readFileSync(transcriptPath, "utf-8");
@@ -1632,6 +1668,10 @@ export function createClaudeCodeAgent(
             for (const line of lines) {
               try {
                 const entry = JSON.parse(line);
+                // Subagent (sidechain) entries are a separate conversation —
+                // replaying them would interleave subagent chatter into the
+                // main history.
+                if (entry.isSidechain) continue;
                 if (entry.type === "user") {
                   const msg = entry.message;
                   if (!msg) continue;
@@ -1672,16 +1712,17 @@ export function createClaudeCodeAgent(
                           } as any,
                         });
                       } else if (block.type === "tool_use") {
+                        // Build the update with the SAME mapper the live path
+                        // uses, so a resumed session shows "Read file 'x.ts'"
+                        // and the right `kind`/diff content instead of a bare
+                        // tool name like "Read".
                         await connection.sessionUpdate({
                           sessionId,
-                          update: {
-                            sessionUpdate: "tool_call",
-                            toolCallId: block.id ?? `replay-${Math.random().toString(36).slice(2, 8)}`,
-                            title: block.name ?? "tool",
-                            kind: "execute",
-                            status: "completed",
-                            rawInput: block.input ?? {},
-                          } as any,
+                          update: buildToolCallUpdate(
+                            block.id ?? `replay-${Math.random().toString(36).slice(2, 8)}`,
+                            block.name ?? "tool",
+                            block.input ?? {},
+                          ) as any,
                         });
                       }
                     }
