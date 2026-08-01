@@ -197,3 +197,20 @@ Use conventional commits with gitemojis (Ericsson internal guideline):
 - This is a public repository fork — never commit secrets, API keys, or internal TODO lists
 - Security fix details stay local only (commit message: "fix security issue in X")
 - `.env` files must never be committed
+
+## Build and Deploy
+
+```bash
+# Local Mac
+./scripts/install.sh
+# or: npm run install:local
+
+# Remote workstation (rsync + build + install)
+ACP_SSH_HOST=workstation ./scripts/install-remote.sh
+# or: npm run install:remote
+
+# Both
+npm run deploy
+```
+
+Installs `claude-code-acp` and `claude-agent-acp` into `~/.local/bin` (symlinks to `bin/claude-code-acp.js`).

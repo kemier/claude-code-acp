@@ -11,7 +11,11 @@
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "install:local": "bash scripts/install.sh",
+    "install:remote": "bash scripts/install-remote.sh",
+    "deploy": "bash scripts/install.sh && bash scripts/install-remote.sh",
+    "deploy:fast": "bash scripts/install.sh && bash scripts/install-remote.sh"
   },
   "keywords": [
     "acp",
