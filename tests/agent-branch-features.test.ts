@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createClaudeCodeAgent } from "../src/agent.js";
+import { clearClaudeSettingsCache } from "../src/claude-settings.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+
+const ERICAI_MODELS =
+  "glm-5.2,glm-5.1,Qwen3-Coder,deepseek-v4-pro,kimi-k2.7-code,kimi-k2.6,mimo-v2.5-pro,mimo-v2.5,qwen2.5-14b-1m";
+
+beforeEach(() => {
+  process.env.ANTHROPIC_MODEL = "glm-5.2";
+  process.env.CLAUDE_ACP_AVAILABLE_MODELS = ERICAI_MODELS;
+  clearClaudeSettingsCache();
+});
 
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => false),
@@ -154,7 +164,7 @@ function messages(conn: AgentSideConnection): string[] {
 }
 
 describe("model & effort pickers", () => {
-  it("newSession advertises 9 models and model-aware efforts", async () => {
+  it("newSession advertises models from CLAUDE_ACP_AVAILABLE_MODELS and model-aware efforts", async () => {
     const { agent } = await setup();
     const r: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
     const opts: any[] = r.configOptions;
@@ -163,11 +173,23 @@ describe("model & effort pickers", () => {
     expect(modelPicker.options).toHaveLength(9);
     expect(modelPicker.options.map((o: any) => o.value)).toContain("glm-5.2");
     expect(modelPicker.options.map((o: any) => o.value)).toContain("qwen2.5-14b-1m");
+    expect(modelPicker.description).toMatch(/Claude Code settings/);
 
     const effortPicker = opts.find((o) => o.id === "effort");
     // Default model is glm-5.2 (reasoning) → effort picker present with low/medium/high.
     expect(effortPicker).toBeDefined();
     expect(effortPicker.options.map((o: any) => o.value)).toEqual(["low", "medium", "high"]);
+  });
+
+  it("newSession advertises only ANTHROPIC_MODEL when no available-models list is set", async () => {
+    delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
+    process.env.ANTHROPIC_MODEL = "LongCat-2.0";
+    clearClaudeSettingsCache();
+    const { agent } = await setup();
+    const r: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    const modelPicker = r.configOptions.find((o: any) => o.id === "model");
+    expect(modelPicker.options.map((o: any) => o.value)).toEqual(["LongCat-2.0"]);
+    expect(modelPicker.currentValue).toBe("LongCat-2.0");
   });
 
   it("selecting a non-reasoning model hides the effort picker", async () => {

@@ -27,7 +27,12 @@ import {
 import { SessionStore } from "./session-store.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
-import { getClaudeEnv } from "./claude-settings.js";
+import {
+  getAvailableModelsFromSettings,
+  getClaudeEnv,
+  getDefaultEffortFromSettings,
+  getDefaultModelFromSettings,
+} from "./claude-settings.js";
 import {
   validateCwd,
   validateMcpCommand,
@@ -62,19 +67,6 @@ function buildModeState(currentModeId: string) {
   };
 }
 
-/** Models available through ericai-proxy (queried from /v1/models). */
-const PROXY_MODELS = [
-  { id: "glm-5.2", name: "GLM-5.2" },
-  { id: "glm-5.1", name: "GLM-5.1" },
-  { id: "Qwen3-Coder", name: "Qwen3-Coder" },
-  { id: "deepseek-v4-pro", name: "DeepSeek-V4-Pro" },
-  { id: "kimi-k2.7-code", name: "Kimi-K2.7-Code" },
-  { id: "kimi-k2.6", name: "Kimi-K2.6" },
-  { id: "mimo-v2.5-pro", name: "MiMo-V2.5-Pro" },
-  { id: "mimo-v2.5", name: "MiMo-V2.5" },
-  { id: "qwen2.5-14b-1m", name: "Qwen2.5-14B-1M" },
-];
-
 /** All possible effort levels (Claude Code CLI --effort flag). */
 const ALL_EFFORT_LEVELS: Record<string, { name: string; description: string }> = {
   low: { name: "Low", description: "Fast, minimal reasoning" },
@@ -85,10 +77,10 @@ const ALL_EFFORT_LEVELS: Record<string, { name: string; description: string }> =
 };
 
 /**
- * Per-model effort support. Must match reasoning_profiles in
- * ericai-proxy/scripts/update_catalog.sh.
- * - Models with thinking support get their specific effort levels.
- * - Models without thinking get an empty array (effort picker hidden).
+ * Optional per-model effort support for known backends (e.g. EricAI via
+ * CLAUDE_ACP_AVAILABLE_MODELS). Unknown models (LongCat, etc.) get the
+ * standard Claude Code effort set below.
+ * Empty array = non-reasoning model (effort picker hidden).
  */
 const MODEL_EFFORTS: Record<string, string[]> = {
   "glm-5.2": ["low", "medium", "high"],
@@ -99,16 +91,36 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   "kimi-k2.6": ["low", "high"],
   "mimo-v2.5-pro": ["low", "high"],
   "mimo-v2.5": ["low", "high"],
-  // qwen2.5-14b-1m is a non-reasoning model — no effort picker
   "qwen2.5-14b-1m": [],
 };
 
-/** Default effort per model (first entry in MODEL_EFFORTS, or undefined). */
+const DEFAULT_EFFORTS = ["low", "medium", "high"];
+
+function getEffortsForModel(modelId: string): string[] {
+  if (Object.prototype.hasOwnProperty.call(MODEL_EFFORTS, modelId)) {
+    return MODEL_EFFORTS[modelId];
+  }
+  return DEFAULT_EFFORTS;
+}
+
+/** Default effort: settings.effortLevel when valid, else high if supported. */
 function getDefaultEffort(modelId: string): string | undefined {
-  const efforts = MODEL_EFFORTS[modelId];
-  if (!efforts || efforts.length === 0) return undefined;
-  // GLM/DeepSeek default to high; Kimi/MiMo default to high
+  const efforts = getEffortsForModel(modelId);
+  if (efforts.length === 0) return undefined;
+  const fromSettings = getDefaultEffortFromSettings();
+  if (fromSettings && efforts.includes(fromSettings)) return fromSettings;
   return efforts.includes("high") ? "high" : efforts[0];
+}
+
+/** Session model override, else the model configured in Claude settings. */
+function resolveSessionModel(
+  store: SessionStore,
+  sessionId: string,
+  modelOverride?: string,
+): string {
+  const override =
+    modelOverride ?? (store.getConfigOverrides(sessionId)["model"] as string | undefined);
+  return override || getDefaultModelFromSettings();
 }
 
 /** Built-in slash commands (mirrors codex-acp's CodexCommands). */
@@ -917,14 +929,26 @@ function buildReviewTurnPrompt(diffCommand: string, scope: string): string {
 }
 
 function buildConfigOptions(store: SessionStore, sessionId: string) {
- const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
- const currentModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
- const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
- const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
+  const availableModels = getAvailableModelsFromSettings();
+  const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+  let currentModel = modelOverride || getDefaultModelFromSettings();
+  // Picker options come strictly from settings/env. If the resolved default is
+  // not in that list (e.g. settings.model vs CLAUDE_ACP_AVAILABLE_MODELS),
+  // snap to the first available model. Session overrides outside the list stay
+  // visible so a just-selected value is not dropped before settings update.
+  if (!availableModels.some((m) => m.id === currentModel)) {
+    if (modelOverride) {
+      availableModels.unshift({ id: modelOverride, name: modelOverride });
+    } else {
+      currentModel = availableModels[0].id;
+    }
+  }
+  const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
+  const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
   const currentCollabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
 
- // Get effort levels supported by the CURRENT model
-  const modelEfforts = MODEL_EFFORTS[currentModel] ?? [];
+  // Get effort levels supported by the CURRENT model
+  const modelEfforts = getEffortsForModel(currentModel);
   // If the stored effort is not supported by this model, fall back to default
   const defaultEffort = getDefaultEffort(currentModel);
   const currentEffort =
@@ -932,20 +956,20 @@ function buildConfigOptions(store: SessionStore, sessionId: string) {
       ? effortOverride
       : defaultEffort;
 
- const configOptions: any[] = [
-   {
-     id: "mode",
-     name: "Mode",
-     type: "select" as const,
-     category: "mode",
+  const configOptions: any[] = [
+    {
+      id: "mode",
+      name: "Mode",
+      type: "select" as const,
+      category: "mode",
       description: "Approval and sandboxing preset for the session",
-     options: AVAILABLE_MODES.map((m) => ({
-       value: m.id,
-       name: m.name,
-       description: m.description,
-     })),
-     currentValue: currentMode,
-   },
+      options: AVAILABLE_MODES.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.description,
+      })),
+      currentValue: currentMode,
+    },
     {
       id: COLLABORATION_MODE_CONFIG_ID,
       name: "Collaboration mode",
@@ -958,20 +982,20 @@ function buildConfigOptions(store: SessionStore, sessionId: string) {
       ],
       currentValue: currentCollabMode,
     },
-   {
-     id: "model",
-     name: "Model",
-     type: "select" as const,
-     category: "model",
-     description: "EricAI model (via ericai-proxy)",
-     options: PROXY_MODELS.map((m) => ({
-       value: m.id,
-       name: m.name,
-       description: m.id,
-     })),
-     currentValue: currentModel,
-   },
- ];
+    {
+      id: "model",
+      name: "Model",
+      type: "select" as const,
+      category: "model",
+      description: "Model from Claude Code settings (~/.claude/settings.json)",
+      options: availableModels.map((m) => ({
+        value: m.id,
+        name: m.name,
+        description: m.id,
+      })),
+      currentValue: currentModel,
+    },
+  ];
 
   // Only show effort picker if the model supports thinking
   if (modelEfforts.length > 0) {
@@ -1342,7 +1366,7 @@ export function createClaudeCodeAgent(
     if (name === "status") {
       const cwd = store.getCwd(sessionId)!;
       const configOverrides = store.getConfigOverrides(sessionId);
-      const currentModel = (configOverrides["model"] as string) || process.env.ANTHROPIC_MODEL || "glm-5.2";
+      const currentModel = resolveSessionModel(store, sessionId, configOverrides["model"] as string | undefined);
       const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
       const goal = sessionGoals.get(sessionId);
       // Context usage, using the same figures that drive auto-compaction so
@@ -1553,10 +1577,9 @@ export function createClaudeCodeAgent(
    * undefined for reasoning models).
    */
   function resolveEffort(store: SessionStore, sessionId: string): string | undefined {
-    const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
     const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
-    const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
-    const modelEfforts = MODEL_EFFORTS[effectiveModel] ?? [];
+    const effectiveModel = resolveSessionModel(store, sessionId);
+    const modelEfforts = getEffortsForModel(effectiveModel);
     if (effortOverride && modelEfforts.includes(effortOverride)) return effortOverride;
     return getDefaultEffort(effectiveModel);
   }
@@ -2130,7 +2153,7 @@ export function createClaudeCodeAgent(
       // what /compact, steer drains, and auto-compact use (previously normal
       // turns fell back to undefined for reasoning models, while /compact via
       // prompt() used the default "high").
-      const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+      const effectiveModel = resolveSessionModel(store, sessionId, modelOverride);
       const effectiveEffort = resolveEffort(store, sessionId);
 
       logger.info(`Prompt for session ${sessionId}: ${text.length} chars`);
@@ -2274,7 +2297,7 @@ export function createClaudeCodeAgent(
       // usage denominator can fall back to the CLI's own figure instead of a
       // hardcoded 200k when the proxy advertises nothing.
       if (event.contextWindow && event.contextWindow > 0) {
-        const cwModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+        const cwModel = resolveSessionModel(store, sessionId, modelOverride);
         if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
           cliReportedContextWindows.set(cwModel, event.contextWindow);
           logger.info(
@@ -2293,7 +2316,7 @@ export function createClaudeCodeAgent(
       lastUsage = event.usage;
       const inputTokens = event.usage.input_tokens ?? 0;
       const outputTokens = event.usage.output_tokens ?? 0;
-      const effectiveModel = modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id;
+      const effectiveModel = resolveSessionModel(store, sessionId, modelOverride);
       const contextWindow = getContextWindowForModel(effectiveModel);
       // Context size for both the UI and auto-compact. Once a real per-call
       // prompt count has been seen (message.usage on an assistant event) the
@@ -2718,13 +2741,11 @@ export function createClaudeCodeAgent(
         // so enabling or tuning compaction in one place affects both layers.
         const lastUsageEntry = sessionLastUsage.get(sessionId);
         if (lastUsageEntry && isAutoCompactEnabled()) {
-          const threshold = getAutoCompactThreshold(
-            modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id,
-          );
+          const threshold = getAutoCompactThreshold(effectiveModel);
           const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
           if (used >= threshold) {
             logger.info(
-              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (effectiveWindow=${getEffectiveContextWindowSize(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)}, contextWindow=${getContextWindowForModel(modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id)})`,
+              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (effectiveWindow=${getEffectiveContextWindowSize(effectiveModel)}, contextWindow=${getContextWindowForModel(effectiveModel)})`,
             );
             // The compaction notice is emitted by doCompact as a dedicated
             // `_meta.contextCompaction` lifecycle, not as assistant text. An
@@ -2760,9 +2781,7 @@ export function createClaudeCodeAgent(
              await Promise.all(permissionPromises);
              // Update usage after continuation
              const contEstimate = ctxEstimator.getEstimatedTokens();
-             const contContextWindow = getContextWindowForModel(
-               modelOverride || process.env.ANTHROPIC_MODEL || PROXY_MODELS[0].id,
-             );
+             const contContextWindow = getContextWindowForModel(effectiveModel);
              sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
              await connection.sessionUpdate({
                sessionId,

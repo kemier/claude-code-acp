@@ -16,9 +16,13 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  getAvailableModelsFromSettings,
   getClaudeEnv,
+  getDefaultEffortFromSettings,
+  getDefaultModelFromSettings,
   loadClaudeSettingsEnv,
   clearClaudeSettingsCache,
+  resolveModelAlias,
 } from "../src/claude-settings.js";
 
 /** Key names unique to this test, so real settings files can't collide. */
@@ -136,5 +140,85 @@ describe("caching", () => {
     expect(getClaudeEnv(KEY)).toBe("first");
     writeProjectSettings("settings.json", { env: { [KEY]: "second" } });
     expect(getClaudeEnv(KEY)).toBe("second");
+  });
+});
+
+describe("model picker from settings", () => {
+  const savedModel = process.env.ANTHROPIC_MODEL;
+  const savedAvailable = process.env.CLAUDE_ACP_AVAILABLE_MODELS;
+  const savedAcpModel = process.env.CLAUDE_ACP_MODEL;
+  const savedHome = process.env.HOME;
+  let fakeHome: string;
+
+  afterEach(() => {
+    if (savedModel === undefined) delete process.env.ANTHROPIC_MODEL;
+    else process.env.ANTHROPIC_MODEL = savedModel;
+    if (savedAvailable === undefined) delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
+    else process.env.CLAUDE_ACP_AVAILABLE_MODELS = savedAvailable;
+    if (savedAcpModel === undefined) delete process.env.CLAUDE_ACP_MODEL;
+    else process.env.CLAUDE_ACP_MODEL = savedAcpModel;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(fakeHome, { recursive: true, force: true });
+  });
+
+  beforeEach(() => {
+    // Isolate from the developer's real ~/.claude/settings.json.
+    fakeHome = mkdtempSync(join(tmpdir(), "acp-home-"));
+    process.env.HOME = fakeHome;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
+    delete process.env.CLAUDE_ACP_MODEL;
+    clearClaudeSettingsCache();
+  });
+
+  it("lists unique models from ANTHROPIC_*_MODEL keys", () => {
+    writeProjectSettings("settings.json", {
+      env: {
+        ANTHROPIC_MODEL: "LongCat-2.0",
+        ANTHROPIC_SMALL_FAST_MODEL: "LongCat-2.0",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "LongCat-2.0",
+      },
+    });
+    expect(getAvailableModelsFromSettings().map((m) => m.id)).toEqual(["LongCat-2.0"]);
+    expect(getDefaultModelFromSettings()).toBe("LongCat-2.0");
+  });
+
+  it("resolves top-level model alias via ANTHROPIC_DEFAULT_*_MODEL", () => {
+    writeProjectSettings("settings.json", {
+      model: "opus",
+      env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "LongCat-2.0" },
+    });
+    expect(resolveModelAlias("opus")).toBe("LongCat-2.0");
+    expect(getDefaultModelFromSettings()).toBe("LongCat-2.0");
+    expect(getAvailableModelsFromSettings().map((m) => m.id)).toEqual(["LongCat-2.0"]);
+  });
+
+  it("honors CLAUDE_ACP_AVAILABLE_MODELS when set", () => {
+    writeProjectSettings("settings.json", {
+      env: {
+        ANTHROPIC_MODEL: "glm-5.2",
+        CLAUDE_ACP_AVAILABLE_MODELS: "glm-5.2, Qwen3-Coder, deepseek-v4-pro",
+      },
+    });
+    expect(getAvailableModelsFromSettings().map((m) => m.id)).toEqual([
+      "glm-5.2",
+      "Qwen3-Coder",
+      "deepseek-v4-pro",
+    ]);
+  });
+
+  it("reads effortLevel from settings", () => {
+    writeProjectSettings("settings.json", {
+      effortLevel: "high",
+      env: { ANTHROPIC_MODEL: "LongCat-2.0" },
+    });
+    expect(getDefaultEffortFromSettings()).toBe("high");
+  });
+
+  it("throws when no model is configured", () => {
+    writeProjectSettings("settings.json", { env: {} });
+    expect(() => getDefaultModelFromSettings()).toThrow(/No model configured/);
+    expect(() => getAvailableModelsFromSettings()).toThrow(/No models configured/);
   });
 });

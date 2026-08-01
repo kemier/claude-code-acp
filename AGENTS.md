@@ -95,16 +95,18 @@ So rebuilding (`npm run build`) immediately updates the installed binary — no 
 ## EricAI Integration Details
 
 ### Model Picker
-- `PROXY_MODELS` array in `agent.ts` lists all 9 EricAI models
-- Must match models in `ericai-proxy/config.yaml` and `~/.codex/model_catalog.json`
+- Built from Claude Code settings (`~/.claude/settings.json`), not a hardcoded catalog
+- Sources (in order):
+  1. `env.CLAUDE_ACP_AVAILABLE_MODELS` — comma-separated explicit list (use for multi-model EricAI)
+  2. Otherwise unique ids from `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_*_MODEL`, `CLAUDE_ACP_MODEL`, and top-level `model` (alias-resolved)
+- Default selection: `CLAUDE_ACP_MODEL` → `ANTHROPIC_MODEL` → resolved `settings.model`
 - Selected model is passed as `--model <id>` to Claude CLI
+- Throws if no model is configured in settings/env
 
 ### Effort Picker (Model-Aware)
-- `MODEL_EFFORTS` map in `agent.ts` defines per-model supported effort levels
-- GLM-5.2/GLM-5.1/Qwen3-Coder: low, medium, high
-- DeepSeek-V4-Pro: low, medium, high, xhigh
-- Kimi/MiMo: low, high
-- Qwen2.5-14B-1M: [] (non-reasoning — effort picker hidden)
+- Default from `settings.effortLevel` when valid for the current model
+- Optional `MODEL_EFFORTS` map in `agent.ts` for known EricAI backends; unknown models get `low/medium/high`
+- Empty `MODEL_EFFORTS` entry (e.g. `qwen2.5-14b-1m`) hides the effort picker
 - Effort is passed as `--effort <level>` to Claude CLI
 - Claude CLI sends `reasoning_effort` in request body → CCR → proxy
 - Proxy reads `reasoning_effort` and sets `enable_thinking: true/false` for the model
@@ -159,8 +161,9 @@ When a goal is set and active, every subsequent prompt is prepended with `[Goal:
 |---|---|---|
 | `ANTHROPIC_API_KEY` | CCR gateway key (set by `claude-code-acp-ccr` wrapper) | — |
 | `ANTHROPIC_BASE_URL` | CCR gateway URL (`http://127.0.0.1:3457`) | — |
-| `ANTHROPIC_MODEL` | Default model (`glm-5.2`) | — |
+| `ANTHROPIC_MODEL` | Default model (from Claude settings) | — |
 | `CLAUDE_ACP_MODEL` | Override default model | — |
+| `CLAUDE_ACP_AVAILABLE_MODELS` | Comma-separated picker list (optional) | derived from ANTHROPIC_*_MODEL |
 | `CLAUDE_ACP_ALLOWED_TOOLS` | Comma-separated allowed tools | — |
 | `CLAUDE_ACP_MAX_TURNS` | Max agentic turns per prompt | unlimited |
 | `CLAUDE_ACP_TIMEOUT` | Timeout in ms | 300000 (5 min) |
