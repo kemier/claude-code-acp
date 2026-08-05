@@ -249,24 +249,31 @@ const cliReportedContextWindows = new Map<string, number>();
  *  3. The window Claude Code itself reported on the result event.
  *  4. DEFAULT_CONTEXT_WINDOW.
  *
- * One deliberate deviation: the override is capped by the model's real window
- * when we know it. The CLI applies the override globally to every model, which
- * is harmless for a larger window (it just compacts earlier than needed) but
- * unsafe for a smaller one — glm-5.1 and deepseek-v4-pro are 131072, so a
- * global 196608 would put the threshold above their real limit and the
- * conversation would overflow without ever compacting. Capping preserves exact
- * parity for the model the override was written for while staying safe when the
- * model picker switches to a smaller one.
+ * Interaction with the override:
+ *  - When the model's real window is UNKNOWN, the override is used verbatim
+ *    (it's the only signal we have).
+ *  - When the model's real window is SMALLER than the override, the real
+ *    window wins — the override is a documented *maximum*, so applying a
+ *    196608 override to deepseek-v4-pro (131072) must clamp down to 131072.
+ *    Without this, the threshold would sit above the real limit and the
+ *    conversation would overflow without ever compacting.
+ *  - When the model's real window is LARGER than the override, the real
+ *    window wins — the override was written for a different (smaller)
+ *    model and must not hide capacity from a larger one. Otherwise
+ *    deepseek-v4-flash (262144) would display as 196608 and compact far
+ *    earlier than necessary.
+ *
+ * Net effect: the real window always wins when known; the override only
+ * applies when no real window is available.
  */
 export function getContextWindowForModel(modelId: string | undefined): number {
   const known = modelId
     ? modelContextWindows.get(modelId) ?? cliReportedContextWindows.get(modelId)
     : undefined;
+  if (known !== undefined) return known;
   const override = parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
-  if (override !== undefined) {
-    return known !== undefined ? Math.min(override, known) : override;
-  }
-  return known ?? DEFAULT_CONTEXT_WINDOW;
+  if (override !== undefined) return override;
+  return DEFAULT_CONTEXT_WINDOW;
 }
 
 // ─── Claude Code CLI auto-compact arithmetic ────────────────────────────────

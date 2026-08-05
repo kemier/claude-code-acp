@@ -7,9 +7,12 @@
 //
 // The hazard under test: the CLI applies its context override to every model.
 // Our model picker offers windows from 131072 (glm-5.1, deepseek-v4-pro) to
-// 262144 (Qwen3-Coder). A global 196608 override would place the compaction
-// threshold *above* a 131072 model's real limit, so the conversation would run
-// past the limit and never compact.
+// 262144 (Qwen3-Coder, deepseek-v4-flash). The real proxy-advertised window
+// always wins when known: it protects smaller-window models (a 196608 override
+// must not inflate a 131072 model past its real limit) and preserves larger
+// windows (the override must not clamp a 262144 model down to 196608, which
+// would hide capacity and compact too early). The override only applies when
+// the proxy never advertised a window for the model.
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
 
@@ -107,11 +110,13 @@ describe("global override vs per-model reality", () => {
     expect(threshold + 20_000).toBeLessThanOrEqual(131_072);
   });
 
-  it("lets the override lower a larger model's window, which is safe", () => {
-    // Qwen3-Coder really has 262144; treating it as 196608 only compacts
-    // earlier than strictly necessary.
+  it("does not let the override lower a larger model's window", () => {
+    // Qwen3-Coder really has 262144; the override was written for a smaller
+    // model (glm-5.2 @ 196608) and must not hide capacity from a larger one.
+    // Clamping a larger window down to the override would compact far earlier
+    // than necessary and misreport the denominator in the usage UI.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
-    expect(getContextWindowForModel("Qwen3-Coder")).toBe(196_608);
+    expect(getContextWindowForModel("Qwen3-Coder")).toBe(262_144);
   });
 
   it("applies the override to a model the proxy never advertised", () => {
