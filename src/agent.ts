@@ -254,7 +254,7 @@ const cliReportedContextWindows = new Map<string, number>();
  *    (it's the only signal we have).
  *  - When the model's real window is SMALLER than the override, the real
  *    window wins — the override is a documented *maximum*, so applying a
- *    196608 override to deepseek-v4-pro (131072) must clamp down to 131072.
+ *    196608 override to glm-5.1 (131072) must clamp down to 131072.
  *    Without this, the threshold would sit above the real limit and the
  *    conversation would overflow without ever compacting.
  *  - When the model's real window is LARGER than the override, the real
