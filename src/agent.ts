@@ -87,6 +87,7 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   "glm-5.1": ["low", "medium", "high"],
   "Qwen3-Coder": ["low", "medium", "high"],
   "deepseek-v4-pro": ["low", "medium", "high", "xhigh"],
+  "deepseek-v4-flash": ["low", "medium", "high", "xhigh"],
   "kimi-k2.7-code": ["low", "high"],
   "kimi-k2.6": ["low", "high"],
   "mimo-v2.5-pro": ["low", "high"],
