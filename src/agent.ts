@@ -1057,14 +1057,27 @@ export function createClaudeCodeAgent(
   const sessionPromptInFlight = new Set<string>();
 
   // ─── Subagent (Agent tool) lifecycle tracking ─────────────────────────────
-  // The Agent tool spawns a subagent that runs for an extended period. We
-  // must NOT mark it "completed" the instant its tool_use block appears (as
-  // we do for Read/Edit/etc.) — the subagent is still running and the UI
-  // should reflect that. Instead we emit status:"in_progress" when the
-  // tool_use fires and flip to "completed" only when the matching tool_result
-  // arrives (the user/tool_result message Claude emits once the subagent
-  // finishes). Maps Claude's native tool_use id → our ACP toolCallId.
-  const sessionPendingAgents = new Map<string, Map<string, string>>();
+  // The Agent tool spawns a subagent that runs ASYNCHRONOUSLY: the tool_result
+  // it emits immediately ("Async agent launched successfully...") is a launch
+  // acknowledgment, NOT a completion signal. The subagent keeps running for
+  // seconds to minutes afterwards.
+  //
+  // Completion is signaled by a <task-notification> that Claude injects back
+  // into the main conversation as a `user` text message once the subagent
+  // finishes (or is stopped). The notification carries a task-id (NOT the
+  // tool_use_id) and a <summary> that names the agent by its description
+  // (e.g. `Agent "Trace interrupt..." completed` / `background agent
+  // "Trace interrupt..."`). We link spawn→completion by description, since
+  // the tool_use_id is never reused by the notification.
+  //
+  // We emit status:"in_progress" at the tool_use, flip to "completed" when the
+  // matching <task-notification> arrives mid-turn, and fall back to a turn-end
+  // flush for any still pending (the premature-end_turn case — see below).
+  // Maps Claude's native tool_use id → { acpCallId, description }.
+  const sessionPendingAgents = new Map<
+    string,
+    Map<string, { acpCallId: string; description: string }>
+  >();
 
   // Non-subagent tools (Bash/Read/Edit/Grep/…) use the same in_progress →
   // completed lifecycle, but resolve on the tool_result message (not a
@@ -2270,26 +2283,17 @@ export function createClaudeCodeAgent(
           sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
         }
       }
-      // Handle user event (tool results) — accumulate for context estimation.
+      // Handle user event (tool results / injected text) — accumulate for
+      // context estimation.
       if (event.type === "user" && event.text) {
         ctxEstimator.addText(event.text);
       }
-      // Claude Code's Task/Agent tool runs subagents ASYNCHRONOUSLY: the
-      // tool_result it emits ("Async agent launched successfully...") is a
-      // launch acknowledgment, NOT a completion signal. The subagent keeps
-      // running (and emitting its own nested tool calls) for seconds to
-      // minutes after this tool_result lands. Flipping the parent tool_call
-      // to "completed" here would mark it done at spawn time — leaving the UI
-      // spinner stuck on a card whose nested work is still streaming.
-      //
-      // Instead we leave subagent tool_calls in_progress and flush them all to
-      // "completed" at turn end (see the post-stream flush below). The parent
-      // turn cannot end while a subagent it spawned is still running — Claude
-      // awaits them — so turn end is a reliable completion signal.
       // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
       // is resolved by this user message's tool_results to "completed". The
       // runner emits toolResultIds on the user event (claude-runner.ts). This
       // is what surfaces the running → completed transition for Bash/Read/Edit.
+      // (Subagents are excluded — their completion is detected via the
+      // <task-notification> path below, not the tool_result id match.)
       if (event.type === "user" && event.toolResultIds?.length) {
         const pendingTools = sessionPendingTools.get(sessionId);
         if (pendingTools && pendingTools.size > 0) {
@@ -2311,6 +2315,55 @@ export function createClaudeCodeAgent(
           }
           if (pendingTools.size === 0) {
             sessionPendingTools.delete(sessionId);
+          }
+        }
+      }
+      // Subagent completion detection via <task-notification>.
+      // Claude Code delivers a finished subagent's result as a `user` text
+      // message containing a <task-notification> block — NOT as a tool_result
+      // reusing the tool_use_id (the only tool_result for a subagent is the
+      // immediate launch ack "Async agent launched successfully..."). The
+      // notification carries a task-id (distinct from the tool_use_id) and a
+      // <summary> naming the agent by its description, e.g.:
+      //   Agent "Trace interrupt message wiring" completed
+      //   background agent "Trace interrupt message wiring" ... [stopped]
+      // So we link spawn→completion by DESCRIPTION: if a pending subagent's
+      // description appears inside a <task-notification> in this user message,
+      // flip its tool_call to "completed" and drop it from the pending map.
+      // The post-turn flush then only catches subagents whose notification
+      // never arrived before end_turn (the premature-end_turn case).
+      if (event.type === "user" && event.text) {
+        const text = event.text;
+        const notifIdx = text.indexOf("<task-notification>");
+        if (notifIdx >= 0) {
+          const notif = text.slice(notifIdx);
+          const pending = sessionPendingAgents.get(sessionId);
+          if (pending && pending.size > 0) {
+            // A single user message can carry multiple <task-notification>
+            // blocks (several subagents finishing at once). Match each pending
+            // subagent whose description the notification text references.
+            for (const [tuId, info] of pending) {
+              if (info.description && notif.includes(info.description)) {
+                pending.delete(tuId);
+                connection
+                  .sessionUpdate({
+                    sessionId,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId: info.acpCallId,
+                      status: "completed",
+                    } as any,
+                  })
+                  .catch(() => {});
+                logger.info(
+                  `Subagent "${info.description}" (${tuId}) completion ` +
+                    `notified via <task-notification>; marked completed.`,
+                );
+              }
+            }
+            if (pending.size === 0) {
+              sessionPendingAgents.delete(sessionId);
+            }
           }
         }
       }
@@ -2464,12 +2517,24 @@ export function createClaudeCodeAgent(
          // result never arrived before end_turn.
          const emitted = { ...update, status: "in_progress" as const };
          if (isSubagent && event.toolUseId) {
+           const subInput = (event.toolInput ?? {}) as Record<string, unknown>;
+           const subDesc =
+             typeof subInput.description === "string"
+               ? subInput.description
+               : typeof subInput.prompt === "string"
+                 ? subInput.prompt
+                 : typeof subInput.subagent_type === "string"
+                   ? subInput.subagent_type
+                   : "";
            let pending = sessionPendingAgents.get(sessionId);
            if (!pending) {
              pending = new Map();
              sessionPendingAgents.set(sessionId, pending);
            }
-           pending.set(event.toolUseId, toolCallId);
+           pending.set(event.toolUseId, {
+             acpCallId: toolCallId,
+             description: subDesc,
+           });
          } else if (event.toolUseId) {
            // Non-subagent tool: register so the tool_result user-event can flip
            // it to completed. Subagents are excluded (their completion comes
@@ -2754,19 +2819,31 @@ export function createClaudeCodeAgent(
         // Wait for all pending permission requests to resolve
         await Promise.all(permissionPromises);
 
-        // Turn end = all spawned subagents have finished (Claude awaits them
-        // before ending the turn). Flush any still-in_progress subagent
-        // tool_calls to "completed" now. This is the real completion signal
-        // for the Task/Agent tool — its tool_result was only a launch ack.
+        // Post-turn subagent flush. Subagents whose <task-notification>
+        // arrived mid-turn were already flipped to "completed" and removed
+        // from sessionPendingAgents by the user-event handler above. Anything
+        // STILL pending here means the CLI ended the turn (end_turn) before
+        // the subagent's result was injected back into the conversation —
+        // i.e. a premature end_turn (observed with GLM/EricAI; real Claude
+        // awaits subagents before ending the turn). Mark these "completed" as
+        // a fallback so the UI spinner doesn't hang forever, and log the
+        // anomaly so the lost result is visible: the main agent lacks the
+        // subagent's output and may need a follow-up ("go on") to retrieve it
+        // — at which point the <task-notification> lands and is matched there.
         const pendingAgents = sessionPendingAgents.get(sessionId);
         if (pendingAgents && pendingAgents.size > 0) {
-          for (const acpCallId of pendingAgents.values()) {
+          logger.info(
+            `Turn ended with ${pendingAgents.size} subagent(s) still pending ` +
+              `(no <task-notification> before end_turn) for session ${sessionId} ` +
+              `— marking completed as fallback; result was likely lost.`,
+          );
+          for (const info of pendingAgents.values()) {
             connection
               .sessionUpdate({
                 sessionId,
                 update: {
                   sessionUpdate: "tool_call_update",
-                  toolCallId: acpCallId,
+                  toolCallId: info.acpCallId,
                   status: "completed",
                 } as any,
               })

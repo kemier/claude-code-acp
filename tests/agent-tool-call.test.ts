@@ -689,4 +689,66 @@ describe("Subagent (Task tool) lifecycle", () => {
     expect(toolCalls[1].sessionUpdate).toBe("tool_call_update");
     expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
+
+  it("flips to completed mid-turn when a <task-notification> names the subagent", async () => {
+    // Claude Code delivers a finished subagent's result as a `user` text
+    // message containing a <task-notification> block whose <summary> names the
+    // agent by its description — NOT as a tool_result reusing the tool_use_id.
+    // When that notification arrives mid-turn, the subagent's tool_call must
+    // flip to completed immediately, and the turn-end flush must NOT also fire
+    // (the subagent was already removed from the pending map).
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Task",
+        toolInput: { description: "Trace interrupt message wiring", subagent_type: "Explore" },
+        toolUseId: "tu_4",
+      },
+      {
+        type: "user",
+        text:
+          '<task-notification>\n<task-id>af36e82b106748422</task-id>\n' +
+          '<output-file>/tmp/x/tasks/af36e82b106748422.output</output-file>\n' +
+          '<status>completed</status>\n' +
+          '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
+          '</task-notification>',
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    // in_progress emit + mid-turn completed flip = 2 frames. The turn-end
+    // flush does NOT add a third (the subagent was already resolved).
+    expect(toolCalls).toHaveLength(2);
+    expect(toolCalls[0].status).toBe("in_progress");
+    expect(toolCalls[1].status).toBe("completed");
+    expect(toolCalls[1].sessionUpdate).toBe("tool_call_update");
+    expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
+  });
+
+  it("does not flip on a <task-notification> naming a different subagent", async () => {
+    // Only the subagent whose description appears in the notification resolves.
+    // A notification for an unrelated agent must leave this one pending until
+    // the turn-end flush.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Task",
+        toolInput: { description: "investigate auth flow" },
+        toolUseId: "tu_5",
+      },
+      {
+        type: "user",
+        text:
+          '<task-notification>\n<task-id>other</task-id>\n' +
+          '<status>completed</status>\n' +
+          '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
+          '</task-notification>',
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    // in_progress emit + turn-end flush = 2 frames. No mid-turn flip because
+    // the notification named a different description.
+    expect(toolCalls).toHaveLength(2);
+    expect(toolCalls[0].status).toBe("in_progress");
+    expect(toolCalls[1].status).toBe("completed");
+  });
 });
