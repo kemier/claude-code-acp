@@ -91,6 +91,17 @@ export function maskArgs(args: string[]): string {
 
 export class ClaudeRunner {
   private runningProcesses = new Map<string, ChildProcess>();
+  /**
+   * Tracking ids whose process was explicitly killed by cancel(). On close,
+   * runStreaming treats these as a clean cancellation (resolve with whatever
+   * was captured, including the Claude session id) rather than a failure
+   * (reject "claude exited with code N"). Without this, a user "Send Now"
+   * (which cancels the in-flight turn) makes the *next* prompt's
+   * continueSessionStreaming reject → the prompt handler catches it and
+   * clearPersistedSession() wipes the Claude session id → the follow-up
+   * starts fresh with no conversation history. See agent.ts prompt handler.
+   */
+  private cancelledProcesses = new Set<string>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
 
@@ -274,6 +285,10 @@ export class ClaudeRunner {
   cancel(trackingId: string): void {
     const proc = this.runningProcesses.get(trackingId);
     if (proc) {
+      // Mark as explicitly cancelled BEFORE the kill so the close handler
+      // resolves (clean cancel) rather than rejecting (treated as a crash /
+      // resume failure). This preserves the captured Claude session id.
+      this.cancelledProcesses.add(trackingId);
       proc.kill("SIGTERM");
       this.runningProcesses.delete(trackingId);
     }
@@ -383,6 +398,9 @@ export class ClaudeRunner {
         if (trackingId) {
           this.runningProcesses.delete(trackingId);
         }
+        const wasCancelled = trackingId
+          ? this.cancelledProcesses.delete(trackingId)
+          : false;
 
         // Process remaining buffer
         if (buffer.trim()) {
@@ -394,6 +412,20 @@ export class ClaudeRunner {
           } catch {
             // ignore
           }
+        }
+
+        // An explicit cancel() (user "Send Now" / interrupt) kills the
+        // process with SIGTERM → non-zero exit. Treat that as a clean
+        // cancellation, NOT a failure: resolve with whatever was captured
+        // (notably the Claude session id, which the CLI emits early). The
+        // prompt handler checks cancelledSessions and short-circuits to
+        // { stopReason: "cancelled" } without touching the stored id, so
+        // the follow-up prompt resumes correctly. Rejecting here would
+        // make continueSessionStreaming's catch wipe the session id and
+        // start fresh — losing all conversation history.
+        if (wasCancelled) {
+          resolve({ text: resultText, sessionId });
+          return;
         }
 
         if (code !== 0 && code !== null) {

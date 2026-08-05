@@ -2976,7 +2976,14 @@ export function createClaudeCodeAgent(
               effectiveEffort
             );
           }
-          store.setClaudeSessionId(sessionId, result.sessionId);
+          // Only persist the Claude session id if the CLI actually emitted one.
+          // On an early cancel (user hit "Send Now" before the CLI's init event
+          // arrived) result.sessionId can be empty — storing "" would overwrite
+          // nothing useful now, but guarding keeps the invariant that a stored
+          // id is always a real one.
+          if (result.sessionId) {
+            store.setClaudeSessionId(sessionId, result.sessionId);
+          }
         }
         }
 
