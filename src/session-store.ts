@@ -12,6 +12,14 @@ export interface SessionInfo {
   cwd: string;
   title?: string;
   updatedAt?: string;
+  /**
+   * The underlying Claude CLI session UUID this ACP session replays, when
+   * known. Used by listSessions to dedupe against CLI-spawned transcripts
+   * scanned from ~/.claude/projects so the same conversation is not listed
+   * twice (once as an ACP session, once as a raw transcript). Not part of
+   * the ACP wire type — stripped before sending.
+   */
+  claudeSessionId?: string;
 }
 
 interface SessionData {
@@ -222,6 +230,7 @@ export class SessionStore {
         cwd: data.cwd,
         title: data.title,
         updatedAt: data.updatedAt,
+        claudeSessionId: data.claudeSessionId,
       });
     }
     return result;

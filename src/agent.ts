@@ -24,7 +24,7 @@ import {
   type ToolCallContent,
   type ToolCallLocation,
 } from "@agentclientprotocol/sdk";
-import { SessionStore } from "./session-store.js";
+import { SessionStore, type SessionInfo } from "./session-store.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import {
@@ -289,6 +289,115 @@ const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000;
 const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
 /** The CLI's max-output default for model ids it does not recognize. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
+
+/**
+ * Scan Claude CLI's on-disk transcripts for a working directory and surface
+ * them as SessionInfo entries — the same way kiro-cli enumerates
+ * `~/.kiro/sessions/cli/*.json`. The Claude CLI spawns a fresh process per
+ * turn and keeps no app-server RPC (unlike `codex app-server`), so the only
+ * way to list CLI-started sessions is to read the transcript files it writes
+ * at `~/.claude/projects/<encoded-cwd>/<claude-session-id>.jsonl`.
+ *
+ * Without this, `listSessions` returned only ACP-created sessions from
+ * sessions.json; sessions started from the `claude` CLI in the same workspace
+ * were invisible in the ACP session list even though `loadSession` could
+ * already replay their transcripts.
+ */
+export async function listCliTranscriptSessions(
+  cwd: string | undefined
+): Promise<SessionInfo[]> {
+  if (!cwd) return [];
+  const { homedir } = await import("node:os");
+  const fs = await import("node:fs");
+  const projectDir = `${homedir()}/.claude/projects/${cwd.replace(/\//g, "-")}`;
+  // existsSync is present in every fs mock; the heavier readdir/stat/read
+  // helpers are accessed lazily below so partial fs mocks (used across the
+  // test suite) don't break on missing exports when no project dir exists.
+  if (!fs.existsSync(projectDir)) return [];
+
+  let files: string[];
+  try {
+    files = (fs.readdirSync ?? (() => [] as string[]))(projectDir).filter(
+      (f: string) => f.endsWith(".jsonl")
+    );
+  } catch {
+    return [];
+  }
+
+  const results: SessionInfo[] = [];
+  for (const file of files) {
+    const filePath = `${projectDir}/${file}`;
+    try {
+      const raw = (fs.readFileSync as (p: string, enc: string) => string)(
+        filePath,
+        "utf-8"
+      );
+      const lines = raw.split("\n").filter((l) => l.trim());
+      if (lines.length === 0) continue;
+
+      let title: string | undefined;
+      let updatedAt: string | undefined;
+      // First pass: prefer a `summary` entry for the title (Claude writes
+      // these as a short label), and take the last entry's timestamp as
+      // updatedAt — mirroring how the store orders sessions.
+      for (const line of lines) {
+        let entry: any;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (entry.timestamp) updatedAt = entry.timestamp;
+        if (!title && entry.type === "summary" && entry.summary) {
+          title = String(entry.summary);
+        }
+      }
+      // Fall back to the first user message text when no summary exists.
+      if (!title) {
+        for (const line of lines) {
+          let entry: any;
+          try {
+            entry = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          if (entry.type === "user" && entry.message) {
+            const content = entry.message.content;
+            if (typeof content === "string" && content.trim()) {
+              title = content.trim().slice(0, 80);
+              break;
+            } else if (Array.isArray(content)) {
+              const text = content
+                .find((b: any) => b?.type === "text" && b.text)?.text;
+              if (text) {
+                title = text.trim().slice(0, 80);
+                break;
+              }
+            }
+          }
+        }
+      }
+      if (!updatedAt) {
+        const stat = fs.statSync as ((p: string) => { mtimeMs: number }) | undefined;
+        updatedAt = stat
+          ? new Date(stat(filePath).mtimeMs).toISOString()
+          : undefined;
+      }
+
+      const claudeSessionId = file.replace(/\.jsonl$/, "");
+      results.push({
+        sessionId: claudeSessionId,
+        cwd,
+        title: title ?? "Claude CLI session",
+        updatedAt,
+      });
+    } catch {
+      // Skip unreadable / corrupted transcripts.
+      continue;
+    }
+  }
+  return results;
+}
 
 /** Parse an env var as a positive integer, or undefined when unset/invalid. */
 function parsePositiveIntEnv(value: string | undefined): number | undefined {
@@ -1881,6 +1990,24 @@ export function createClaudeCodeAgent(
        }
      }
 
+     // If the sessionId being loaded is itself a Claude CLI transcript UUID
+     // (a session started from the `claude` CLI and surfaced via listSessions'
+     // transcript scan), bind it as the Claude session id for this ACP
+     // session. Without this, getClaudeSessionId returns undefined and the
+     // replay fallback below picks the NEWEST transcript for the directory —
+     // replaying the wrong conversation when the user picked a specific one.
+     if (!store.getClaudeSessionId(sessionId) && typeof params.cwd === "string") {
+       const { homedir } = await import("node:os");
+       const { existsSync } = await import("node:fs");
+       const transcriptPath = `${homedir()}/.claude/projects/${params.cwd.replace(/\//g, "-")}/${sessionId}.jsonl`;
+       if (existsSync(transcriptPath)) {
+         store.setClaudeSessionId(sessionId, sessionId);
+         logger.info(
+           `Bound listed CLI transcript ${sessionId} as the Claude session for replay`
+         );
+       }
+     }
+
      const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
      logger.info(`Load session: ${sessionId}`);
 
@@ -2007,7 +2134,36 @@ export function createClaudeCodeAgent(
     async listSessions(
       params: ListSessionsRequest
     ): Promise<ListSessionsResponse> {
-      const sessions = store.listAll(params.cwd ?? undefined);
+      const cwd = params.cwd ?? undefined;
+      const storeSessions = store.listAll(cwd);
+
+      // Merge in CLI-spawned transcripts (sessions started from the `claude`
+      // CLI, not through ACP). The Claude CLI has no app-server RPC, so these
+      // are enumerated from ~/.claude/projects/<encoded-cwd>/*.jsonl — the
+      // same transcripts loadSession already replays. Dedupe by Claude
+      // session UUID: an ACP session that already maps to a Claude UUID
+      // suppresses the raw-transcript copy so the conversation is listed once.
+      const cliSessions = await listCliTranscriptSessions(cwd);
+      const coveredClaudeIds = new Set(
+        storeSessions
+          .map((s) => s.claudeSessionId)
+          .filter((id): id is string => Boolean(id))
+      );
+      const merged = [
+        ...storeSessions,
+        ...cliSessions.filter((s) => !coveredClaudeIds.has(s.sessionId)),
+      ];
+      // Sort by updatedAt descending (most recent first), matching the store's
+      // ordering, so merged CLI sessions interleave by activity rather than
+      // appearing only after every ACP session.
+      merged.sort((a, b) => {
+        const at = a.updatedAt ? Date.parse(a.updatedAt) : 0;
+        const bt = b.updatedAt ? Date.parse(b.updatedAt) : 0;
+        return bt - at;
+      });
+      // Strip the internal claudeSessionId field before returning — it is not
+      // part of the ACP wire type.
+      const sessions = merged.map(({ claudeSessionId: _omit, ...rest }) => rest);
       return { sessions };
     },
 
