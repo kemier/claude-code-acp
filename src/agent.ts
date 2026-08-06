@@ -2019,8 +2019,18 @@ export function createClaudeCodeAgent(
 
       const value = (params as any).value;
 
-      // Handle collaboration_mode specially (stored in separate map)
-      if (configId === COLLABORATION_MODE_CONFIG_ID) {
+      // The mode picker (configId "mode") must write to the canonical
+      // session.mode field — every read site (buildConfigOptions, /status,
+      // loadSession) consults store.getMode(), not configOverrides["mode"].
+      // Routing it through setMode() keeps a single source of truth and makes
+      // the selection persist across agent restarts (setMode persists to disk;
+      // setConfigOverride would write configOverrides["mode"], which nothing
+      // reads back, so the picker would reset to the default after restart).
+      if (configId === "mode") {
+        store.setMode(sessionId, String(value));
+        logger.info(`Session ${sessionId} config mode set to ${value}`);
+      } else if (configId === COLLABORATION_MODE_CONFIG_ID) {
+        // Handle collaboration_mode specially (stored in separate map)
         sessionCollaborationModes.set(sessionId, value);
         logger.info(`Session ${sessionId} collaboration_mode set to ${value}`);
       } else {

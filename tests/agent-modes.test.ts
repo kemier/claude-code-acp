@@ -178,6 +178,35 @@ describe("Agent modes and config", () => {
         } as any)
       ).rejects.toThrow();
     });
+
+    it("persists the mode config option so loadSession restores it", async () => {
+      // Regression: setSessionConfigOption previously wrote the "mode" value
+      // to configOverrides["mode"], which no read path consulted. loadSession
+      // reads store.getMode() (session.mode) and so reset to DEFAULT_MODE on
+      // reload/resume — the picker selection was not persisted.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+      const result = await agent.setSessionConfigOption!({
+        sessionId: session.sessionId,
+        configId: "mode",
+        value: "agent-full-access",
+      } as any);
+
+      // The returned configOptions reflect the just-selected mode ...
+      const modeOpt = (result as any).configOptions.find(
+        (o: any) => o.id === "mode"
+      );
+      expect(modeOpt.currentValue).toBe("agent-full-access");
+
+      // ... and loadSession restores it (the field that was being lost).
+      const loaded = await agent.loadSession!({ sessionId: session.sessionId });
+      expect((loaded as any).modes.currentModeId).toBe("agent-full-access");
+    });
   });
 
   describe("listSessions", () => {
