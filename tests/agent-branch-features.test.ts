@@ -1,14 +1,35 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createClaudeCodeAgent } from "../src/agent.js";
-import { clearClaudeSettingsCache } from "../src/claude-settings.js";
+import { clearClaudeSettingsCache, MODEL_ENV_KEYS } from "../src/claude-settings.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 
 const ERICAI_MODELS =
   "glm-5.2,glm-5.1,Qwen3-Coder,deepseek-v4-pro,kimi-k2.7-code,kimi-k2.6,mimo-v2.5-pro,mimo-v2.5,qwen2.5-14b-1m";
 
+// Throwaway path that replaces the user-layer settings dir (~/.claude) for the
+// duration of each test. The vi.mock("node:fs") below does not reliably
+// intercept claude-settings.ts's readFileSync under vitest 4 / vite 8, so the
+// developer's real ~/.claude/settings.json (which sets ANTHROPIC_MODEL etc.)
+// would leak into the cached settings env and override the process.env values
+// these tests set. CLAUDE_SETTINGS_DIR redirects settingsPaths() to this path,
+// which does not exist — readSettingsFile treats an absent file as {} — so
+// getClaudeEnv falls back to process.env, which the tests fully control. No
+// directory is created or removed: the path is intentionally non-existent.
+const savedSettingsDir = process.env.CLAUDE_SETTINGS_DIR;
+const fakeSettingsDir = join(tmpdir(), "acp-agent-no-settings");
+
 beforeEach(() => {
+  process.env.CLAUDE_SETTINGS_DIR = fakeSettingsDir;
   process.env.ANTHROPIC_MODEL = "glm-5.2";
   process.env.CLAUDE_ACP_AVAILABLE_MODELS = ERICAI_MODELS;
+  clearClaudeSettingsCache();
+});
+
+afterEach(() => {
+  if (savedSettingsDir === undefined) delete process.env.CLAUDE_SETTINGS_DIR;
+  else process.env.CLAUDE_SETTINGS_DIR = savedSettingsDir;
   clearClaudeSettingsCache();
 });
 
@@ -182,14 +203,31 @@ describe("model & effort pickers", () => {
   });
 
   it("newSession advertises only ANTHROPIC_MODEL when no available-models list is set", async () => {
-    delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
-    process.env.ANTHROPIC_MODEL = "LongCat-2.0";
-    clearClaudeSettingsCache();
-    const { agent } = await setup();
-    const r: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
-    const modelPicker = r.configOptions.find((o: any) => o.id === "model");
-    expect(modelPicker.options.map((o: any) => o.value)).toEqual(["LongCat-2.0"]);
-    expect(modelPicker.currentValue).toBe("LongCat-2.0");
+    // With no explicit CLAUDE_ACP_AVAILABLE_MODELS list, the picker is built
+    // from every model-naming env key (MODEL_ENV_KEYS). The developer's real
+    // env sets ANTHROPIC_SMALL_FAST_MODEL etc., so scrub them all before
+    // pinning the single ANTHROPIC_MODEL this test asserts on, and restore
+    // afterward so the scrub does not leak into later tests.
+    const saved: Record<string, string | undefined> = {};
+    for (const k of MODEL_ENV_KEYS) {
+      saved[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
+      process.env.ANTHROPIC_MODEL = "LongCat-2.0";
+      clearClaudeSettingsCache();
+      const { agent } = await setup();
+      const r: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+      const modelPicker = r.configOptions.find((o: any) => o.id === "model");
+      expect(modelPicker.options.map((o: any) => o.value)).toEqual(["LongCat-2.0"]);
+      expect(modelPicker.currentValue).toBe("LongCat-2.0");
+    } finally {
+      for (const k of MODEL_ENV_KEYS) {
+        if (saved[k] === undefined) delete process.env[k];
+        else process.env[k] = saved[k];
+      }
+    }
   });
 
   it("selecting a non-reasoning model hides the effort picker", async () => {

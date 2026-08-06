@@ -32,7 +32,7 @@ type LoadedClaudeSettings = {
 };
 
 /** Env keys that name concrete backend models in Claude Code settings. */
-const MODEL_ENV_KEYS = [
+export const MODEL_ENV_KEYS = [
   "ANTHROPIC_MODEL",
   "ANTHROPIC_SMALL_FAST_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -42,7 +42,7 @@ const MODEL_ENV_KEYS = [
 ] as const;
 
 /** Optional comma-separated explicit picker list in settings env. */
-const AVAILABLE_MODELS_ENV_KEY = "CLAUDE_ACP_AVAILABLE_MODELS";
+export const AVAILABLE_MODELS_ENV_KEY = "CLAUDE_ACP_AVAILABLE_MODELS";
 
 let cachedSettings: LoadedClaudeSettings | undefined;
 
@@ -54,9 +54,17 @@ let cachedSettings: LoadedClaudeSettings | undefined;
  * `CLAUDE_PROJECT_DIR` are consulted. Per-session working directories are not,
  * because these values (context window, token budgets) are model-level
  * configuration rather than per-directory settings.
+ *
+ * The user-layer directory defaults to `~/.claude`. Setting the
+ * `CLAUDE_SETTINGS_DIR` environment variable redirects it elsewhere — used by
+ * tests to point at a throwaway directory so the developer's real
+ * `~/.claude/settings.json` cannot leak into model-picker assertions, and
+ * usable in production to layer the ACP adapter over a non-default settings
+ * location.
  */
 function settingsPaths(): string[] {
-  const paths = [join(homedir(), ".claude", "settings.json")];
+  const userDir = process.env.CLAUDE_SETTINGS_DIR ?? join(homedir(), ".claude");
+  const paths = [join(userDir, "settings.json")];
   const projectDir = process.env.CLAUDE_PROJECT_DIR;
   if (projectDir) {
     paths.push(join(projectDir, ".claude", "settings.json"));

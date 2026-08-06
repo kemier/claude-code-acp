@@ -23,6 +23,8 @@ import {
   loadClaudeSettingsEnv,
   clearClaudeSettingsCache,
   resolveModelAlias,
+  MODEL_ENV_KEYS,
+  AVAILABLE_MODELS_ENV_KEY,
 } from "../src/claude-settings.js";
 
 /** Key names unique to this test, so real settings files can't collide. */
@@ -30,7 +32,9 @@ const KEY = "ACP_TEST_ONLY_SETTING";
 const KEY2 = "ACP_TEST_ONLY_SECOND";
 
 let projectDir: string;
+let userSettingsDir: string;
 let savedProjectDir: string | undefined;
+let savedSettingsDir: string | undefined;
 
 function writeProjectSettings(file: string, settings: unknown): void {
   const dir = join(projectDir, ".claude");
@@ -41,8 +45,15 @@ function writeProjectSettings(file: string, settings: unknown): void {
 
 beforeEach(() => {
   projectDir = mkdtempSync(join(tmpdir(), "acp-settings-test-"));
+  // Isolate the user-layer settings file from the developer's real
+  // ~/.claude/settings.json. CLAUDE_SETTINGS_DIR redirects settingsPaths() to
+  // this empty throwaway dir so a real user file (which may set
+  // ANTHROPIC_MODEL etc.) cannot leak into the assertions below.
+  userSettingsDir = mkdtempSync(join(tmpdir(), "acp-settings-user-"));
   savedProjectDir = process.env.CLAUDE_PROJECT_DIR;
+  savedSettingsDir = process.env.CLAUDE_SETTINGS_DIR;
   process.env.CLAUDE_PROJECT_DIR = projectDir;
+  process.env.CLAUDE_SETTINGS_DIR = userSettingsDir;
   delete process.env[KEY];
   delete process.env[KEY2];
   clearClaudeSettingsCache();
@@ -51,10 +62,13 @@ beforeEach(() => {
 afterEach(() => {
   if (savedProjectDir === undefined) delete process.env.CLAUDE_PROJECT_DIR;
   else process.env.CLAUDE_PROJECT_DIR = savedProjectDir;
+  if (savedSettingsDir === undefined) delete process.env.CLAUDE_SETTINGS_DIR;
+  else process.env.CLAUDE_SETTINGS_DIR = savedSettingsDir;
   delete process.env[KEY];
   delete process.env[KEY2];
   clearClaudeSettingsCache();
   rmSync(projectDir, { recursive: true, force: true });
+  rmSync(userSettingsDir, { recursive: true, force: true });
 });
 
 describe("reading the settings env block", () => {
@@ -144,31 +158,29 @@ describe("caching", () => {
 });
 
 describe("model picker from settings", () => {
-  const savedModel = process.env.ANTHROPIC_MODEL;
-  const savedAvailable = process.env.CLAUDE_ACP_AVAILABLE_MODELS;
-  const savedAcpModel = process.env.CLAUDE_ACP_MODEL;
-  const savedHome = process.env.HOME;
-  let fakeHome: string;
+  // getAvailableModelsFromSettings / getDefaultModelFromSettings resolve model
+  // ids via getClaudeEnv, which falls back to process.env when the settings env
+  // block is silent. The developer's real environment commonly sets
+  // ANTHROPIC_SMALL_FAST_MODEL (and other ANTHROPIC_DEFAULT_*_MODEL keys), so
+  // scrubbing only ANTHROPIC_MODEL / CLAUDE_ACP_MODEL is not enough — those
+  // sibling keys would leak in and pollute the picker. Save and clear every
+  // model-naming env key for the duration of this suite.
+  const savedEnv: Record<string, string | undefined> = {};
+  const allModelKeys = [...MODEL_ENV_KEYS, AVAILABLE_MODELS_ENV_KEY];
 
   afterEach(() => {
-    if (savedModel === undefined) delete process.env.ANTHROPIC_MODEL;
-    else process.env.ANTHROPIC_MODEL = savedModel;
-    if (savedAvailable === undefined) delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
-    else process.env.CLAUDE_ACP_AVAILABLE_MODELS = savedAvailable;
-    if (savedAcpModel === undefined) delete process.env.CLAUDE_ACP_MODEL;
-    else process.env.CLAUDE_ACP_MODEL = savedAcpModel;
-    if (savedHome === undefined) delete process.env.HOME;
-    else process.env.HOME = savedHome;
-    rmSync(fakeHome, { recursive: true, force: true });
+    for (const k of allModelKeys) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+    clearClaudeSettingsCache();
   });
 
   beforeEach(() => {
-    // Isolate from the developer's real ~/.claude/settings.json.
-    fakeHome = mkdtempSync(join(tmpdir(), "acp-home-"));
-    process.env.HOME = fakeHome;
-    delete process.env.ANTHROPIC_MODEL;
-    delete process.env.CLAUDE_ACP_AVAILABLE_MODELS;
-    delete process.env.CLAUDE_ACP_MODEL;
+    for (const k of allModelKeys) {
+      savedEnv[k] = process.env[k];
+      delete process.env[k];
+    }
     clearClaudeSettingsCache();
   });
 
