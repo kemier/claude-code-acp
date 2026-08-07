@@ -60,6 +60,13 @@ interface RecordedCall {
 let recorded: RecordedCall[] = [];
 // The next text the mocked summary/fresh-session turns should return.
 let nextStreamText = "streamed response";
+// The usage figure the next mocked turn reports in its `result` event.
+// Default mirrors the CLI's small usage; tests set it high to drive the
+// pre-turn compaction guard.
+let nextUsage: { input_tokens: number; output_tokens: number } = {
+  input_tokens: 10,
+  output_tokens: 5,
+};
 // Controls runner.isRunning() so tests can simulate "a turn is in flight" at
 // steer time (handleSteer drops steers for idle sessions). Set true before
 // steering, false before the draining prompt.
@@ -105,8 +112,12 @@ vi.mock("../src/claude-runner.js", () => {
         recorded.push({ kind: "start", cwd, prompt, modelOverride, effortOverride });
         if (streamGate) streamEntered();
         onEvent({ type: "assistant", apiCallIndex: 0 });
+        // message_delta is the authoritative per-call prompt token count
+        // (agent.ts:2674). Without it the estimator never sees a real count
+        // and the pre-turn guard can't project the next prompt size.
+        onEvent({ type: "message_delta", usage: nextUsage });
         onEvent({ type: "text_delta", text: nextStreamText, fromAssistantBlock: true });
-        onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
+        onEvent({ type: "result", usage: nextUsage });
         if (streamGate) await streamGatePromise;
         return { text: nextStreamText, sessionId: "claude-uuid-abc" };
       }
@@ -123,8 +134,9 @@ vi.mock("../src/claude-runner.js", () => {
         recorded.push({ kind: "continue", prompt, modelOverride, effortOverride });
         if (streamGate) streamEntered();
         onEvent({ type: "assistant", apiCallIndex: 0 });
+        onEvent({ type: "message_delta", usage: nextUsage });
         onEvent({ type: "text_delta", text: nextStreamText, fromAssistantBlock: true });
-        onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
+        onEvent({ type: "result", usage: nextUsage });
         if (streamGate) await streamGatePromise;
         return { text: nextStreamText, sessionId: "claude-uuid-abc" };
       }
@@ -151,6 +163,7 @@ async function setup() {
   vi.clearAllMocks();
   recorded = [];
   nextStreamText = "streamed response";
+  nextUsage = { input_tokens: 10, output_tokens: 5 };
   running = false;
   streamGate = null;
   streamGatePromise = new Promise(() => {});
@@ -375,6 +388,89 @@ describe("/compact (doCompact)", () => {
     expect(messages(conn).some((m) => m.includes("No conversation to compact"))).toBe(true);
   });
 });
+
+describe("pre-turn compaction guard", () => {
+  // Regression for the "1-token overflow" class: the post-turn auto-compact
+  // check measures the PREVIOUS turn's real prompt count, so a turn that
+  // finished at 176,000 (under the 176,947 threshold) yet whose NEXT prompt
+  // grows the request past the threshold arrives at vLLM as input + maxOutput
+  // > window → HTTP 500. The pre-turn guard projects the about-to-be-sent
+  // prompt size (last real count + new prompt's char-estimated tokens) and
+  // compacts BEFORE forwarding when it would cross the threshold.
+  it("compacts before forwarding a prompt that would cross the threshold", async () => {
+    // glm-5.2 window 196608, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE default →
+    // threshold = floor(196608 * 0.90) = 176947 (no reserve; see e0bf09d).
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
+    process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
+    clearClaudeSettingsCache();
+    const { conn, agent, sid } = await setup();
+
+    // Turn 1: establish a real prompt count JUST under the threshold. The
+    // estimator's realTokens becomes 176000; the post-turn check sees
+    // 176000 < 176947 and does NOT compact.
+    nextUsage = { input_tokens: 176_000, output_tokens: 100 };
+    await prompt(agent, sid, "seed turn");
+    recorded = [];
+
+    // Turn 2: a prompt large enough that 176000 + ceil(chars/3) >= 176947,
+    // i.e. >= 2841 chars. The pre-turn guard must fire doCompact before the
+    // turn's normal continueSessionStreaming call.
+    nextUsage = { input_tokens: 30_000, output_tokens: 100 };
+    const bigPrompt = "x".repeat(3000);
+    await prompt(agent, sid, bigPrompt);
+
+    // doCompact ran: a continue (summary) then a start (fresh session seeded
+    // with the summary) appear BEFORE the turn's own continue.
+    const summaryStart = recorded.findIndex(
+      (c) => c.kind === "start" && c.prompt.includes("Previous conversation summary"),
+    );
+    expect(summaryStart).toBeGreaterThanOrEqual(0);
+    // The summary start must precede the final continue that runs the actual
+    // turn (the bigPrompt), proving compaction happened before forwarding.
+    const finalContinue = recorded.findIndex(
+      (c, i) => i > summaryStart && c.kind === "continue" && c.prompt === bigPrompt,
+    );
+    expect(finalContinue).toBeGreaterThan(summaryStart);
+
+    // Compaction was announced via the contextCompaction lifecycle.
+    const compactionUpdates = (conn.sessionUpdate as any).mock.calls
+      .map((c: any) => c[0]?.update)
+      .filter((u: any) => u?._meta?.contextCompaction === true);
+    expect(compactionUpdates.length).toBeGreaterThanOrEqual(2);
+
+    delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+    delete process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE;
+    clearClaudeSettingsCache();
+  });
+
+  it("does not compact when the projected prompt stays under the threshold", async () => {
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
+    process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
+    clearClaudeSettingsCache();
+    const { conn, agent, sid } = await setup();
+
+    // Turn 1: well under threshold.
+    nextUsage = { input_tokens: 100_000, output_tokens: 100 };
+    await prompt(agent, sid, "seed turn");
+    recorded = [];
+
+    // Turn 2: small prompt, projected stays under 176947 → no compaction.
+    nextUsage = { input_tokens: 100_500, output_tokens: 100 };
+    await prompt(agent, sid, "small follow-up");
+
+    const compactionUpdates = (conn.sessionUpdate as any).mock.calls
+      .map((c: any) => c[0]?.update)
+      .filter((u: any) => u?._meta?.contextCompaction === true);
+    expect(compactionUpdates).toHaveLength(0);
+    // Only the single continue for the turn — no summary start.
+    expect(recorded.some((c) => c.prompt.includes("Previous conversation summary"))).toBe(false);
+
+    delete process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+    delete process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE;
+    clearClaudeSettingsCache();
+  });
+});
+
 
 describe("steering (session/steer)", () => {
   it("emits a user_message_chunk immediately for visual feedback", async () => {

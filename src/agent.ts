@@ -567,6 +567,11 @@ class TurnContextEstimator {
     return this.realTokens > 0;
   }
 
+  /** Characters accumulated since the last real per-call count (for logging). */
+  getPendingChars(): number {
+    return this.bytesSinceReal;
+  }
+
   /** Accumulate text content (assistant messages, thinking, tool results). */
   addText(text: string): void {
     if (text) {
@@ -616,6 +621,31 @@ class TurnContextEstimator {
    */
   getEstimatedTokens(): number {
     if (this.realTokens > 0) return this.realTokens;
+    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
+  }
+
+  /**
+   * Context size INCLUDING content accumulated since the last real per-call
+   * count (the new user prompt + any trailing tool results added between API
+   * calls).
+   *
+   * `getEstimatedTokens` returns `realTokens` verbatim and ignores
+   * `bytesSinceReal` — correct mid-turn (the real count refreshes on every
+   * API call) but stale for the pre-turn compaction check. Between turns the
+   * next prompt's text has already been `addText`-ed into `bytesSinceReal`,
+   * so the verbatim figure under-counts what vLLM is about to receive by
+   * exactly the new prompt's token contribution. That gap is what let a turn
+   * sit at 174,239 (under the 176,947 threshold) yet arrive at vLLM as
+   * 176,609 input + 20,000 maxOutput → 1-token overflow.
+   *
+   * Used ONLY by the pre-turn compaction guard, not the live usage UI (the
+   * char-based increment over-inflates when subagent/tool traffic is in
+   * `bytesSinceReal` — see the getEstimatedTokens comment).
+   */
+  getEstimatedTokensWithPending(): number {
+    if (this.realTokens > 0) {
+      return this.realTokens + estimateTokensFromChars(this.bytesSinceReal);
+    }
     return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
   }
 
@@ -3135,10 +3165,58 @@ export function createClaudeCodeAgent(
         const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
         let result;
         if (!skipMainTurn) {
-        if (claudeSessionIdAfterDrain) {
+        // ─── Pre-turn compaction guard ────────────────────────────────
+        // The post-turn auto-compact check (below, after "Prompt completed")
+        // runs against `sessionLastUsage` — the REAL prompt count from the
+        // previous turn's last API call. By the time THIS turn forwards its
+        // prompt to the CLI, that figure is stale: the new user prompt (added
+        // to ctxEstimator at addText(effectivePrompt) above) has grown the
+        // request by the new prompt's token contribution. The between-turn
+        // check can't see that growth, so a turn that measured 174,239 (under
+        // the 176,947 threshold) arrives at vLLM as 176,609 input + 20,000
+        // maxOutput = 196,609 > 196,608 → HTTP 500 context overflow.
+        //
+        // This guard mirrors the Claude Code CLI's pre-send `isAtBlockingLimit`
+        // check (query.ts): project the about-to-be-sent prompt size using the
+        // estimator's pending-inclusive count, and if it would cross the
+        // threshold, compact BEFORE forwarding. getEstimatedTokensWithPending
+        // adds the new prompt's char-estimated tokens to the last real count,
+        // closing the measurement gap so the 90% threshold actually means 90%.
+        if (isAutoCompactEnabled() && claudeSessionIdAfterDrain) {
+          const projectedInput = ctxEstimator.getEstimatedTokensWithPending();
+          const preTurnThreshold = getAutoCompactThreshold(effectiveModel);
+          if (projectedInput >= preTurnThreshold) {
+            logger.info(
+              `Pre-turn compact for session ${sessionId}: projected ${projectedInput} >= ${preTurnThreshold} ` +
+                `(lastReal=${ctxEstimator.getEstimatedTokens()}, pendingChars added ${ctxEstimator.getPendingChars()} chars, ` +
+                `effectiveWindow=${getEffectiveContextWindowSize(effectiveModel)}, contextWindow=${getContextWindowForModel(effectiveModel)})`,
+            );
+            await doCompact(
+              sessionId,
+              connection,
+              runner,
+              store,
+              modelOverride,
+              effectiveEffort,
+              false,
+            );
+            // doCompact reset the estimator (conversation replaced by a short
+            // summary). Re-add this turn's prompt so the estimator reflects
+            // the post-compact conversation + the new prompt before the turn.
+            ctxEstimator.addText(effectivePrompt);
+            // Re-read the claude session id: doCompact starts a fresh session.
+            // The variable captured below must point at the compacted session,
+            // not the pre-compact one (which the summary replaced).
+          }
+        }
+        // doCompact above may have replaced the claude session id; re-read so
+        // the resume below targets the compacted conversation when compaction
+        // ran, and the original when it didn't.
+        const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
+        if (claudeSessionIdForTurn) {
           try {
             result = await runner.continueSessionStreaming(
-              claudeSessionIdAfterDrain,
+              claudeSessionIdForTurn,
               effectivePrompt,
               onEvent,
               sessionId,
