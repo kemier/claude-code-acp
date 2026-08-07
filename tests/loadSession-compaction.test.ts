@@ -180,4 +180,68 @@ describe("loadSession replay compaction truncation", () => {
 
     expect(texts).toEqual(["first user", "first reply", "second user"]);
   });
+
+  it("reconstructs the plan snapshot from replayed TaskCreate/TaskUpdate tool_use blocks", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1.0" },
+    });
+
+    const sessionId = "cccccccc-dddd-eeee-ffff-000000000001";
+    const cwd = "/tmp/proj";
+    const transcriptPath = `/home/test/.claude/projects/-tmp-proj/${sessionId}.jsonl`;
+    const lines: any[] = [
+      {
+        type: "user",
+        message: { content: "do the tasks" },
+      },
+      {
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu-create-1",
+              name: "TaskCreate",
+              input: {
+                tasks: [
+                  { subject: "Write tests" },
+                  { subject: "Ship fix" },
+                ],
+              },
+            },
+          ],
+        },
+      },
+      {
+        type: "assistant",
+        message: {
+          content: [
+            {
+              type: "tool_use",
+              id: "toolu-update-1",
+              name: "TaskUpdate",
+              input: { taskId: "1", status: "completed" },
+            },
+          ],
+        },
+      },
+    ];
+    fsState.files[transcriptPath] = lines.map((l) => JSON.stringify(l)).join("\n");
+    fsState.exists.add(transcriptPath);
+
+    await agent.loadSession!({ sessionId, cwd, mcpServers: [] });
+
+    const planSnapshots = updates.filter((u) => u.sessionUpdate === "plan");
+    // At least one plan snapshot must reach the client from the replay.
+    expect(planSnapshots.length).toBeGreaterThan(0);
+    const last = planSnapshots[planSnapshots.length - 1];
+    // The final snapshot reflects the TaskUpdate: "Write tests" is completed,
+    // "Ship fix" is still pending.
+    const byContent: Record<string, string> = {};
+    for (const e of last.entries) byContent[e.content] = e.status;
+    expect(byContent["Write tests"]).toBe("completed");
+    expect(byContent["Ship fix"]).toBe("pending");
+  });
 });

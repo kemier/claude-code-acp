@@ -1241,10 +1241,15 @@ export function createClaudeCodeAgent(
    *   then by `task-N` derived from a bare numeric id, then by subject.
    * - TaskList: {} (no-op; the list is already tracked)
    */
+  // Optional receiver for the plan snapshot handleTaskTool builds. The live
+  // path leaves this undefined (handleTaskTool emits nothing itself); the
+  // session/load replay path passes one so the snapshot is buffered with the
+  // rest of the replayed updates instead of emitted inline.
   function handleTaskTool(
     sessionId: string,
     toolName: string,
     toolInput: unknown,
+    out?: { snapshot?: any },
   ): boolean {
     if (toolName !== "TaskCreate" && toolName !== "TaskUpdate" && toolName !== "TaskList") {
       return false;
@@ -1256,6 +1261,19 @@ export function createClaudeCodeAgent(
     }
 
     const input = (toolInput ?? {}) as Record<string, any>;
+    // Where the built plan snapshot goes. When `out` is provided (replay path),
+    // write it there for the caller to buffer; otherwise emit it directly on
+    // the connection (live path).
+    const deliver = (snapshot: any) => {
+      if (!snapshot) return;
+      if (out) {
+        out.snapshot = snapshot;
+      } else {
+        connection.sessionUpdate({ sessionId, update: snapshot } as any).catch(() => {
+          // Best effort.
+        });
+      }
+    };
 
     if (toolName === "TaskCreate") {
       // Accept BOTH schemas: a `tasks` array (batch) OR a single task
@@ -1328,12 +1346,15 @@ export function createClaudeCodeAgent(
     }
     // TaskList: nothing to apply; we already track the list.
 
-    // Emit a full plan snapshot — but ONLY when there is at least one tracked
+    // Build a full plan snapshot — but ONLY when there is at least one tracked
     // todo. An empty snapshot would render as "Plan (no content)" in the UI,
     // which happens when the model calls TaskUpdate on tasks it never created
     // (e.g. GLM-5.2 replaying task ids it saw in memory/prior context across a
     // new session where sessionTodos is empty). In that case there is genuinely
-    // nothing to plan, so we skip the emission rather than flash an empty bar.
+    // nothing to plan, so we return null (no emission) rather than flash an
+    // empty bar. Returning the snapshot (instead of emitting inline) lets the
+    // caller decide delivery: the live path emits immediately, the session/load
+    // replay path buffers it with the rest of the replayed updates.
     if (todos.size === 0) {
       return true;
     }
@@ -1342,14 +1363,9 @@ export function createClaudeCodeAgent(
       priority: "medium" as const,
       status: t.status as "pending" | "in_progress" | "completed",
     }));
-    connection.sessionUpdate({
-      sessionId,
-      update: {
-        sessionUpdate: "plan",
-        entries,
-      } as any,
-    }).catch(() => {
-      // Best effort.
+    deliver({
+      sessionUpdate: "plan",
+      entries,
     });
     return true;
   }
@@ -2117,6 +2133,26 @@ export function createClaudeCodeAgent(
                             block.input ?? {},
                           ) as any,
                         );
+                        // Reconstruct plan state from replayed TaskCreate/Update
+                        // tool_use blocks so a reloaded session shows its todo
+                        // list (the live path calls handleTaskTool at L2663; the
+                        // replay path previously did not, so sessionTodos stayed
+                        // empty and no `plan` snapshot reached the client). The
+                        // `out` receiver buffers the snapshot instead of emitting
+                        // it inline, so it is truncated/ordered with the rest of
+                        // the replayed updates (incl. at a compaction marker).
+                        const planOut: { snapshot?: any } = {};
+                        if (
+                          handleTaskTool(
+                            sessionId,
+                            block.name ?? "",
+                            block.input ?? {},
+                            planOut,
+                          ) &&
+                          planOut.snapshot
+                        ) {
+                          replayedUpdates.push(planOut.snapshot);
+                        }
                       }
                     }
                   }
