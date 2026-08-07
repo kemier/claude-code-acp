@@ -105,13 +105,17 @@ describe("global override vs per-model reality", () => {
     expect(getContextWindowForModel("glm-5.1")).toBe(131_072);
   });
 
-  it("keeps the threshold inside the real window for a smaller model", () => {
+  it("compacts at window - 13000 for a smaller model (no reserve)", () => {
+    // With the summary reserve removed, the threshold is just window - 13000.
+    // The output budget no longer factors in, so threshold + maxOutput can
+    // exceed the real window (accepted overflow risk, compaction mode A).
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     const threshold = getAutoCompactThreshold("glm-5.1");
-    // 131072 - 20000 - 13000
-    expect(threshold).toBe(98_072);
-    expect(threshold + 20_000).toBeLessThanOrEqual(131_072);
+    // 131072 - 13000
+    expect(threshold).toBe(118_072);
+    // No longer guaranteed to fit: 118072 + 20000 = 138072 > 131072.
+    expect(threshold + 20_000).toBeGreaterThan(131_072);
   });
 
   it("does not let the override lower a larger model's window", () => {

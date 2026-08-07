@@ -1,19 +1,20 @@
-// Verifies the ACP layer computes the same auto-compact threshold Claude Code
-// CLI does.
+// Verifies the ACP layer's auto-compact threshold arithmetic.
 //
 // Both layers can compact. If their arithmetic disagrees, whichever fires first
 // wins and the other silently never runs — so tuning compaction via the
 // documented environment variables would have unpredictable effect. These tests
-// pin the ACP side to the CLI's formula:
+// pin the ACP side's formula:
 //
-//   effectiveWindow = min(window, AUTO_COMPACT_WINDOW) - min(maxOutput, 20000)
+//   effectiveWindow = min(window, AUTO_COMPACT_WINDOW)        (NO summary reserve)
 //   threshold       = effectiveWindow - 13000
 //   with PCT=N        threshold = min(floor(effectiveWindow * N/100), threshold)
 //
-// The CLI implementation this mirrors (v2.1.220, minified):
-//   function yfo(e,t){let r=e-13000,n=t.testPctOverride;
-//     if(n!==void 0&&!isNaN(n)&&n>0&&n<=100)return Math.min(Math.floor(e*(n/100)),r);
-//     return r}
+// NOTE: the ACP layer intentionally does NOT subtract a summary output reserve
+// (it used to subtract min(maxOutput, 20000), mirroring the Claude Code CLI).
+// Removing it compacts later (~codex-acp's behavior) at the cost of the
+// `threshold + maxOutput <= window` safety property: a turn at the threshold
+// whose response uses the full maxOutput budget can overflow the window and be
+// backend-rejected. That trade-off is accepted (see getEffectiveContextWindowSize).
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
@@ -114,57 +115,54 @@ describe("auto-compact window", () => {
   });
 });
 
-describe("effective window and threshold (CLI parity)", () => {
-  it("reproduces the effectiveWindow the CLI logs for our configuration", () => {
-    // Claude Code's own debug log for this exact env prints
-    // "autocompact: ... effectiveWindow=176608".
+describe("effective window and threshold", () => {
+  it("effective window is the (capped) model window with no reserve subtracted", () => {
+    // No summary reserve: effective == the compaction window itself.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
-    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(176_608);
+    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(GLM_WINDOW);
   });
 
-  it("caps the summary reserve at 20000 even with a larger output budget", () => {
+  it("ignores the output budget — no reserve is subtracted", () => {
+    // The old formula reserved min(maxOutput, 20000); that reserve is gone, so
+    // a large output budget no longer lowers the effective window.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "64000";
-    // reserve is min(64000, 20000) = 20000
-    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(GLM_WINDOW - 20_000);
-  });
-
-  it("reserves the full output budget when it is below the cap", () => {
-    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
+    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "8000";
-    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(GLM_WINDOW - 8_000);
+    expect(getEffectiveContextWindowSize("glm-5.2")).toBe(GLM_WINDOW);
   });
 
   it("subtracts the 13000 buffer with no percentage override", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
-    expect(getAutoCompactThreshold("glm-5.2")).toBe(176_608 - 13_000); // 163608
+    expect(getAutoCompactThreshold("glm-5.2")).toBe(GLM_WINDOW - 13_000); // 183608
   });
 
-  it("applies the percentage to the effective window, matching the CLI", () => {
-    // Not 90% of the raw 196608 (=176947) — 90% of the effective 176608.
+  it("applies the percentage to the effective (un-reserved) window", () => {
+    // 90% of the un-reserved 196608 = 176947, which is below the 183608 base,
+    // so the percentage wins.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
-    expect(getAutoCompactThreshold("glm-5.2")).toBe(158_947);
+    expect(getAutoCompactThreshold("glm-5.2")).toBe(176_947);
   });
 
   it("only ever lowers the threshold — a high percentage has no effect", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "100";
-    // floor(176608 * 1.0) = 176608, min with 163608 -> 163608
-    expect(getAutoCompactThreshold("glm-5.2")).toBe(163_608);
+    // floor(196608 * 1.0) = 196608, min with 183608 -> 183608
+    expect(getAutoCompactThreshold("glm-5.2")).toBe(183_608);
   });
 
   it("compacts much earlier with a low percentage", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "50";
-    expect(getAutoCompactThreshold("glm-5.2")).toBe(Math.floor(176_608 / 2));
+    expect(getAutoCompactThreshold("glm-5.2")).toBe(Math.floor(GLM_WINDOW / 2));
   });
 
   it("ignores an out-of-range percentage", () => {
@@ -172,26 +170,22 @@ describe("effective window and threshold (CLI parity)", () => {
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     for (const bad of ["0", "101", "-1", "abc"]) {
       process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = bad;
-      expect(getAutoCompactThreshold("glm-5.2")).toBe(163_608);
+      expect(getAutoCompactThreshold("glm-5.2")).toBe(183_608);
     }
   });
 
-  it("leaves headroom so a request at the threshold cannot overflow", () => {
-    // This is the property that actually prevents the failure: the backend
-    // rejects when prompt + max_tokens exceeds the window.
+  it("documents the accepted overflow risk at the threshold", () => {
+    // With the reserve removed, a turn at the threshold whose response uses
+    // the full maxOutput budget CAN exceed the window — the backend rejects
+    // rather than gracefully compacting. This is the trade-off of compaction
+    // mode A (compact late, no reserve). Pinned as a known, accepted property.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = String(GLM_WINDOW);
     process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(GLM_WINDOW);
-    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "32000";
     process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
-    const worstCase = getAutoCompactThreshold("glm-5.2") + getMaxOutputTokens();
-    expect(worstCase).toBeLessThanOrEqual(GLM_WINDOW);
-  });
-
-  it("would overflow with the old naive 90%-of-raw-window rule", () => {
-    // Regression guard documenting why the previous formula was unsafe:
-    // 90% of 196608 = 176947, plus a 32000 output budget = 208947 > 196608.
-    const naive = Math.floor((GLM_WINDOW * 9) / 10);
-    expect(naive + 32_000).toBeGreaterThan(GLM_WINDOW);
+    const threshold = getAutoCompactThreshold("glm-5.2");
+    // threshold (176947) + maxOutput (32000) = 208947 > 196608 -> overflow.
+    expect(threshold + getMaxOutputTokens()).toBeGreaterThan(GLM_WINDOW);
   });
 });
 

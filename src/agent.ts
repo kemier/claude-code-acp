@@ -283,9 +283,7 @@ export function getContextWindowForModel(modelId: string | undefined): number {
 // wins and the other becomes unreachable, making the configured behaviour a
 // coin flip that depends on undocumented internals.
 
-/** Tokens the CLI reserves for the compaction summary's own output. */
-const MAX_OUTPUT_TOKENS_FOR_SUMMARY = 20_000;
-/** Headroom the CLI keeps below the effective window before compacting. */
+/** Headroom kept below the effective window before compacting. */
 const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
 /** The CLI's max-output default for model ids it does not recognize. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
@@ -438,24 +436,33 @@ export function getAutoCompactWindow(modelId: string | undefined): number {
 }
 
 /**
- * Effective window = compaction capacity minus the summary output reserve.
- * Mirrors the CLI's `getEffectiveContextWindowSize()`.
+ * Effective window used for compaction maths.
+ *
+ * Deliberately NOT reduced by the summary output reserve: we compact as late
+ * as possible (matching codex-acp's ~90%-of-window behavior) instead of
+ * reserving `min(maxOutput, 20000)` tokens up front. Trade-off (accepted):
+ * a turn whose prompt sits at the threshold AND whose response uses the full
+ * maxOutput budget can push `prompt + max_tokens` past the real window, which
+ * the backend rejects. The reserve existed to guarantee `threshold + maxOutput
+ * <= window`; removing it trades that safety for later compaction.
  */
 export function getEffectiveContextWindowSize(modelId: string | undefined): number {
-  const reserved = Math.min(getMaxOutputTokens(), MAX_OUTPUT_TOKENS_FOR_SUMMARY);
-  return getAutoCompactWindow(modelId) - reserved;
+  return getAutoCompactWindow(modelId);
 }
 
 /**
- * Auto-compact threshold, matching Claude Code CLI exactly:
+ * Auto-compact threshold.
  *
  *   threshold = effectiveWindow - 13000
  *   with CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=N:
  *     threshold = min(floor(effectiveWindow * N/100), threshold)
  *
- * The percentage applies to the *effective* window (not the raw context
- * window) and can only lower the threshold — values above the default have no
- * effect, per the CLI's own implementation.
+ * `effectiveWindow` is the (possibly capped) model window with NO summary
+ * reserve subtracted (see getEffectiveContextWindowSize), so the threshold
+ * sits as high as possible. The percentage applies to the effective window
+ * and can only lower the threshold further — values above the default
+ * (N >= ~93) have no effect because floor(effective*N/100) exceeds
+ * effective - 13000.
  */
 export function getAutoCompactThreshold(modelId: string | undefined): number {
   const effective = getEffectiveContextWindowSize(modelId);
