@@ -177,10 +177,20 @@ const sessionGoals = new Map<string, { text: string; paused: boolean }>();
 // Default context window used when the proxy doesn't report one for a model.
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
-// Cached map of model-id → context_length, fetched once from the proxy's
-// /v1/models endpoint at startup. Falls back to DEFAULT_CONTEXT_WINDOW.
+// Cached map of model-id → context_length, fetched from the proxy's
+// /v1/models endpoint. Falls back to DEFAULT_CONTEXT_WINDOW.
 const modelContextWindows = new Map<string, number>();
+// Once a fetch has SUCCEEDED this is set so we don't re-fetch on every lookup.
+// A FAILED fetch (proxy unreachable, non-200) deliberately leaves this false so
+// the next caller retries — otherwise a transiently-unreachable proxy at
+// process spawn would freeze the map empty for the whole session, and every
+// model would fall through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS override
+// (pinned to one model's window), mis-reporting every other model's denominator
+// and compaction threshold.
 let modelContextWindowsLoaded = false;
+// In-flight fetch promise so concurrent callers share one request without
+// marking the load complete until it settles.
+let modelContextWindowsLoadPromise: Promise<void> | null = null;
 
 /**
  * The proxy URL for direct /v1/models queries.
@@ -198,30 +208,42 @@ function getProxyBaseUrl(): string {
 
 /**
  * Fetch /v1/models from the proxy and populate modelContextWindows.
- * Called once at module load; safe to call again to refresh.
+ * Called once at module load; safe to call again to refresh. Concurrent
+ * callers share a single in-flight fetch. The "loaded" gate is only set on
+ * SUCCESS — a failed fetch leaves the map retryable so a transiently
+ * unreachable proxy at spawn doesn't freeze the wrong override in for the
+ * whole session.
  */
 export async function loadModelContextWindows(): Promise<void> {
   if (modelContextWindowsLoaded) return;
-  modelContextWindowsLoaded = true; // set early to avoid concurrent fetches
-  try {
-    const url = `${getProxyBaseUrl()}/v1/models`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    if (!resp.ok) {
-      logger.warn(`Failed to fetch /v1/models from proxy (${resp.status}): ${url}`);
-      return;
-    }
-    const body = await resp.json() as { data?: Array<{ id: string; context_length?: number }> };
-    if (body.data) {
-      for (const m of body.data) {
-        if (typeof m.context_length === "number" && m.context_length > 0) {
-          modelContextWindows.set(m.id, m.context_length);
-        }
+  if (modelContextWindowsLoadPromise) return modelContextWindowsLoadPromise;
+  modelContextWindowsLoadPromise = (async () => {
+    try {
+      const url = `${getProxyBaseUrl()}/v1/models`;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
+      if (!resp.ok) {
+        logger.warn(`Failed to fetch /v1/models from proxy (${resp.status}): ${url}`);
+        return;
       }
-      logger.info(`Loaded ${modelContextWindows.size} model context windows from proxy`);
+      const body = await resp.json() as { data?: Array<{ id: string; context_length?: number }> };
+      if (body.data) {
+        for (const m of body.data) {
+          if (typeof m.context_length === "number" && m.context_length > 0) {
+            modelContextWindows.set(m.id, m.context_length);
+          }
+        }
+        logger.info(`Loaded ${modelContextWindows.size} model context windows from proxy`);
+        // Only pin the load complete once we actually have data. A failed or
+        // empty fetch stays retryable.
+        if (modelContextWindows.size > 0) modelContextWindowsLoaded = true;
+      }
+    } catch (err) {
+      logger.warn(`Could not load model context windows from proxy: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      modelContextWindowsLoadPromise = null;
     }
-  } catch (err) {
-    logger.warn(`Could not load model context windows from proxy: ${err instanceof Error ? err.message : String(err)}`);
-  }
+  })();
+  return modelContextWindowsLoadPromise;
 }
 
 /**
@@ -269,10 +291,21 @@ const cliReportedContextWindows = new Map<string, number>();
  * applies when no real window is available.
  */
 export function getContextWindowForModel(modelId: string | undefined): number {
-  const known = modelId
-    ? modelContextWindows.get(modelId) ?? cliReportedContextWindows.get(modelId)
-    : undefined;
+  const proxyKnown = modelId ? modelContextWindows.get(modelId) : undefined;
+  const cliKnown = modelId ? cliReportedContextWindows.get(modelId) : undefined;
+  const known = proxyKnown ?? cliKnown;
   if (known !== undefined) return known;
+  // The model is in neither map. If the proxy load hasn't completed (or failed
+  // at spawn and is now retryable), kick off a background refresh so the NEXT
+  // lookup sees the real window instead of falling through to the override —
+  // which is typically pinned to one specific model's window and would
+  // mis-report every other model's denominator and compaction threshold. This
+  // is fire-and-forget: the current call still falls back below; the refresh
+  // populates the map for subsequent calls (the next usage_update, which fires
+  // many times per turn).
+  if (modelId && !modelContextWindowsLoaded) {
+    void loadModelContextWindows();
+  }
   const override = parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
   if (override !== undefined) return override;
   return DEFAULT_CONTEXT_WINDOW;
@@ -2579,6 +2612,17 @@ export function createClaudeCodeAgent(
       // Get model and effort overrides from session config (set via pickers)
       const configOverrides = store.getConfigOverrides(sessionId);
       const modelOverride = configOverrides["model"] as string | undefined;
+      // Best-effort: trigger a context-window map load (one-shot, idempotent) so
+      // the first usage_update of the turn uses the proxy's real per-model
+      // window instead of falling through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS
+      // override (which is pinned to one model's window and would mis-report
+      // every other model's denominator). This is NON-BLOCKING: a blocking await
+      // here delays prompt() past the point where an early cancel() can be
+      // observed, which loses the cancel signal (the test for cancel-during-prompt
+      // times out). The startup fire-and-forget in index.ts and the refresh-on-miss
+      // in getContextWindowForModel already populate the map; this just nudges an
+      // in-flight load along if the proxy wasn't reachable at spawn.
+      void loadModelContextWindows();
       // Only pass effort if the selected model actually supports it; otherwise
       // fall back to the model's default effort. Using resolveEffort() keeps
       // the actually-sent effort consistent with what the picker shows and
@@ -2793,7 +2837,13 @@ export function createClaudeCodeAgent(
       if (event.isError) turnErrored = true;
       // Record the context window Claude Code resolved for this model, so the
       // usage denominator can fall back to the CLI's own figure instead of a
-      // hardcoded 200k when the proxy advertises nothing.
+      // hardcoded 200k when the proxy advertises nothing. NOTE: the CLI's value
+      // is only a FALLBACK — getContextWindowForModel prefers the proxy's
+      // /v1/models figure (authoritative) via `??`. The CLI often reports a
+      // stale/default window for non-Claude models routed via ANTHROPIC_BASE_URL
+      // (e.g. it reports 196608 for deepseek-v4-flash, whose real window is
+      // 262144). If the proxy map doesn't have this model, refresh it — the
+      // proxy may have added the model after our one-shot load.
       if (event.contextWindow && event.contextWindow > 0) {
         const cwModel = resolveSessionModel(store, sessionId, modelOverride);
         if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
@@ -2801,6 +2851,9 @@ export function createClaudeCodeAgent(
           logger.info(
             `Claude Code reports contextWindow=${event.contextWindow} for ${cwModel}`
           );
+        }
+        if (!modelContextWindows.has(cwModel)) {
+          void loadModelContextWindows();
         }
       }
       // Log the stop reason so premature turn termination (end_turn vs

@@ -135,3 +135,30 @@ describe("global override vs per-model reality", () => {
     expect(getContextWindowForModel("some-unknown-model")).toBe(196_608);
   });
 });
+
+describe("CLI-reported window vs proxy reality", () => {
+  // Production bug (2026-08-07): the CLI reports contextWindow=196608 for
+  // deepseek-v4-flash (whose real window is 262144) because it doesn't
+  // recognize non-Claude models routed via ANTHROPIC_BASE_URL. The proxy map's
+  // authoritative value MUST win — the wrong CLI figure must never shadow it,
+  // or the usage denominator and compaction threshold get pinned to the wrong
+  // (smaller) model's window. The proxy map is loaded in beforeAll with the
+  // correct 262144; this asserts the override (196608, matching the CLI's wrong
+  // value) does NOT win when the proxy map has the model.
+  it("prefers the proxy window over the override when the model is known", () => {
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
+    expect(getContextWindowForModel("deepseek-v4-flash")).toBe(262_144);
+  });
+
+  it("computes the 90% threshold against the real (larger) window", () => {
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
+    process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
+    // 90% of 262144 = 235930, not 90% of 196608 (176947). Pinning the
+    // threshold to the larger window means compaction fires later, matching
+    // the model's real capacity.
+    expect(getAutoCompactThreshold("deepseek-v4-flash")).toBe(
+      Math.floor((262_144 * 90) / 100)
+    );
+  });
+});
+
