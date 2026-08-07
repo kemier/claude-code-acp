@@ -642,7 +642,12 @@ describe("Subagent (Task tool) lifecycle", () => {
     expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
-  it("non-subagent tools stay completed immediately (no lifecycle)", async () => {
+  it("non-subagent tools emit in_progress at tool_use, flip to completed on tool_result", async () => {
+    // Read/Bash/Edit/etc. now follow the same lifecycle as subagents: emit
+    // `in_progress` when the tool_use arrives, then flip to `completed` once
+    // the matching tool_result lands (delivered as a `user` event carrying
+    // the resolved toolResultIds). This is what lets vscode-acp render a
+    // "running" row with the command text before the tool finishes.
     const { updates } = await runWithEvents([
       {
         type: "tool_use",
@@ -650,8 +655,34 @@ describe("Subagent (Task tool) lifecycle", () => {
         toolInput: { file_path: "/x" },
         toolUseId: "tu_3",
       },
+      { type: "user", text: "result text", toolResultIds: ["tu_3"] },
     ]);
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
-    expect(toolCalls[0].status).toBe("completed");
+    // First: in_progress when the tool starts.
+    expect(toolCalls[0].status).toBe("in_progress");
+    // The tool_result flips the same toolCallId to completed.
+    const flip = toolCalls[toolCalls.length - 1];
+    expect(flip.status).toBe("completed");
+    expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
+  });
+
+  it("non-subagent tools with no tool_result still complete at turn end", async () => {
+    // If the turn ends without a tool_result (e.g. interrupt mid-tool), the
+    // post-turn safety-net flush must still flip any lingering in_progress
+    // tool_call to completed so vscode-acp isn't left with a stuck spinner.
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "Read",
+        toolInput: { file_path: "/x" },
+        toolUseId: "tu_4",
+      },
+    ]);
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    // in_progress emit + turn-end flush = 2 frames.
+    expect(toolCalls).toHaveLength(2);
+    expect(toolCalls[0].status).toBe("in_progress");
+    expect(toolCalls[1].status).toBe("completed");
+    expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 });

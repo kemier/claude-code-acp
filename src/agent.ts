@@ -1066,6 +1066,16 @@ export function createClaudeCodeAgent(
   // finishes). Maps Claude's native tool_use id → our ACP toolCallId.
   const sessionPendingAgents = new Map<string, Map<string, string>>();
 
+  // Non-subagent tools (Bash/Read/Edit/Grep/…) use the same in_progress →
+  // completed lifecycle, but resolve on the tool_result message (not a
+  // <task-notification>). The runner collects the tool_use_ids a user message
+  // resolves (claude-runner.ts `toolResultIds`); we flip each matching pending
+  // tool to "completed" when that user event arrives. Without this, every tool
+  // is emitted as status:"completed" at the tool_use and the chat UI never
+  // shows a running phase — the command text appears only after the tool ends.
+  // Maps sessionId → (Claude tool_use_id → ACP toolCallId).
+  const sessionPendingTools = new Map<string, Map<string, string>>();
+
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
   // We mirror them into ACP `session/update` with sessionUpdate:"plan" +
@@ -2276,8 +2286,34 @@ export function createClaudeCodeAgent(
       // "completed" at turn end (see the post-stream flush below). The parent
       // turn cannot end while a subagent it spawned is still running — Claude
       // awaits them — so turn end is a reliable completion signal.
-      // Non-subagent tool_result ids are ignored here (they were never added to
-      // sessionPendingAgents; they completed inline at their tool_use).
+      // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
+      // is resolved by this user message's tool_results to "completed". The
+      // runner emits toolResultIds on the user event (claude-runner.ts). This
+      // is what surfaces the running → completed transition for Bash/Read/Edit.
+      if (event.type === "user" && event.toolResultIds?.length) {
+        const pendingTools = sessionPendingTools.get(sessionId);
+        if (pendingTools && pendingTools.size > 0) {
+          for (const tuId of event.toolResultIds) {
+            const acpCallId = pendingTools.get(tuId);
+            if (acpCallId) {
+              pendingTools.delete(tuId);
+              connection
+                .sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: "tool_call",
+                    toolCallId: acpCallId,
+                    status: "completed",
+                  } as any,
+                })
+                .catch(() => {});
+            }
+          }
+          if (pendingTools.size === 0) {
+            sessionPendingTools.delete(sessionId);
+          }
+        }
+      }
     // Handle result event — Claude CLI reports CUMULATIVE usage across all
     // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
     // single-call turn, input_tokens = real context size (accurate). For a
@@ -2418,12 +2454,15 @@ export function createClaudeCodeAgent(
            event.toolName,
            event.toolInput,
          );
-         // A subagent runs long after its tool_use block appears. Emit it as
-         // in_progress (not completed) and record the Claude tool_use id so
-         // we can flip it to completed when the subagent's tool_result lands.
-         const emitted = isSubagent
-           ? { ...update, status: "in_progress" as const }
-           : update;
+         // Emit every tool as in_progress at its tool_use so the chat UI shows
+         // a running phase (command text + spinner) while the tool executes.
+         // The tool flips to "completed" when its tool_result lands — subagents
+         // via the <task-notification> path below, normal tools via the
+         // tool_result path in the user-event handler. buildToolCallUpdate's
+         // status:"completed" default is overridden here and only resolved on
+         // completion; the post-turn flush is the safety net for tools whose
+         // result never arrived before end_turn.
+         const emitted = { ...update, status: "in_progress" as const };
          if (isSubagent && event.toolUseId) {
            let pending = sessionPendingAgents.get(sessionId);
            if (!pending) {
@@ -2431,6 +2470,16 @@ export function createClaudeCodeAgent(
              sessionPendingAgents.set(sessionId, pending);
            }
            pending.set(event.toolUseId, toolCallId);
+         } else if (event.toolUseId) {
+           // Non-subagent tool: register so the tool_result user-event can flip
+           // it to completed. Subagents are excluded (their completion comes
+           // through <task-notification>, not the tool_result id match).
+           let pendingTools = sessionPendingTools.get(sessionId);
+           if (!pendingTools) {
+             pendingTools = new Map();
+             sessionPendingTools.set(sessionId, pendingTools);
+           }
+           pendingTools.set(event.toolUseId, toolCallId);
          }
          connection.sessionUpdate({
            sessionId,
@@ -2720,6 +2769,33 @@ export function createClaudeCodeAgent(
           }
           pendingAgents.clear();
           sessionPendingAgents.delete(sessionId);
+        }
+
+        // Post-turn normal-tool flush. Tools whose tool_result never arrived
+        // before end_turn (e.g. a tool_use emitted in the final assistant
+        // message with no following user/tool_result) would otherwise hang in
+        // in_progress forever. Mark them completed as a fallback.
+        const pendingTools = sessionPendingTools.get(sessionId);
+        if (pendingTools && pendingTools.size > 0) {
+          logger.info(
+            `Turn ended with ${pendingTools.size} tool(s) still pending ` +
+              `(no tool_result before end_turn) for session ${sessionId} ` +
+              `— marking completed as fallback.`,
+          );
+          for (const acpCallId of pendingTools.values()) {
+            connection
+              .sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "tool_call",
+                  toolCallId: acpCallId,
+                  status: "completed",
+                } as any,
+              })
+              .catch(() => {});
+          }
+          pendingTools.clear();
+          sessionPendingTools.delete(sessionId);
         }
 
         // Check if this session was cancelled while running
