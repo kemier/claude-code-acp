@@ -2301,7 +2301,7 @@ export function createClaudeCodeAgent(
                 .sessionUpdate({
                   sessionId,
                   update: {
-                    sessionUpdate: "tool_call",
+                    sessionUpdate: "tool_call_update",
                     toolCallId: acpCallId,
                     status: "completed",
                   } as any,
@@ -2534,6 +2534,7 @@ export function createClaudeCodeAgent(
                 sessionId,
                 update: {
                   ...baseUpdate,
+                  sessionUpdate: "tool_call_update",
                   status: isApproved ? "completed" : "failed",
                 },
               });
@@ -2544,7 +2545,11 @@ export function createClaudeCodeAgent(
               );
               connection.sessionUpdate({
                 sessionId,
-                update: { ...baseUpdate, status: "failed" },
+                update: {
+                  ...baseUpdate,
+                  sessionUpdate: "tool_call_update",
+                  status: "failed",
+                },
               });
             });
 
@@ -2760,7 +2765,7 @@ export function createClaudeCodeAgent(
               .sessionUpdate({
                 sessionId,
                 update: {
-                  sessionUpdate: "tool_call",
+                  sessionUpdate: "tool_call_update",
                   toolCallId: acpCallId,
                   status: "completed",
                 } as any,
@@ -2787,7 +2792,7 @@ export function createClaudeCodeAgent(
               .sessionUpdate({
                 sessionId,
                 update: {
-                  sessionUpdate: "tool_call",
+                  sessionUpdate: "tool_call_update",
                   toolCallId: acpCallId,
                   status: "completed",
                 } as any,

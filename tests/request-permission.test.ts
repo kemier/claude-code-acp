@@ -178,9 +178,10 @@ describe("session/request_permission", () => {
     });
 
     const updates = (conn.sessionUpdate as any).mock.calls.map((c: any) => c[0].update);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     const completedCall = toolCalls.find((u: any) => u.status === "completed");
     expect(completedCall).toBeDefined();
+    expect(completedCall.sessionUpdate).toBe("tool_call_update");
   });
 
   it("should send tool_call update with failed status after reject_once", async () => {
@@ -195,9 +196,10 @@ describe("session/request_permission", () => {
     });
 
     const updates = (conn.sessionUpdate as any).mock.calls.map((c: any) => c[0].update);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     const failedCall = toolCalls.find((u: any) => u.status === "failed");
     expect(failedCall).toBeDefined();
+    expect(failedCall.sessionUpdate).toBe("tool_call_update");
   });
 
   it("should send tool_call update with failed status when outcome is cancelled", async () => {
@@ -212,9 +214,10 @@ describe("session/request_permission", () => {
     });
 
     const updates = (conn.sessionUpdate as any).mock.calls.map((c: any) => c[0].update);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     const failedCall = toolCalls.find((u: any) => u.status === "failed");
     expect(failedCall).toBeDefined();
+    expect(failedCall.sessionUpdate).toBe("tool_call_update");
   });
 
   it("should include rawInput with tool call details in permission request", async () => {

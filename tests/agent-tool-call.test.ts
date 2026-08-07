@@ -613,7 +613,7 @@ describe("Subagent (Task tool) lifecycle", () => {
       // after it. So this must NOT flip the tool_call to completed.
       { type: "user", text: "result text", toolResultIds: ["tu_1"] },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     // First: in_progress when the subagent starts.
     expect(toolCalls[0].status).toBe("in_progress");
     // The tool_result launch ack must NOT produce a completed flip — only two
@@ -622,6 +622,7 @@ describe("Subagent (Task tool) lifecycle", () => {
     // Last: the turn-end flush flips the same toolCallId to completed.
     const flip = toolCalls[toolCalls.length - 1];
     expect(flip.status).toBe("completed");
+    expect(flip.sessionUpdate).toBe("tool_call_update");
     expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
@@ -634,11 +635,12 @@ describe("Subagent (Task tool) lifecycle", () => {
         toolUseId: "tu_2",
       },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     // in_progress emit + turn-end flush = 2 frames.
     expect(toolCalls).toHaveLength(2);
     expect(toolCalls[0].status).toBe("in_progress");
     expect(toolCalls[1].status).toBe("completed");
+    expect(toolCalls[1].sessionUpdate).toBe("tool_call_update");
     expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
@@ -657,12 +659,13 @@ describe("Subagent (Task tool) lifecycle", () => {
       },
       { type: "user", text: "result text", toolResultIds: ["tu_3"] },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     // First: in_progress when the tool starts.
     expect(toolCalls[0].status).toBe("in_progress");
     // The tool_result flips the same toolCallId to completed.
     const flip = toolCalls[toolCalls.length - 1];
     expect(flip.status).toBe("completed");
+    expect(flip.sessionUpdate).toBe("tool_call_update");
     expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
@@ -678,11 +681,12 @@ describe("Subagent (Task tool) lifecycle", () => {
         toolUseId: "tu_4",
       },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
     // in_progress emit + turn-end flush = 2 frames.
     expect(toolCalls).toHaveLength(2);
     expect(toolCalls[0].status).toBe("in_progress");
     expect(toolCalls[1].status).toBe("completed");
+    expect(toolCalls[1].sessionUpdate).toBe("tool_call_update");
     expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 });
