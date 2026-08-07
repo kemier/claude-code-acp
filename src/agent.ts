@@ -1327,6 +1327,32 @@ export function createClaudeCodeAgent(
           if (t.content === subject) { matchedId = id; break; }
         }
       }
+      // Final fallback: a status-only TaskUpdate (taskId + status, no subject)
+      // whose taskId is a Claude-internal id we never tracked. The model emits
+      // these to mark the task it just finished as completed/in_progress. When
+      // there is exactly ONE task currently in_progress, that is almost
+      // certainly the one being updated (the active task transitions to
+      // completed when done; a pending task flips to in_progress when started).
+      // Match it so the plan panel reflects the transition instead of leaving
+      // every entry stuck at "pending". If there are zero or multiple
+      // in_progress tasks, don't guess — leave the list unchanged.
+      if (!matchedId && input.status !== undefined && !subject) {
+        let inProgressId: string | null = null;
+        let inProgressCount = 0;
+        for (const [id, t] of todos) {
+          if (t.status === "in_progress") {
+            inProgressId = id;
+            inProgressCount++;
+          }
+        }
+        if (inProgressCount === 1 && inProgressId) {
+          matchedId = inProgressId;
+          logger.debug(
+            `TaskUpdate: taskId=${rawTaskId} unmatched by id/subject; ` +
+              `applying status=${status} to the sole in_progress task`,
+          );
+        }
+      }
       if (matchedId) {
         const existing = todos.get(matchedId)!;
         if (subject) existing.content = subject;

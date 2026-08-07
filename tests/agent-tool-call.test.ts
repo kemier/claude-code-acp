@@ -391,6 +391,49 @@ describe("Agent todo/plan updates", () => {
     expect(lastPlan.entries[1].status).toBe("pending");
   });
 
+  it("TaskUpdate with an unmatched Claude-internal taskId flips the sole in_progress task", async () => {
+    // The model references tasks by Claude-internal ids we never tracked
+    // (e.g. taskId:"19" when only 5 tasks exist) and often sends status-only
+    // updates (no subject). The sole in_progress task is the active one being
+    // finished — flip it so the plan reflects completion instead of leaving
+    // every entry stuck at "pending".
+    const { updates } = await runWithEvents([
+      {
+        type: "tool_use",
+        toolName: "TaskCreate",
+        toolInput: {
+          tasks: [
+            { subject: "Do thing A" },
+            { subject: "Do thing B" },
+            { subject: "Do thing C" },
+          ],
+        },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        // taskId is a bare number that resolves to task-1 (synthetic id).
+        toolInput: { taskId: "1", status: "in_progress" },
+      },
+      {
+        type: "tool_use",
+        toolName: "TaskUpdate",
+        // Claude-internal id "19" does NOT map to any synthetic task-N.
+        // No subject. Status-only. Must fall back to the in_progress task.
+        toolInput: { taskId: "19", status: "completed" },
+      },
+    ]);
+    const plans = updates.filter((u: any) => u.sessionUpdate === "plan");
+    const lastPlan = plans[plans.length - 1];
+    const byContent: Record<string, string> = {};
+    for (const e of lastPlan.entries) byContent[e.content] = e.status;
+    // The task that was in_progress ("Do thing A") is now completed.
+    expect(byContent["Do thing A"]).toBe("completed");
+    // The others remain pending (untouched).
+    expect(byContent["Do thing B"]).toBe("pending");
+    expect(byContent["Do thing C"]).toBe("pending");
+  });
+
   it("multiple TaskCreate calls accumulate into one growing list", async () => {
     const { updates } = await runWithEvents([
       {
