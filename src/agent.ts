@@ -2048,6 +2048,17 @@ export function createClaudeCodeAgent(
             const raw = readFileSync(transcriptPath, "utf-8");
             const lines = raw.split("\n").filter((l) => l.trim());
             logger.info(`Replaying ${lines.length} transcript lines from ${transcriptPath}`);
+            // Buffer replayed updates and only emit the surviving set after the
+            // walk. The Claude CLI writes a `summary` entry at each compaction
+            // (the post-compact context that replaces the conversation); turns
+            // BEFORE the last compaction are no longer part of the live context
+            // and must NOT be re-rendered into the chat panel. Dropping them on
+            // a `summary` marker mirrors codex-acp's streamThreadHistory
+            // (`threadUpdates.length = 0` on a contextCompaction item). We also
+            // reset sessionTodos so stale pre-compaction plan state doesn't
+            // leak into the post-compaction plan snapshot.
+            const replayedUpdates: any[] = [];
+            let compactedAtLeastOnce = false;
             for (const line of lines) {
               try {
                 const entry = JSON.parse(line);
@@ -2055,27 +2066,30 @@ export function createClaudeCodeAgent(
                 // replaying them would interleave subagent chatter into the
                 // main history.
                 if (entry.isSidechain) continue;
+                // Compaction marker: the CLI replaces the conversation with
+                // this summary. Drop everything replayed so far (it is no
+                // longer live context) and reset derived plan state.
+                if (entry.type === "summary") {
+                  replayedUpdates.length = 0;
+                  sessionTodos.delete(sessionId);
+                  compactedAtLeastOnce = true;
+                  continue;
+                }
                 if (entry.type === "user") {
                   const msg = entry.message;
                   if (!msg) continue;
                   const content = msg.content;
                   if (typeof content === "string" && content.trim()) {
-                    await connection.sessionUpdate({
-                      sessionId,
-                      update: {
-                        sessionUpdate: "user_message_chunk",
-                        content: { type: "text", text: content },
-                      } as any,
+                    replayedUpdates.push({
+                      sessionUpdate: "user_message_chunk",
+                      content: { type: "text", text: content },
                     });
                   } else if (Array.isArray(content)) {
                     for (const block of content) {
                       if (block.type === "text" && block.text) {
-                        await connection.sessionUpdate({
-                          sessionId,
-                          update: {
-                            sessionUpdate: "user_message_chunk",
-                            content: { type: "text", text: block.text },
-                          } as any,
+                        replayedUpdates.push({
+                          sessionUpdate: "user_message_chunk",
+                          content: { type: "text", text: block.text },
                         });
                       }
                     }
@@ -2087,26 +2101,22 @@ export function createClaudeCodeAgent(
                   if (Array.isArray(content)) {
                     for (const block of content) {
                       if (block.type === "text" && block.text) {
-                        await connection.sessionUpdate({
-                          sessionId,
-                          update: {
-                            sessionUpdate: "agent_message_chunk",
-                            content: { type: "text", text: block.text },
-                          } as any,
+                        replayedUpdates.push({
+                          sessionUpdate: "agent_message_chunk",
+                          content: { type: "text", text: block.text },
                         });
                       } else if (block.type === "tool_use") {
                         // Build the update with the SAME mapper the live path
                         // uses, so a resumed session shows "Read file 'x.ts'"
                         // and the right `kind`/diff content instead of a bare
                         // tool name like "Read".
-                        await connection.sessionUpdate({
-                          sessionId,
-                          update: buildToolCallUpdate(
+                        replayedUpdates.push(
+                          buildToolCallUpdate(
                             block.id ?? `replay-${Math.random().toString(36).slice(2, 8)}`,
                             block.name ?? "tool",
                             block.input ?? {},
                           ) as any,
-                        });
+                        );
                       }
                     }
                   }
@@ -2115,7 +2125,16 @@ export function createClaudeCodeAgent(
                 // Skip unparseable lines
               }
             }
-            logger.info(`Replay complete for session ${sessionId}`);
+            // Emit only the surviving (post-last-compaction) updates in order.
+            for (const update of replayedUpdates) {
+              await connection.sessionUpdate({ sessionId, update } as any);
+            }
+            logger.info(
+              `Replay complete for session ${sessionId}` +
+                (compactedAtLeastOnce
+                  ? ` (truncated at compaction marker; ${replayedUpdates.length} post-compact update(s) emitted)`
+                  : ` (${replayedUpdates.length} update(s) emitted)`),
+            );
           } else {
             logger.warn(`Transcript not found: ${transcriptPath}`);
           }
