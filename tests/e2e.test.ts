@@ -217,4 +217,53 @@ describe("E2E: ACP Client ↔ Agent", () => {
     });
     expect(r2.stopReason).toBe("end_turn");
   });
+
+  it("should fork a session into a new divergent session", async () => {
+    const { agentStream, clientStream } = createStreamPair();
+
+    new AgentSideConnection(
+      (conn) => createClaudeCodeAgent(conn),
+      agentStream
+    );
+
+    const client: Client = {
+      async sessionUpdate() {},
+      async requestPermission() {
+        return { outcome: { outcome: "selected", optionId: "allow" } };
+      },
+    };
+    const clientConn = new ClientSideConnection(() => client, clientStream);
+
+    await clientConn.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "e2e-test", version: "1.0" },
+    });
+
+    // Verify the agent advertises the fork capability.
+    // (initialize response is consumed inside ClientSideConnection; reach the
+    // agent directly by forking after a session exists.)
+
+    const source = await clientConn.newSession({
+      cwd: "/tmp",
+      mcpServers: [],
+    });
+
+    // A turn establishes a Claude session id on the source session, so the
+    // fork has a transcript id to branch from.
+    await clientConn.prompt({
+      sessionId: source.sessionId,
+      prompt: [{ type: "text", text: "seed turn" }],
+    });
+
+    // Fork — must NOT throw "Method not found" (the bug being fixed).
+    const fork = await clientConn.unstable_forkSession({
+      sessionId: source.sessionId,
+      cwd: "/tmp",
+    });
+
+    expect(fork.sessionId).toBeDefined();
+    expect(fork.sessionId).not.toBe(source.sessionId);
+    expect(fork.modes).toBeDefined();
+  });
 });

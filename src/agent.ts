@@ -14,6 +14,8 @@ import {
   type CancelNotification,
   type LoadSessionRequest,
   type LoadSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type ListSessionsRequest,
   type ListSessionsResponse,
   type SetSessionModeRequest,
@@ -1294,19 +1296,38 @@ export function createClaudeCodeAgent(
           ? [input]
           : [];
       const tasks = batch.length ? batch : scalar;
+      let deduped = 0;
       for (const t of tasks) {
         const content =
           (typeof t.subject === "string" && t.subject) ||
           (typeof t.description === "string" && t.description) ||
           (typeof t.activeForm === "string" && t.activeForm) ||
           "task";
+        // Dedup by content: the model (notably GLM-5.2) sometimes re-emits a
+        // TaskCreate for a task it already created earlier in the session
+        // (re-planning). Appending a second `task-N` with the same content
+        // produced duplicate plan entries that never cleared. If an entry with
+        // the same content already exists, skip it rather than adding a dupe.
+        let alreadyTracked = false;
+        for (const existing of todos.values()) {
+          if (existing.content === content) {
+            alreadyTracked = true;
+            break;
+          }
+        }
+        if (alreadyTracked) {
+          deduped++;
+          continue;
+        }
         // Assign a synthetic id in creation order. Claude's real task ids
         // only surface in the tool_result (not the tool_use input), so we
         // can't key on them; we match TaskUpdate by derived id/subject below.
         const id = `task-${todos.size + 1}`;
         todos.set(id, { content, status: "pending" });
       }
-      logger.debug(`TaskCreate: +${tasks.length} task(s), list now ${todos.size}`);
+      logger.debug(
+        `TaskCreate: +${tasks.length - deduped} task(s)${deduped ? ` (${deduped} dup skipped)` : ""}, list now ${todos.size}`,
+      );
     } else if (toolName === "TaskUpdate") {
       const rawTaskId = String(input.taskId ?? input.task_id ?? "");
       const status = toPlanStatus(input.status);
@@ -1885,9 +1906,14 @@ export function createClaudeCodeAgent(
       store.setClaudeSessionId(sessionId, newResult.sessionId);
       // Clear usage tracking so auto-compact doesn't immediately re-trigger.
       sessionLastUsage.delete(sessionId);
-      // Compaction replaces the whole conversation with a summary, so any
-      // todo list from the prior context no longer applies.
-      sessionTodos.delete(sessionId);
+      // Intentionally NOT clearing sessionTodos here. Compaction summarizes the
+      // conversation but does not invalidate the tracked task list — the tasks
+      // are still pending/in-progress/completed. Wiping the mirror here (while
+      // the upstream CLI's task files survive compaction) left the plan panel
+      // empty until the model happened to re-emit TaskCreate, which it usually
+      // doesn't. codex and ericli both correctly avoid clearing plan state on
+      // compaction; this matches them. The compaction summary already asks the
+      // model for "pending tasks", so the surviving entries stay accurate.
       // Reset the context estimator: compaction replaced the entire
       // conversation with a short summary, so the pre-compaction content the
       // estimator accumulated no longer reflects the session's real context.
@@ -1942,6 +1968,7 @@ export function createClaudeCodeAgent(
           },
           sessionCapabilities: {
             list: {},
+            fork: {},
           },
         },
         authMethods: [],
@@ -2217,6 +2244,96 @@ export function createClaudeCodeAgent(
        configOptions: buildConfigOptions(store, sessionId),
         availableCommands: BUILTIN_COMMANDS,
       } as LoadSessionResponse;
+    },
+
+    /**
+     * Fork a session (ACP `session/fork` — experimental).
+     *
+     * The conversation history lives in the Claude CLI JSONL transcript at
+     * ~/.claude/projects/<encoded-cwd>/<claude-session-id>.jsonl, not in the
+     * SessionStore (the store only maps ACP session id → claude session id).
+     * Forking therefore means: copy the source transcript to a fresh Claude
+     * session UUID and register a new ACP session pointing at the copy. The
+     * fork's first prompt resumes (`--resume <new-claude-id>`) from the copy,
+     * so subsequent turns append to the branch and leave the original
+     * conversation untouched — true branch semantics.
+     */
+    async unstable_forkSession(
+      params: ForkSessionRequest
+    ): Promise<ForkSessionResponse> {
+      const { sessionId: sourceSessionId } = params;
+      logger.info(`Fork request for session ${sourceSessionId}`);
+
+      // Same rehydration leniency as loadSession: the agent is respawned per
+      // client session, so the source may not be in this process's map yet.
+      if (!store.has(sourceSessionId)) {
+        if (typeof params.cwd === "string" && params.cwd) {
+          logger.info(
+            `Fork source ${sourceSessionId} unknown to this process — rehydrating from cwd ${params.cwd}`
+          );
+          store.ensure(sourceSessionId, params.cwd, (params as any).mcpServers ?? []);
+        } else {
+          throw RequestError.resourceNotFound(
+            `Session ${sourceSessionId} not found`
+          );
+        }
+      }
+
+      const sourceClaudeId = store.getClaudeSessionId(sourceSessionId);
+      const sourceCwd = store.getCwd(sourceSessionId)!;
+
+      // No Claude session mapped yet (the source has had no turns). There is
+      // nothing to branch from, but we still produce a valid empty fork so the
+      // client gets a new session id rather than an error — matching how a
+      // fresh session/new behaves.
+      const forkClaudeId = generateSessionId();
+      if (sourceClaudeId) {
+        const { homedir } = await import("node:os");
+        const projectDir = `${homedir()}/.claude/projects/${sourceCwd.replace(/\//g, "-")}`;
+        const sourcePath = `${projectDir}/${sourceClaudeId}.jsonl`;
+        const forkPath = `${projectDir}/${forkClaudeId}.jsonl`;
+        try {
+          const { copyFileSync, existsSync, mkdirSync } = await import("node:fs");
+          if (existsSync(sourcePath)) {
+            if (!existsSync(projectDir)) {
+              mkdirSync(projectDir, { recursive: true });
+            }
+            copyFileSync(sourcePath, forkPath);
+            logger.info(
+              `Forked transcript: ${sourceClaudeId}.jsonl → ${forkClaudeId}.jsonl (${sourceCwd})`
+            );
+          } else {
+            // Source transcript not on disk (e.g. compaction wiped it, or it
+            // lives on a different host). The fork starts empty; the mapping
+            // below still lets the fork diverge from the source's future turns.
+            logger.warn(
+              `Fork source transcript not found at ${sourcePath}; fork starts empty`
+            );
+          }
+        } catch (e) {
+          logger.error(
+            `Failed to copy transcript for fork: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+      }
+
+      // Register a new ACP session bound to the fork's Claude session id. Use
+      // the source's cwd unless the client explicitly overrode it.
+      const forkCwd =
+        typeof params.cwd === "string" && params.cwd ? params.cwd : sourceCwd;
+      const forkAcpId = generateSessionId();
+      store.create(forkAcpId, forkCwd, (params as any).mcpServers ?? []);
+      store.setClaudeSessionId(forkAcpId, forkClaudeId);
+
+      logger.info(
+        `Forked session ${sourceSessionId} → ${forkAcpId} (claude ${forkClaudeId})`
+      );
+
+      return {
+        sessionId: forkAcpId,
+        modes: buildModeState(store.getMode(sourceSessionId) ?? DEFAULT_MODE),
+        configOptions: buildConfigOptions(store, forkAcpId),
+      } as ForkSessionResponse;
     },
 
     async listSessions(
