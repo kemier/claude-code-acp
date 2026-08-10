@@ -47,6 +47,15 @@ function generateSessionId(): string {
     .join("");
 }
 
+// Monotonic id for one-shot agent_message_chunk emits (slash-command
+// responses, status notices). Each gets a distinct id so a client grouping
+// by messageId treats each as its own message (never merges them with
+// adjacent assistant text). See ACP spec: ContentChunk.messageId.
+let commandMessageCounter = 0;
+function nextCommandMessageId(): string {
+  return `cmd_msg_${++commandMessageCounter}`;
+}
+
 const AVAILABLE_MODES = [
   { id: "read-only", name: "Read-only", description: "Requires approval to edit files and run commands." },
   { id: "agent", name: "Agent", description: "Read and edit files, and run commands." },
@@ -1572,6 +1581,7 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "No background terminals running." },
+          messageId: nextCommandMessageId(),
         } as any,
       });
       return { handled: true };
@@ -1593,6 +1603,7 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Conversation cleared. Starting fresh." },
+          messageId: nextCommandMessageId(),
         } as any,
       });
       return { handled: true };
@@ -1605,6 +1616,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/review-branch" requires branch name.' },
+            messageId: nextCommandMessageId(),
           } as any,
         });
         return { handled: true };
@@ -1623,6 +1635,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/review-commit" requires commit sha.' },
+            messageId: nextCommandMessageId(),
           } as any,
         });
         return { handled: true };
@@ -1667,6 +1680,7 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: lines.join("\n") },
+          messageId: nextCommandMessageId(),
         } as any,
       });
       return { handled: true };
@@ -1739,6 +1753,7 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: skillsList },
+          messageId: nextCommandMessageId(),
         } as any,
       });
       return { handled: true };
@@ -1752,6 +1767,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/goal" requires [<objective>|clear|pause|resume].' },
+            messageId: nextCommandMessageId(),
           } as any,
         });
         return { handled: true };
@@ -1765,6 +1781,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: "Goal cleared." },
+            messageId: nextCommandMessageId(),
           } as any,
         });
         return { handled: true };
@@ -1778,6 +1795,7 @@ export function createClaudeCodeAgent(
             update: {
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
+              messageId: nextCommandMessageId(),
             } as any,
           });
         } else {
@@ -1786,6 +1804,7 @@ export function createClaudeCodeAgent(
             update: {
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "No goal to pause. Set one with /goal <objective>." },
+              messageId: nextCommandMessageId(),
             } as any,
           });
         }
@@ -1800,6 +1819,7 @@ export function createClaudeCodeAgent(
             update: {
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
+              messageId: nextCommandMessageId(),
             } as any,
           });
         } else {
@@ -1808,6 +1828,7 @@ export function createClaudeCodeAgent(
             update: {
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "No goal to resume. Set one with /goal <objective>." },
+              messageId: nextCommandMessageId(),
             } as any,
           });
         }
@@ -1820,6 +1841,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/goal" requires goal text of at most 4000 characters.' },
+            messageId: nextCommandMessageId(),
           } as any,
         });
         return { handled: true };
@@ -1830,6 +1852,7 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
+          messageId: nextCommandMessageId(),
         } as any,
       });
       // Caller should start an LLM turn pursuing the goal.
@@ -1931,6 +1954,7 @@ export function createClaudeCodeAgent(
           update: {
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: "No conversation to compact yet." },
+            messageId: nextCommandMessageId(),
           } as any,
         });
       }
@@ -2198,6 +2222,7 @@ export function createClaudeCodeAgent(
             // leak into the post-compaction plan snapshot.
             const replayedUpdates: any[] = [];
             let compactedAtLeastOnce = false;
+            let replayMessageCounter = 0;
             for (const line of lines) {
               try {
                 const entry = JSON.parse(line);
@@ -2237,12 +2262,17 @@ export function createClaudeCodeAgent(
                   const msg = entry.message;
                   if (!msg) continue;
                   const content = msg.content;
+                  // One messageId per replayed assistant message, shared across
+                  // its text blocks — mirrors the live path's per-API-call id
+                  // so the client groups a resumed message into one bubble.
+                  const replayMessageId = `replay_msg_${++replayMessageCounter}`;
                   if (Array.isArray(content)) {
                     for (const block of content) {
                       if (block.type === "text" && block.text) {
                         replayedUpdates.push({
                           sessionUpdate: "agent_message_chunk",
                           content: { type: "text", text: block.text },
+                          messageId: replayMessageId,
                         });
                       } else if (block.type === "tool_use") {
                         // Build the update with the SAME mapper the live path
@@ -2592,6 +2622,18 @@ export function createClaudeCodeAgent(
       const claudeSessionId = store.getClaudeSessionId(sessionId);
       const cwd = store.getCwd(sessionId)!;
      let toolCallCounter = 0;
+     // Monotonic counter for ACP `messageId` on agent_message_chunk. The ACP
+     // spec (ContentChunk.messageId) groups chunks into one logical message:
+     // "All chunks belonging to the same message share the same messageId. A
+     // change in messageId indicates a new message has started." Without it,
+     // vscode-acp cannot tell that text emitted before and after a tool call
+     // belong to the SAME assistant message, so it renders them as separate
+     // bubbles (text→tool→text = 2 bubbles). We rotate the id at each
+     // `assistant` event (one per LLM API call) so all text_delta chunks in
+     // one API call share it; the next API call (after a tool result) gets a
+     // new id → correctly starts a new bubble.
+     let messageCounter = 0;
+     let currentMessageId: string | null = null;
 
       // Real-time context estimator — tracks conversation content to estimate
       // context size during the turn (before the result event arrives).
@@ -2688,6 +2730,10 @@ export function createClaudeCodeAgent(
       // Send a real-time usage_update so the context ring shows during the turn.
       if (event.type === "assistant") {
         ctxEstimator.markApiCall();
+        // Rotate the messageId at each API call boundary so all text_delta
+        // chunks in THIS call share one id (→ one bubble in the client), and
+        // the next call (after a tool result) starts a fresh id (→ new bubble).
+        currentMessageId = `msg_${++messageCounter}`;
         // Secondary source. Through the CCR/proxy path the completed assistant
         // message reports input_tokens: 0, so this usually contributes nothing;
         // setRealTokens ignores non-positive values. `message_delta` below is
@@ -2936,6 +2982,9 @@ export function createClaudeCodeAgent(
              update: {
                sessionUpdate: "agent_message_chunk",
                content: { type: "text", text: event.text },
+               // Group all chunks of this assistant API call into one logical
+               // message so the client renders one bubble (not one per delta).
+               messageId: currentMessageId ?? undefined,
              },
            });
          }
@@ -3497,6 +3546,7 @@ export function createClaudeCodeAgent(
                     ? `Reached the maximum number of turns (${reason}) before finishing. The task may be incomplete — continue to resume.`
                     : `Turn ended with status: ${reason}.`,
               },
+              messageId: nextCommandMessageId(),
             },
           }).catch(() => {});
         }
@@ -3522,6 +3572,7 @@ export function createClaudeCodeAgent(
               type: "text",
               text: `Error: ${message}`,
             },
+            messageId: nextCommandMessageId(),
           },
         });
 
