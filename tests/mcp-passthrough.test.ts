@@ -31,12 +31,21 @@ function createMockProcess(output: string, exitCode = 0): ChildProcess {
 }
 
 describe("MCP config passthrough", () => {
+  let runner: ClaudeRunner | undefined;
+
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
+  afterEach(() => {
+    // startSessionWithMcp writes a claude-acp-mcp-* temp dir via buildMcpArgs;
+    // cleanup() removes it. Without this the dir leaks into /tmp on every run.
+    runner?.cleanup();
+    runner = undefined;
+  });
+
   it("should pass --mcp-config when mcpServers provided", async () => {
-    const runner = new ClaudeRunner({
+    runner = new ClaudeRunner({
       model: undefined,
       allowedTools: [],
       maxTurns: undefined,
