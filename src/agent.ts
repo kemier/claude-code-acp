@@ -2421,7 +2421,8 @@ export function createClaudeCodeAgent(
     modelOverride: string | undefined,
     effectiveEffort: string | undefined,
     announce: boolean,
-  ): Promise<boolean> {
+    skipCompleted: boolean = false,
+  ): Promise<{ compactionId: string; summary: string } | boolean> {
     const claudeSid = store.getClaudeSessionId(sessionId);
     if (!claudeSid) {
       if (announce) {
@@ -2496,9 +2497,11 @@ export function createClaudeCodeAgent(
       // Completion drives the client's history clear + transient notice. The
       // client renders the notice text itself, so nothing is sent as assistant
       // text (which is what previously got concatenated onto the prior reply).
-      await emitCompactionLifecycle(connection, sessionId, compactionId, "completed");
+      if (!skipCompleted) {
+        await emitCompactionLifecycle(connection, sessionId, compactionId, "completed");
+      }
       logger.info(`Compaction succeeded for session ${sessionId}`);
-      return true;
+      return { compactionId, summary: result.text };
     } catch (compactErr) {
       const detail = compactErr instanceof Error ? compactErr.message : String(compactErr);
       logger.error(`Compaction failed for session ${sessionId}: ${detail}`);
@@ -4305,7 +4308,12 @@ export function createClaudeCodeAgent(
             // streamed (vscode-acp only treats compaction text as standalone
             // when nothing is mid-stream), which is exactly the concatenated,
             // never-dismissed notice this replaces.
-           await doCompact(
+           // skipCompleted=true: emit "start" now, but defer "completed" until
+           // AFTER the continuation finishes. This keeps the client's
+           // isCompacting=true and "Compacting..." spinner visible while the
+           // continuation streams, so the 400ms flush timer doesn't race with
+           // continuation events and the history wipe happens at the right time.
+           const compactResult = await doCompact(
              sessionId,
              connection,
              runner,
@@ -4313,7 +4321,8 @@ export function createClaudeCodeAgent(
              modelOverride,
              effectiveEffort,
              false, // no "No conversation to compact yet." text for auto-compact
-           );
+             true,  // skipCompleted — emit "completed" after continuation
+           ) as { compactionId: string; summary: string } | false;
            // After compaction, re-send the original user prompt so the LLM
            // continues the task in the fresh (compacted) session. This matches
            // Codex behavior where compaction is transparent to the user — the
@@ -4321,15 +4330,23 @@ export function createClaudeCodeAgent(
            logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
            const claudeSid = store.getClaudeSessionId(sessionId);
            if (claudeSid) {
+             // Frame the continuation prompt so the model knows it is resuming
+             // after a context compaction. Without this framing, the fresh
+             // session (which only has the summary) can hallucinate tool
+             // results as text ("ReadResult(file_path=...placeholder)...")
+             // because it lost the conversation context and tries to simulate
+             // prior tool calls it doesn't actually have results for.
+             const continueFraming = `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
              // Preserve accompanying images (if any) when re-sending the
              // original prompt after compaction.
-             const reSendContent: import("./claude-runner.js").StdinContentBlock[] = hasImages
-               ? [{ type: "text", text: effectivePrompt }, ...promptImages]
-               : [];
+             const continueContent = [
+               { type: "text" as const, text: continueFraming },
+               ...(hasImages ? promptImages : []),
+             ];
              const continueResult = hasImages
                ? await runner.continueSessionStreamingWithContent(
                    claudeSid,
-                   reSendContent,
+                   continueContent,
                    onEvent,
                    sessionId,
                    modelOverride,
@@ -4337,7 +4354,7 @@ export function createClaudeCodeAgent(
                  )
                : await runner.continueSessionStreaming(
                    claudeSid,
-                   effectivePrompt,
+                   continueFraming,
                    onEvent,
                    sessionId,
                    modelOverride,
@@ -4357,6 +4374,12 @@ export function createClaudeCodeAgent(
                  size: contContextWindow,
                } as any,
              }).catch(() => {});
+           }
+           // NOW emit "completed" — the continuation finished, so the client
+           // can safely flush (wipe old history, show compact notice, drain
+           // buffered continuation chunks into the fresh panel).
+           if (compactResult && typeof compactResult === 'object') {
+             await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
            }
          }
         }
