@@ -4172,13 +4172,31 @@ export function createClaudeCodeAgent(
         // Wait for all pending permission requests to resolve
         await Promise.all(permissionPromises);
 
+        // Bounded wait for pending subagents: the CLI ended the turn before all
+        // subagent <task-notification> messages arrived. Real Claude awaits
+        // subagents before ending the turn; GLM/EricAI does not. Wait up to 15s
+        // for the remaining notifications — they often arrive within 1‑5s of the
+        // turn end. Only fall back to marking completed if the wait times out.
+        {
+          const pendingAgentsTmp = sessionPendingAgents.get(sessionId);
+          if (pendingAgentsTmp && pendingAgentsTmp.size > 0) {
+            const waitDeadline = Date.now() + 15000;
+            while (Date.now() < waitDeadline) {
+              const stillPending = sessionPendingAgents.get(sessionId);
+              if (!stillPending || stillPending.size === 0) break;
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
+          }
+        }
+
         // Post-turn subagent flush. Subagents whose <task-notification>
         // arrived mid-turn were already flipped to "completed" and removed
         // from sessionPendingAgents by the user-event handler above. Anything
         // STILL pending here means the CLI ended the turn (end_turn) before
         // the subagent's result was injected back into the conversation —
         // i.e. a premature end_turn (observed with GLM/EricAI; real Claude
-        // awaits subagents before ending the turn). Mark these "completed" as
+        // awaits subagents before ending the turn). Mark this "completed" as
         // a fallback so the UI spinner doesn't hang forever, and log the
         // anomaly so the lost result is visible: the main agent lacks the
         // subagent's output and may need a follow-up ("go on") to retrieve it
