@@ -180,7 +180,7 @@ const BUILTIN_COMMANDS = [
 ];
 
 /** Per-session goal state. */
-const sessionGoals = new Map<string, { text: string; paused: boolean }>();
+const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null }>();
 
 /**
  * Publish the current goal snapshot to the IDE via session_info_update with
@@ -196,10 +196,12 @@ async function publishGoalSnapshot(
     ? {
         objective: goal.text,
         status: goal.paused ? "paused" as const : "active" as const,
-        tokenBudget: null,
-        timeUsedSeconds: 0,
-        createdAt: 0,
-        controlMethod: "_codex/session/goal_control",
+       tokenBudget: null,
+        timeUsedSeconds: goal.paused && goal.pausedAt
+          ? Math.floor((goal.pausedAt - goal.createdAt) / 1000)
+          : Math.floor((Date.now() - goal.createdAt) / 1000),
+        createdAt: Math.floor(goal.createdAt / 1000),
+       controlMethod: "_codex/session/goal_control",
       }
     : null;
   await connection.sessionUpdate({
@@ -1819,9 +1821,10 @@ export function createClaudeCodeAgent(
       }
       if (lowerArg === "pause") {
         const goal = sessionGoals.get(sessionId);
-        if (goal) {
-          goal.paused = true;
-          await connection.sessionUpdate({
+       if (goal) {
+         goal.paused = true;
+         goal.pausedAt = Date.now();
+         await connection.sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
@@ -1844,9 +1847,15 @@ export function createClaudeCodeAgent(
       }
       if (lowerArg === "resume") {
         const goal = sessionGoals.get(sessionId);
-        if (goal) {
-          goal.paused = false;
-          await connection.sessionUpdate({
+       if (goal) {
+         goal.paused = false;
+         if (goal.pausedAt) {
+           // Shift createdAt forward by the paused duration so timeUsedSeconds
+           // excludes the pause interval.
+           goal.createdAt += Date.now() - goal.pausedAt;
+           goal.pausedAt = null;
+         }
+         await connection.sessionUpdate({
             sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
@@ -1879,7 +1888,7 @@ export function createClaudeCodeAgent(
         });
         return { handled: true };
       }
-     sessionGoals.set(sessionId, { text: argument, paused: false });
+     sessionGoals.set(sessionId, { text: argument, paused: false, createdAt: Date.now(), pausedAt: null });
      // Send user_message_chunk so the IDE shows the /goal command as a user
      // message bubble before the agent's "Goal set:" response. Without this,
      // the "Goal set:" text and the LLM's first response appear as two agent
