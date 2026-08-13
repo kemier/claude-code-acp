@@ -182,6 +182,35 @@ const BUILTIN_COMMANDS = [
 /** Per-session goal state. */
 const sessionGoals = new Map<string, { text: string; paused: boolean }>();
 
+/**
+ * Publish the current goal snapshot to the IDE via session_info_update with
+ * _meta.codex.goal. This mirrors codex-acp's publishGoalSnapshot so the
+ * vscode-acp goal chip works across all agents.
+ */
+async function publishGoalSnapshot(
+  sessionId: string,
+  connection: AgentSideConnection,
+): Promise<void> {
+  const goal = sessionGoals.get(sessionId);
+  const snapshot = goal
+    ? {
+        objective: goal.text,
+        status: goal.paused ? "paused" as const : "active" as const,
+        tokenBudget: null,
+        timeUsedSeconds: 0,
+        createdAt: 0,
+        controlMethod: "_codex/session/goal_control",
+      }
+    : null;
+  await connection.sessionUpdate({
+    sessionId,
+    update: {
+      sessionUpdate: "session_info_update",
+      _meta: { codex: { goal: snapshot } },
+    } as any,
+  }).catch(() => {});
+}
+
 // ─── Context window resolution ──────────────────────────────────────────────
 // Default context window used when the proxy doesn't report one for a model.
 const DEFAULT_CONTEXT_WINDOW = 200_000;
@@ -1602,11 +1631,12 @@ export function createClaudeCodeAgent(
         sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "Conversation cleared. Starting fresh." },
-          messageId: nextCommandMessageId(),
-        } as any,
-      });
-      return { handled: true };
+         content: { type: "text", text: "Conversation cleared. Starting fresh." },
+         messageId: nextCommandMessageId(),
+       } as any,
+     });
+      await publishGoalSnapshot(sessionId, connection);
+     return { handled: true };
     }
 
     if (name === "review-branch") {
@@ -1780,11 +1810,12 @@ export function createClaudeCodeAgent(
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Goal cleared." },
-            messageId: nextCommandMessageId(),
-          } as any,
-        });
-        return { handled: true };
+           content: { type: "text", text: "Goal cleared." },
+           messageId: nextCommandMessageId(),
+         } as any,
+       });
+        await publishGoalSnapshot(sessionId, connection);
+       return { handled: true };
       }
       if (lowerArg === "pause") {
         const goal = sessionGoals.get(sessionId);
@@ -1794,11 +1825,12 @@ export function createClaudeCodeAgent(
             sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
-              messageId: nextCommandMessageId(),
-            } as any,
-          });
-        } else {
+             content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
+             messageId: nextCommandMessageId(),
+           } as any,
+         });
+          await publishGoalSnapshot(sessionId, connection);
+       } else {
           await connection.sessionUpdate({
             sessionId,
             update: {
@@ -1818,11 +1850,12 @@ export function createClaudeCodeAgent(
             sessionId,
             update: {
               sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
-              messageId: nextCommandMessageId(),
-            } as any,
-          });
-        } else {
+             content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
+             messageId: nextCommandMessageId(),
+           } as any,
+         });
+          await publishGoalSnapshot(sessionId, connection);
+       } else {
           await connection.sessionUpdate({
             sessionId,
             update: {
@@ -1852,11 +1885,12 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
-          messageId: nextCommandMessageId(),
-        } as any,
-      });
-      // Caller should start an LLM turn pursuing the goal.
-      return { handled: true, startTurn: `Please start working toward this goal now:\n\n${argument}` };
+         messageId: nextCommandMessageId(),
+       } as any,
+     });
+      await publishGoalSnapshot(sessionId, connection);
+     // Caller should start an LLM turn pursuing the goal.
+     return { handled: true, startTurn: `Please start working toward this goal now:\n\n${argument}` };
     }
 
     // Unknown slash command — let the caller send it as a plain prompt
