@@ -1791,28 +1791,35 @@ export function createClaudeCodeAgent(
       return { handled: true };
     }
 
-    if (name === "goal") {
-      const argument = rest.trim();
-      if (!argument) {
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: 'Command "/goal" requires [<objective>|clear|pause|resume].' },
-            messageId: nextCommandMessageId(),
-          } as any,
-        });
-        return { handled: true };
-      }
+   if (name === "goal") {
+     const argument = rest.trim();
+     if (!argument) {
+       // /goal with no argument — show current goal status (matches Claude Code CLI behavior).
+       const g = sessionGoals.get(sessionId);
+       const statusText = g
+         ? `**Goal:** ${g.paused ? "(paused) " : ""}${g.text.slice(0, 200)}`
+         : "**Goal:** none";
+       await connection.sessionUpdate({
+         sessionId,
+         update: {
+           sessionUpdate: "agent_message_chunk",
+           content: { type: "text", text: statusText },
+           messageId: nextCommandMessageId(),
+         } as any,
+       });
+       await publishGoalSnapshot(sessionId, connection);
+       return { handled: true };
+     }
 
       const lowerArg = argument.toLowerCase();
-      if (lowerArg === "clear") {
-        sessionGoals.delete(sessionId);
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-           content: { type: "text", text: "Goal cleared." },
+      // Claude Code CLI accepts: clear, stop, off, reset, none, cancel
+      if (["clear", "stop", "off", "reset", "none", "cancel"].includes(lowerArg)) {
+       sessionGoals.delete(sessionId);
+       await connection.sessionUpdate({
+         sessionId,
+         update: {
+           sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "Goal cleared." },
            messageId: nextCommandMessageId(),
          } as any,
        });
