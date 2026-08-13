@@ -180,7 +180,7 @@ const BUILTIN_COMMANDS = [
 ];
 
 /** Per-session goal state. */
-const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null }>();
+const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number }>();
 
 /**
  * Publish the current goal snapshot to the IDE via session_info_update with
@@ -192,18 +192,19 @@ async function publishGoalSnapshot(
   connection: AgentSideConnection,
 ): Promise<void> {
   const goal = sessionGoals.get(sessionId);
-  const snapshot = goal
-    ? {
-        objective: goal.text,
-        status: goal.paused ? "paused" as const : "active" as const,
-       tokenBudget: null,
-        timeUsedSeconds: goal.paused && goal.pausedAt
-          ? Math.floor((goal.pausedAt - goal.createdAt) / 1000)
-          : Math.floor((Date.now() - goal.createdAt) / 1000),
-        createdAt: Math.floor(goal.createdAt / 1000),
-       controlMethod: "_codex/session/goal_control",
-      }
-    : null;
+ const snapshot = goal
+   ? {
+       objective: goal.text,
+       status: goal.paused ? "paused" as const : "active" as const,
+      tokenBudget: null,
+       tokensUsed: goal.tokensUsed,
+       timeUsedSeconds: goal.paused && goal.pausedAt
+         ? Math.floor((goal.pausedAt - goal.createdAt) / 1000)
+         : Math.floor((Date.now() - goal.createdAt) / 1000),
+       createdAt: Math.floor(goal.createdAt / 1000),
+      controlMethod: "_codex/session/goal_control",
+     }
+   : null;
   await connection.sessionUpdate({
     sessionId,
     update: {
@@ -1895,7 +1896,7 @@ export function createClaudeCodeAgent(
         });
         return { handled: true };
       }
-     sessionGoals.set(sessionId, { text: argument, paused: false, createdAt: Date.now(), pausedAt: null });
+     sessionGoals.set(sessionId, { text: argument, paused: false, createdAt: Date.now(), pausedAt: null, tokensUsed: 0, timeUsedSeconds: 0 });
      // Send user_message_chunk so the IDE shows the /goal command as a user
      // message bubble before the agent's "Goal set:" response. Without this,
      // the "Goal set:" text and the LLM's first response appear as two agent
@@ -2742,8 +2743,10 @@ export function createClaudeCodeAgent(
 
       const permissionPromises: Promise<void>[] = [];
 
-      let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
-      // Output tokens of the most recent non-sidechain API call. The result
+     let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
+     // Track turn start time for goal budget accounting.
+     const _turnStartTime = Date.now();
+     // Output tokens of the most recent non-sidechain API call. The result
       // event's output_tokens is summed over every call in the turn, which
       // over-states how much the conversation actually grew.
       let lastRealOutputTokens = 0;
@@ -3609,16 +3612,38 @@ export function createClaudeCodeAgent(
               },
               messageId: nextCommandMessageId(),
             },
-          }).catch(() => {});
+         }).catch(() => {});
+       }
+      // Account token usage and elapsed time toward the active goal.
+      const _activeGoal = sessionGoals.get(sessionId);
+      if (_activeGoal && !_activeGoal.paused) {
+        const _lu = lastUsage as any;
+        const _turnTokens = _lu
+          ? (_lu.input_tokens ?? 0) + (_lu.output_tokens ?? 0)
+          : 0;
+        const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
+        _activeGoal.tokensUsed += _turnTokens;
+        _activeGoal.timeUsedSeconds += _turnElapsed;
+        await publishGoalSnapshot(sessionId, connection);
+      }
+      return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
+    } catch (err) {
+      // Check if cancelled
+      if (cancelledSessions.has(sessionId)) {
+        cancelledSessions.delete(sessionId);
+        logger.info(`Prompt cancelled for session ${sessionId}`);
+        // Account partial turn usage toward goal budget.
+        const _cancelledGoal = sessionGoals.get(sessionId);
+        const _clu = lastUsage as any;
+        if (_cancelledGoal && !_cancelledGoal.paused && _clu) {
+          const _turnTokens = (_clu.input_tokens ?? 0) + (_clu.output_tokens ?? 0);
+          const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
+          _cancelledGoal.tokensUsed += _turnTokens;
+          _cancelledGoal.timeUsedSeconds += _turnElapsed;
+          void publishGoalSnapshot(sessionId, connection).catch(() => {});
         }
-        return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
-      } catch (err) {
-        // Check if cancelled
-        if (cancelledSessions.has(sessionId)) {
-          cancelledSessions.delete(sessionId);
-          logger.info(`Prompt cancelled for session ${sessionId}`);
-          return { stopReason: "cancelled" };
-        }
+        return { stopReason: "cancelled" };
+      }
 
         const message =
           err instanceof Error ? err.message : String(err);
