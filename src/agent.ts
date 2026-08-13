@@ -1879,11 +1879,22 @@ export function createClaudeCodeAgent(
         });
         return { handled: true };
       }
-      sessionGoals.set(sessionId, { text: argument, paused: false });
-      await connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "agent_message_chunk",
+     sessionGoals.set(sessionId, { text: argument, paused: false });
+     // Send user_message_chunk so the IDE shows the /goal command as a user
+     // message bubble before the agent's "Goal set:" response. Without this,
+     // the "Goal set:" text and the LLM's first response appear as two agent
+     // messages with no user message separating them, looking concatenated.
+     await connection.sessionUpdate({
+       sessionId,
+       update: {
+         sessionUpdate: "user_message_chunk",
+         content: { type: "text", text },
+       } as any,
+     });
+     await connection.sessionUpdate({
+       sessionId,
+       update: {
+         sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
          messageId: nextCommandMessageId(),
        } as any,
