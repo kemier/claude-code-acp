@@ -1,5 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
-import { writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AgentConfig, loadConfig } from "./config.js";
@@ -127,6 +127,40 @@ export class ClaudeRunner {
   private cancelledProcesses = new Set<string>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
+
+  /**
+   * Resolve the claude executable to spawn.
+   *
+   * On Windows `claude` ships as .cmd shims, which spawn() cannot run without
+   * a shell — and cmd shell-quoting concatenates args with raw quotes, so any
+   * prompt containing `"` (the memory wrapper always does) is re-tokenized
+   * into garbage and claude exits 1. Resolving the real .exe and spawning it
+   * directly keeps argv clean on every platform.
+   */
+  protected resolveClaudeBin(): string {
+    if (process.platform !== "win32") return "claude";
+    const candidates: string[] = [];
+    try {
+      const out = execFileSync("where", ["claude"], { encoding: "utf8", windowsHide: true });
+      candidates.push(
+        ...out
+          .split(/\r?\n/)
+          .map((s) => s.trim())
+          .filter((s) => /\.exe$/i.test(s)),
+      );
+    } catch {
+      // Not on PATH as an .exe — fall through to known install layouts.
+    }
+    if (process.env.APPDATA) {
+      candidates.push(
+        join(process.env.APPDATA, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe"),
+      );
+    }
+    if (process.env.USERPROFILE) {
+      candidates.push(join(process.env.USERPROFILE, ".local", "bin", "claude.exe"));
+    }
+    return candidates.find((p) => existsSync(p)) || "claude";
+  }
 
   constructor(config?: AgentConfig) {
     this.config = config ?? loadConfig();
@@ -402,14 +436,10 @@ export class ClaudeRunner {
   ): Promise<ClaudeResult> {
     return new Promise((resolve, reject) => {
       logger.debug(`spawn: claude ${maskArgs(args)}`);
-      const proc = spawn("claude", args, {
+      const proc = spawn(this.resolveClaudeBin(), args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
-        // Windows ships `claude` as a .cmd shim — spawn() without a shell can
-        // only CreateProcess .exe files, so resolve through cmd.exe there
-        // (same win32 handling as the vscode-acp extension's AgentManager).
-        shell: process.platform === "win32",
       });
 
       let stdout = "";
@@ -454,12 +484,10 @@ export class ClaudeRunner {
   ): Promise<ClaudeResult> {
     return new Promise((resolve, reject) => {
       logger.debug(`spawn streaming: claude ${maskArgs(args)}`);
-      const proc = spawn("claude", args, {
+      const proc = spawn(this.resolveClaudeBin(), args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
-        // Windows ships `claude` as a .cmd shim — see note above.
-        shell: process.platform === "win32",
       });
 
       if (trackingId) {
