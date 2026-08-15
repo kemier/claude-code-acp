@@ -369,7 +369,15 @@ export class ClaudeRunner {
     // routes through our CCR gateway → ericai-proxy → EricAI vLLM.
     // The original code deleted these to force subscription auth, but
     // in our setup we use API key auth via the proxy chain.
-    return { ...process.env };
+    const env = { ...process.env };
+    // Never leak the parent Claude Code session into the spawned CLI: claude
+    // refuses to run nested when CLAUDECODE is set ("Claude Code cannot be
+    // launched inside another Claude Code session", exit code 1). This hits
+    // when VS Code is launched from inside a Claude Code terminal.
+    delete env.CLAUDECODE;
+    delete env.CLAUDE_CODE_SESSION_ID;
+    delete env.CLAUDE_CODE_CHILD_SESSION;
+    return env;
   }
 
   cancel(trackingId: string): void {
@@ -398,6 +406,10 @@ export class ClaudeRunner {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
+        // Windows ships `claude` as a .cmd shim — spawn() without a shell can
+        // only CreateProcess .exe files, so resolve through cmd.exe there
+        // (same win32 handling as the vscode-acp extension's AgentManager).
+        shell: process.platform === "win32",
       });
 
       let stdout = "";
@@ -446,6 +458,8 @@ export class ClaudeRunner {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
+        // Windows ships `claude` as a .cmd shim — see note above.
+        shell: process.platform === "win32",
       });
 
       if (trackingId) {
