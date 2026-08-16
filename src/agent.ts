@@ -788,7 +788,9 @@ function sendEstimatedUsage(
 function shortName(filePath: unknown): string {
   const p = typeof filePath === "string" ? filePath : "";
   if (!p) return "";
-  const base = p.split("/").pop() || p;
+  // Windows paths use backslashes — split on both separators or the whole
+  // path becomes the "basename" and renders as a truncated full path.
+  const base = p.split(/[\\/]/).pop() || p;
   return base.length <= 48 ? base : base.slice(0, 45) + "…";
 }
 
