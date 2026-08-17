@@ -227,10 +227,48 @@ export function getAvailableModelsFromSettings(): Array<{ id: string; name: stri
 let proxyModelsCache: Array<{ id: string; name: string }> | null = null;
 
 /**
- * Fetch the available model list from the proxy's /v1/models endpoint.
- * The proxy filters this to only show chat models that are currently
- * loaded by the vLLM backend. Called during session initialization so
- * the picker can show new models without editing settings.json.
+ * Picker rules for the ACP model dropdown.
+ *
+ * A model is shown only when ALL of these hold:
+ *   1. healthy — /v1/model-health reports healthy === true (replicas > 0,
+ *      actually loaded by the vLLM backend; not configured-but-scaled-zero)
+ *   2. lifecycle !== 'Deprecated' — retired models stay out of the dropdown
+ *   3. tagged `coding` (agent mainline) OR `near_sota` (flagship models like
+ *      deepseek-v4-flash / glm-5.2)
+ *   4. NOT tagged `fast` — the fast-tagged variants are lighter chat models,
+ *      not the agent mainline
+ *
+ * Pure exported helper so the tag/lifecycle combination can be unit tested
+ * without a live proxy. Mirrors ericli's filterProxyModelsForPicker so all
+ * ACP pickers (ericli, claude-code-acp, codex-acp via update_catalog.sh)
+ * agree on the same list.
+ */
+export function filterProxyModelsForPicker(
+  rawModels: Array<{ id?: string; tags?: string[] }>,
+  healthById: ReadonlySet<string>,
+): string[] {
+  return rawModels
+    .map((m) => {
+      const tags = Array.isArray(m.tags) ? m.tags : [];
+      return {
+        id: m.id ?? "",
+        isCoding: (tags.includes("coding") || tags.includes("near_sota"))
+          && !tags.includes("fast"),
+        isHealthy: m.id ? healthById.has(m.id) : false,
+      };
+    })
+    .filter((e) => e.id && e.isHealthy && e.isCoding)
+    .map((e) => e.id)
+    .sort();
+}
+
+/**
+ * Fetch the available model list from the proxy, filtered for the picker.
+ *
+ * Pulls /v1/model-health (healthy + lifecycle) and /v1/models (tags), then
+ * keeps only healthy, non-Deprecated, coding/near_sota-tagged (no fast)
+ * models — the same rules as ericli's picker. Called during session
+ * initialization so the picker shows new models without editing settings.json.
  *
  * Safe to call multiple times — returns the cached result after the first
  * successful fetch. A failed fetch leaves the cache null so settings.json
@@ -243,16 +281,36 @@ export async function discoverProxyModels(): Promise<void> {
       process.env.ERICAI_PROXY_URL ||
       process.env.ERICAI_PROXY_BASE_URL ||
       "http://127.0.0.1:8317";
-    const url = `${baseUrl}/v1/models`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
-    if (!resp.ok) return;
-    const body = await resp.json() as { data?: Array<{ id?: string }> };
-    const ids = (body.data ?? [])
-      .map((m) => m.id)
-      .filter((id): id is string => typeof id === "string" && id.length > 0);
-    if (ids.length > 0) {
-      proxyModelsCache = ids.sort().map((id) => ({ id, name: id }));
-      logger.info(`Discovered ${ids.length} models from proxy /v1/models`);
+    // Health/lifecycle metadata comes from /v1/model-health (the same source
+    // update_catalog.sh uses for the codex catalog). Without the health
+    // filter, raw /v1/models would surface Deprecated models (DeepSeek-V3.2,
+    // Qwen3-32B) and health-less variants in the picker.
+    const healthResp = await fetch(`${baseUrl}/v1/model-health`, { signal: AbortSignal.timeout(3000) });
+    if (!healthResp.ok) return;
+    const healthBody = await healthResp.json() as { data?: Array<{
+      id?: string;
+      ericai_backend_id?: string;
+      health?: { healthy?: boolean; lifecycle?: string; running_replicas?: number; status?: string };
+    }> };
+    const healthyById = new Set<string>();
+    for (const m of healthBody.data ?? []) {
+      const h = m.health ?? {};
+      if (h.healthy === true && h.lifecycle !== "Deprecated") {
+        if (m.id) healthyById.add(m.id);
+        if (m.ericai_backend_id) healthyById.add(m.ericai_backend_id);
+      }
+    }
+    // Only apply the healthy gate when model-health responded with data (so
+    // a health endpoint that errors out doesn't ghost the picker).
+    if (healthyById.size > 0) {
+      const modelsResp = await fetch(`${baseUrl}/v1/models`, { signal: AbortSignal.timeout(3000) });
+      if (!modelsResp.ok) return;
+      const modelsBody = await modelsResp.json() as { data?: Array<{ id?: string; tags?: string[] }> };
+      const ids = filterProxyModelsForPicker(modelsBody.data ?? [], healthyById);
+      if (ids.length > 0) {
+        proxyModelsCache = ids.map((id) => ({ id, name: id }));
+        logger.info(`Discovered ${ids.length} healthy coding/near_sota models from proxy`);
+      }
     }
   } catch {
     // Proxy unreachable — settings.json remains the model source

@@ -125,13 +125,15 @@ describe("slash commands & estimator", () => {
     expect(text).toContain(`**Session:** \`${sid}\``);
   });
 
-  it("/goal with empty arg returns an error message, not a turn", async () => {
+  it("/goal with empty arg shows status, not a turn", async () => {
     const sid = await newSession();
     await prompt(sid, "/goal");
 
     const calls = (conn.sessionUpdate as any).mock.calls;
     const msg = calls.find((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk");
-    expect(msg[0].update.content.text).toMatch(/requires \[.+\]/);
+    // /goal with no argument shows the current goal status (or "**Goal:** none"
+    // when no goal is set) — matches Claude Code CLI behavior (1442197).
+    expect(msg[0].update.content.text).toMatch(/^\*\*Goal:\*\*/);
     // No streaming turn should have been started for an empty /goal.
     expect(capturedOnEvent).toBeNull();
   });
