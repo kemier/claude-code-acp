@@ -219,6 +219,73 @@ export function getAvailableModelsFromSettings(): Array<{ id: string; name: stri
   return unique.map((id) => ({ id, name: id }));
 }
 
+/**
+ * Cached proxy model discovery result. Populated by discoverProxyModels()
+ * and used as a fallback when settings.json has no explicit model list
+ * (CLAUDE_ACP_AVAILABLE_MODELS not set).
+ */
+let proxyModelsCache: Array<{ id: string; name: string }> | null = null;
+
+/**
+ * Fetch the available model list from the proxy's /v1/models endpoint.
+ * The proxy filters this to only show chat models that are currently
+ * loaded by the vLLM backend. Called during session initialization so
+ * the picker can show new models without editing settings.json.
+ *
+ * Safe to call multiple times — returns the cached result after the first
+ * successful fetch. A failed fetch leaves the cache null so settings.json
+ * remains the fallback.
+ */
+export async function discoverProxyModels(): Promise<void> {
+  if (proxyModelsCache) return;
+  try {
+    const baseUrl =
+      process.env.ERICAI_PROXY_URL ||
+      process.env.ERICAI_PROXY_BASE_URL ||
+      "http://127.0.0.1:8317";
+    const url = `${baseUrl}/v1/models`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(3000) });
+    if (!resp.ok) return;
+    const body = await resp.json() as { data?: Array<{ id?: string }> };
+    const ids = (body.data ?? [])
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    if (ids.length > 0) {
+      proxyModelsCache = ids.sort().map((id) => ({ id, name: id }));
+      logger.info(`Discovered ${ids.length} models from proxy /v1/models`);
+    }
+  } catch {
+    // Proxy unreachable — settings.json remains the model source
+  }
+}
+
+/**
+ * Get available models, preferring settings.json, falling back to the
+ * proxy's /v1/models endpoint (if discoverProxyModels was called).
+ * Throws if no models are configured.
+ */
+export function getAvailableModels(): Array<{ id: string; name: string }> {
+  // If CLAUDE_ACP_AVAILABLE_MODELS is explicitly set, use it (highest priority)
+  if (getClaudeEnv(AVAILABLE_MODELS_ENV_KEY)) {
+    return getAvailableModelsFromSettings();
+  }
+
+  // If any model env keys are set, use settings-based list
+  const hasModelEnv = MODEL_ENV_KEYS.some((key) => getClaudeEnv(key));
+  const hasTopLevelModel = loadClaudeSettings().model;
+  if (hasModelEnv || hasTopLevelModel) {
+    return getAvailableModelsFromSettings();
+  }
+
+  // No models in settings — use proxy discovery cache
+  if (proxyModelsCache && proxyModelsCache.length > 0) {
+    return proxyModelsCache;
+  }
+
+  // Last resort: try settings (will throw with a helpful message)
+  return getAvailableModelsFromSettings();
+}
+
 /** Default effort from settings (`effortLevel`), if present. */
 export function getDefaultEffortFromSettings(): string | undefined {
   return loadClaudeSettings().effortLevel;

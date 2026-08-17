@@ -30,7 +30,8 @@ import { SessionStore, type SessionInfo } from "./session-store.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import {
-  getAvailableModelsFromSettings,
+  discoverProxyModels,
+  getAvailableModels,
   getClaudeEnv,
   getDefaultEffortFromSettings,
   getDefaultModelFromSettings,
@@ -1159,7 +1160,7 @@ function buildReviewTurnPrompt(diffCommand: string, scope: string): string {
 }
 
 function buildConfigOptions(store: SessionStore, sessionId: string) {
-  const availableModels = getAvailableModelsFromSettings();
+  const availableModels = getAvailableModels();
   const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
   let currentModel = modelOverride || getDefaultModelFromSettings();
   // Picker options come strictly from settings/env. If the resolved default is
@@ -2167,6 +2168,10 @@ export function createClaudeCodeAgent(
       logger.info(
         `Session created: ${sessionId} (cwd: ${resolvedCwd}, mcpServers: ${mcpServers.length})`
       );
+
+      // Discover available models from the proxy so the picker shows
+      // newly-added models without requiring settings.json updates.
+      await discoverProxyModels();
 
       // Send available_commands_update notification so vscode-acp picks up
       // the slash commands. vscode-acp's SessionManager ignores the
