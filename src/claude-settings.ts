@@ -252,8 +252,11 @@ export function filterProxyModelsForPicker(
       const tags = Array.isArray(m.tags) ? m.tags : [];
       return {
         id: m.id ?? "",
-        isCoding: (tags.includes("coding") || tags.includes("near_sota"))
-          && !tags.includes("fast"),
+        // Show any coding-tagged model (agent mainline) and any healthy
+        // flagship (near_sota): a model like deepseek-v4-flash carries the
+        // fast tag on top of coding/near_sota and must NOT be hidden by it.
+        // Fast-only chat models (gpt-oss-120b) still fail this test.
+        isCoding: tags.includes("coding") || tags.includes("near_sota"),
         isHealthy: m.id ? healthById.has(m.id) : false,
       };
     })

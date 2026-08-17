@@ -244,7 +244,7 @@ describe("filterProxyModelsForPicker", () => {
     "glm-5.2",
   ]);
 
-  it("keeps coding-tagged models without the fast tag", () => {
+  it("keeps coding-tagged models even when they also carry the fast tag", () => {
     const ids = filterProxyModelsForPicker(
       [
         { id: "Qwen3-Coder-480B", tags: ["fast", "coding"] },
@@ -252,7 +252,7 @@ describe("filterProxyModelsForPicker", () => {
       ],
       health,
     );
-    expect(ids).toEqual(["Qwen3.8-27B-FP8-1M"]);
+    expect(ids).toEqual(["Qwen3-Coder-480B", "Qwen3.8-27B-FP8-1M"]);
   });
 
   it("keeps near_sota models (flagship, e.g. deepseek-v4-flash, glm-5.2)", () => {
