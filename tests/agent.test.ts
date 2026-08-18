@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { createClaudeCodeAgent } from "../src/agent.js";
+import { createClaudeCodeAgent, acpImageBlocksToStdinBlocks } from "../src/agent.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+
+// Captured runner calls for routing assertions (see mock below).
+const capturedRunnerCalls: Array<{
+  kind: string;
+  prompt?: string;
+  content?: unknown[];
+}> = [];
 
 // Mock node:fs so SessionStore doesn't read real persisted sessions
 vi.mock("node:fs", () => ({
@@ -28,14 +35,30 @@ vi.mock("../src/claude-runner.js", () => {
       text: "Continued response",
       sessionId: "claude-uuid-abc",
     });
+    this.startSessionStreamingWithContent = vi.fn().mockImplementation(
+      async (_cwd: string, _content: unknown[], onEvent: (e: any) => void) => {
+        capturedRunnerCalls.push({ kind: "startWithContent", content: _content });
+        onEvent({ type: "text_delta", text: "Streamed with content" });
+        return { text: "Streamed with content", sessionId: "claude-uuid-abc" };
+      }
+    );
+    this.continueSessionStreamingWithContent = vi.fn().mockImplementation(
+      async (_sessionId: string, _content: unknown[], onEvent: (e: any) => void) => {
+        capturedRunnerCalls.push({ kind: "continueWithContent", content: _content });
+        onEvent({ type: "text_delta", text: "Continued with content" });
+        return { text: "Continued with content", sessionId: "claude-uuid-abc" };
+      }
+    );
     this.startSessionStreaming = vi.fn().mockImplementation(
-      async (_cwd: string, _prompt: string, onEvent: (e: any) => void) => {
+      async (_cwd: string, prompt: string, onEvent: (e: any) => void) => {
+        capturedRunnerCalls.push({ kind: "start", prompt });
         onEvent({ type: "text_delta", text: "Streamed response" });
         return { text: "Streamed response", sessionId: "claude-uuid-abc" };
       }
     );
     this.continueSessionStreaming = vi.fn().mockImplementation(
-      async (_sessionId: string, _prompt: string, onEvent: (e: any) => void) => {
+      async (_sessionId: string, prompt: string, onEvent: (e: any) => void) => {
+        capturedRunnerCalls.push({ kind: "continue", prompt });
         onEvent({ type: "text_delta", text: "Continued streamed" });
         return { text: "Continued streamed", sessionId: "claude-uuid-abc" };
       }
@@ -63,6 +86,7 @@ describe("ClaudeCodeAgent", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    capturedRunnerCalls.length = 0;
     conn = createMockConnection();
     agent = createClaudeCodeAgent(conn);
   });
@@ -79,6 +103,18 @@ describe("ClaudeCodeAgent", () => {
       expect(result.agentInfo?.name).toBe("claude-code-acp");
       expect(result.agentCapabilities).toBeDefined();
       expect(result.agentCapabilities?.loadSession).toBe(true);
+    });
+
+    it("should advertise image prompt capability", async () => {
+      const result = await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+
+      expect(
+        result.agentCapabilities?.promptCapabilities as unknown as { image: boolean }
+      ).toMatchObject({ image: true });
     });
 
     it("should advertise no auth methods", async () => {
@@ -207,6 +243,69 @@ describe("ClaudeCodeAgent", () => {
       // Verify sessionUpdate was called for both prompts
       expect((conn.sessionUpdate as any).mock.calls.length).toBeGreaterThanOrEqual(2);
     });
+
+    it("should route an image prompt through startSessionStreamingWithContent", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+
+      const result = await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [
+          { type: "text", text: "What's in this picture?" },
+          {
+            type: "image",
+            data: "aGVsbG8=",
+            mimeType: "image/png",
+          },
+        ],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+      // The stream-json stdin path must be used (not the text-only one).
+      const withContentCalls = capturedRunnerCalls.filter(
+        (c) => c.kind === "startWithContent"
+      );
+      expect(withContentCalls).toHaveLength(1);
+      expect(capturedRunnerCalls.some((c) => c.kind === "start")).toBe(false);
+
+      // The image block must be forwarded as an Anthropic image block.
+      expect(withContentCalls[0].content).toEqual([
+        { type: "text", text: "What's in this picture?" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+        },
+      ]);
+    });
+
+    it("should keep text-only prompts on startSessionStreaming", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+
+      await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [{ type: "text", text: "Just text" }],
+      });
+
+      expect(capturedRunnerCalls.filter((c) => c.kind === "start")).toHaveLength(1);
+      expect(
+        capturedRunnerCalls.some((c) => c.kind === "startWithContent")
+      ).toBe(false);
+    });
   });
 
   describe("cancel", () => {
@@ -215,5 +314,57 @@ describe("ClaudeCodeAgent", () => {
         agent.cancel({ sessionId: "some-session" })
       ).resolves.not.toThrow();
     });
+  });
+});
+
+describe("acpImageBlocksToStdinBlocks", () => {
+  it("returns an empty array when there are no image blocks", () => {
+    expect(acpImageBlocksToStdinBlocks([])).toEqual([]);
+    expect(acpImageBlocksToStdinBlocks([{ type: "text", text: "hi" }])).toEqual([]);
+  });
+
+  it("converts a single image block to an Anthropic image source", () => {
+    expect(
+      acpImageBlocksToStdinBlocks([
+        { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      ])
+    ).toEqual([
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+      },
+    ]);
+  });
+
+  it("defaults mimeType to image/png when omitted", () => {
+    const out = acpImageBlocksToStdinBlocks([{ type: "image", data: "QUJD" }]);
+    expect(out[0]?.source).toMatchObject({ media_type: "image/png" });
+  });
+
+  it("skips image blocks with empty/missing base64 data", () => {
+    expect(
+      acpImageBlocksToStdinBlocks([
+        { type: "image", data: "" },
+        { type: "image", data: undefined },
+        { type: "image", data: "aGk=", mimeType: "image/webp" },
+      ])
+    ).toEqual([
+      {
+        type: "image",
+        source: { type: "base64", media_type: "image/webp", data: "aGk=" },
+      },
+    ]);
+  });
+
+  it("keeps image order and ignores non-image blocks", () => {
+    const out = acpImageBlocksToStdinBlocks([
+      { type: "text", text: "ignore me" },
+      { type: "image", data: "QUJD", mimeType: "image/jpeg" },
+      { type: "resource_link", uri: "file:///x" as unknown as string, name: "x" },
+      { type: "image", data: "REVG", mimeType: "image/png" },
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0]?.source).toMatchObject({ media_type: "image/jpeg", data: "QUJD" });
+    expect(out[1]?.source).toMatchObject({ media_type: "image/png", data: "REVG" });
   });
 });

@@ -53,6 +53,36 @@ function createStreamMockProcess(lines: string[], exitCode = 0): ChildProcess {
   return proc;
 }
 
+// Mock process for the stdin stream-json path. Captures whatever JSON line is
+// written to stdin so tests can assert the exact SDK user message format.
+function createStdinMockProcess(
+  lines: string[],
+  exitCode = 0
+): ChildProcess & { capturedStdin: () => string } {
+  const proc = new EventEmitter() as ChildProcess & EventEmitter;
+  const stdout = new EventEmitter();
+  const stderr = new EventEmitter();
+  const stdin = new EventEmitter() as EventEmitter & { end: (s?: string) => void };
+  let stdinData = "";
+  stdin.end = (s?: string) => {
+    if (s) stdinData += s;
+  };
+  (proc as any).stdout = stdout;
+  (proc as any).stderr = stderr;
+  (proc as any).stdin = stdin;
+  (proc as any).pid = 12345;
+  (proc as any).kill = vi.fn(() => true);
+
+  setTimeout(() => {
+    for (const line of lines) {
+      stdout.emit("data", Buffer.from(line + "\n"));
+    }
+    setTimeout(() => proc.emit("close", exitCode), 5);
+  }, 5);
+
+  return proc as ChildProcess & { capturedStdin: () => string };
+}
+
 describe("ClaudeRunner", () => {
   let runner: ClaudeRunner;
 
@@ -175,6 +205,86 @@ describe("ClaudeRunner", () => {
       expect(textEvents[0].text).toBe("chunk1");
       expect(textEvents[1].text).toBe("chunk2");
       expect(result.sessionId).toBe("sess-789");
+    });
+  });
+
+  describe("startSessionStreamingWithContent", () => {
+    it("should write an SDK user message JSON line to stdin", async () => {
+      const outLines = [
+        JSON.stringify({ type: "result", result: "OK", session_id: "sess-img" }),
+      ];
+      const proc = createStdinMockProcess(outLines);
+      mockSpawn.mockReturnValue(proc as any);
+
+      const stdinData: string[] = [];
+      (proc as any).stdin.end = (s?: string) => {
+        if (s) stdinData.push(s);
+      };
+
+      const result = await runner.startSessionStreamingWithContent(
+        "/tmp",
+        [
+          { type: "text", text: "what's this?" },
+          {
+            type: "image",
+            source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+          },
+        ],
+        () => {}
+      );
+
+      expect(result.sessionId).toBe("sess-img");
+      // Must pass --input-format=stream-json and NOT -p <string>.
+      const args = mockSpawn.mock.calls[0][1] as string[];
+      expect(args).toContain("--input-format");
+      expect(args).toContain("stream-json");
+      expect(args).not.toContain("what's this?");
+
+      const sent = stdinData.join("");
+      const parsed = JSON.parse(sent.trim());
+      expect(parsed.type).toBe("user");
+      expect(parsed.message?.role).toBe("user");
+      expect(parsed.message?.content).toEqual([
+        { type: "text", text: "what's this?" },
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+        },
+      ]);
+      expect(parsed.parent_tool_use_id).toBeNull();
+    });
+  });
+
+  describe("continueSessionStreamingWithContent", () => {
+    it("should write --resume and an SDK user message to stdin", async () => {
+      const outLines = [
+        JSON.stringify({ type: "result", result: "Continue", session_id: "sess-resume" }),
+      ];
+      const proc = createStdinMockProcess(outLines);
+      mockSpawn.mockReturnValue(proc as any);
+
+      const stdinData: string[] = [];
+      (proc as any).stdin.end = (s?: string) => {
+        if (s) stdinData.push(s);
+      };
+
+      const result = await runner.continueSessionStreamingWithContent(
+        "abc-123",
+        [{ type: "text", text: "more" }],
+        () => {}
+      );
+
+      expect(result.sessionId).toBe("sess-resume");
+      const args = mockSpawn.mock.calls[0][1] as string[];
+      expect(args).toContain("--resume");
+      expect(args).toContain("abc-123");
+      expect(args).toContain("--input-format");
+      expect(args).toContain("stream-json");
+
+      const sent = stdinData.join("");
+      const parsed = JSON.parse(sent.trim());
+      expect(parsed.type).toBe("user");
+      expect(parsed.message?.content).toEqual([{ type: "text", text: "more" }]);
     });
   });
 

@@ -57,6 +57,35 @@ function nextCommandMessageId(): string {
   return `cmd_msg_${++commandMessageCounter}`;
 }
 
+/**
+ * Converts ACP `image` content blocks into Claude SDK stdin image blocks
+ * (Anthropic Messages API shape) for the `--input-format=stream-json` path.
+ *
+ * ACP `ImageContent` carries base64 `data` + `mimeType`; the CLI's SDK input
+ * expects `{"type":"image","source":{"type":"base64","media_type":...,"data":...}}`.
+ * Blocks with missing/empty base64 data are skipped (best-effort), matching
+ * ericli's `extractPromptImages` behavior.
+ */
+export function acpImageBlocksToStdinBlocks(
+  blocks: ReadonlyArray<{ type: string; data?: unknown; mimeType?: string | null }>,
+): import("./claude-runner.js").StdinContentBlock[] {
+  const out: import("./claude-runner.js").StdinContentBlock[] = [];
+  for (const block of blocks) {
+    if (block.type !== "image") continue;
+    const data = block.data;
+    if (typeof data !== "string" || data.length === 0) continue;
+    const mediaType =
+      typeof block.mimeType === "string" && block.mimeType.length > 0
+        ? block.mimeType
+        : "image/png";
+    out.push({
+      type: "image",
+      source: { type: "base64", media_type: mediaType, data },
+    });
+  }
+  return out;
+}
+
 const AVAILABLE_MODES = [
   { id: "read-only", name: "Read-only", description: "Requires approval to edit files and run commands." },
   { id: "agent", name: "Agent", description: "Read and edit files, and run commands." },
@@ -2108,7 +2137,10 @@ export function createClaudeCodeAgent(
         agentCapabilities: {
           loadSession: true,
          promptCapabilities: {
-            image: false,
+            // Image support is enabled: `image` ACP content blocks are
+            // forwarded to the CLI via --input-format=stream-json (see
+            // acpImageBlocksToStdinBlocks + the WithContent runner methods).
+            image: true,
             audio: false,
             embeddedContext: false,
           },
@@ -2630,6 +2662,14 @@ export function createClaudeCodeAgent(
       if (!text.trim()) {
         throw RequestError.invalidParams("Empty prompt text");
       }
+
+      // Extract image content blocks (base64 media) for the multimodal stdin
+      // path. When present, the LLM turn below is sent via the Claude CLI's
+      // `--input-format=stream-json` protocol so vision-capable models
+      // actually receive the pictures. Text-only prompts keep using the
+      // `-p <string>` path unchanged (zero behavior change).
+      const promptImages = acpImageBlocksToStdinBlocks(prompt);
+      const hasImages = promptImages.length > 0;
 
       // Serialize against any in-flight prompt on this session. See
       // sessionPromptLocks above: the SDK runs concurrent prompt() handlers,
@@ -3384,35 +3424,65 @@ export function createClaudeCodeAgent(
         // the resume below targets the compacted conversation when compaction
         // ran, and the original when it didn't.
         const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
+        const turnContent: import("./claude-runner.js").StdinContentBlock[] = hasImages
+          ? [{ type: "text", text: effectivePrompt }, ...promptImages]
+          : [];
         if (claudeSessionIdForTurn) {
           try {
-            result = await runner.continueSessionStreaming(
-              claudeSessionIdForTurn,
-              effectivePrompt,
-              onEvent,
-              sessionId,
-              modelOverride,
-              effectiveEffort
-            );
+            result = hasImages
+              ? await runner.continueSessionStreamingWithContent(
+                  claudeSessionIdForTurn,
+                  turnContent,
+                  onEvent,
+                  sessionId,
+                  modelOverride,
+                  effectiveEffort
+                )
+              : await runner.continueSessionStreaming(
+                  claudeSessionIdForTurn,
+                  effectivePrompt,
+                  onEvent,
+                  sessionId,
+                  modelOverride,
+                  effectiveEffort
+                );
           } catch (resumeErr) {
             // Resume failed (expired session, etc.) — fall back to new session
             logger.warn(
               `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
             );
             store.clearPersistedSession(cwd);
-            result = await runner.startSessionStreaming(
+            result = hasImages
+              ? await runner.startSessionStreamingWithContent(
+                  cwd,
+                  turnContent,
+                  onEvent,
+                  sessionId,
+                  modelOverride,
+                  effectiveEffort
+                )
+              : await runner.startSessionStreaming(
+                  cwd,
+                  effectivePrompt,
+                  onEvent,
+                  sessionId,
+                  modelOverride,
+                  effectiveEffort
+                );
+            store.setClaudeSessionId(sessionId, result.sessionId);
+          }
+        } else {
+          const mcpServers = store.getMcpServers(sessionId);
+          if (hasImages) {
+            result = await runner.startSessionStreamingWithContent(
               cwd,
-              effectivePrompt,
+              turnContent,
               onEvent,
               sessionId,
               modelOverride,
               effectiveEffort
             );
-            store.setClaudeSessionId(sessionId, result.sessionId);
-          }
-        } else {
-          const mcpServers = store.getMcpServers(sessionId);
-          if (mcpServers.length > 0) {
+          } else if (mcpServers.length > 0) {
             result = await runner.startSessionWithMcp(
               cwd,
               text,
@@ -3562,14 +3632,28 @@ export function createClaudeCodeAgent(
            logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
            const claudeSid = store.getClaudeSessionId(sessionId);
            if (claudeSid) {
-             const continueResult = await runner.continueSessionStreaming(
-               claudeSid,
-               effectivePrompt,
-               onEvent,
-               sessionId,
-               modelOverride,
-               effectiveEffort,
-             );
+             // Preserve accompanying images (if any) when re-sending the
+             // original prompt after compaction.
+             const reSendContent: import("./claude-runner.js").StdinContentBlock[] = hasImages
+               ? [{ type: "text", text: effectivePrompt }, ...promptImages]
+               : [];
+             const continueResult = hasImages
+               ? await runner.continueSessionStreamingWithContent(
+                   claudeSid,
+                   reSendContent,
+                   onEvent,
+                   sessionId,
+                   modelOverride,
+                   effectiveEffort,
+                 )
+               : await runner.continueSessionStreaming(
+                   claudeSid,
+                   effectivePrompt,
+                   onEvent,
+                   sessionId,
+                   modelOverride,
+                   effectiveEffort,
+                 );
              store.setClaudeSessionId(sessionId, continueResult.sessionId);
              await Promise.all(permissionPromises);
              // Update usage after continuation

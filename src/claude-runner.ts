@@ -20,6 +20,29 @@ export interface ClaudeResult {
   sessionId: string;
 }
 
+/**
+ * A user message content block following the Anthropic Messages API schema,
+ * sent to the Claude CLI via `--input-format=stream-json` on stdin.
+ *
+ * The CLI's SDK input layer accepts the same content blocks as the Messages
+ * API: `text`, `image` (with `source`), `tool_result`, `document`, etc. Only
+ * `text` and `image` are used by this bridge today, but the union is kept
+ * open so future media types need no type churn.
+ */
+export type StdinContentBlock =
+  | { type: "text"; text: string }
+  | {
+      type: "image";
+      source: {
+        type: "base64";
+        media_type: string;
+        data: string;
+      };
+    }
+  | { type: "tool_result"; tool_use_id?: string; content: string }
+  | { type: "document"; source: { type: "base64"; media_type: string; data: string } }
+  | { type: string; [key: string]: unknown };
+
 export interface StreamEvent {
   type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user";
  text?: string;
@@ -177,6 +200,73 @@ export class ClaudeRunner {
       ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
     return this.runStreaming(args, cwd, onEvent, trackingId);
+  }
+
+  /**
+   * Starts a new session with a multimodal user message via the Claude CLI's
+   * `--input-format=stream-json` stdin protocol. Unlike the plain-string
+   * `startSessionStreaming`, the message may contain `image` content blocks,
+   * which the CLI forwards to vision-capable models.
+   *
+   * Backward compatible: callers that only pass text can keep using
+   * `startSessionStreaming`; this method is only required when an image is
+   * present in the ACP prompt.
+   */
+  async startSessionStreamingWithContent(
+    cwd: string,
+    content: StdinContentBlock[],
+    onEvent: (event: StreamEvent) => void,
+    trackingId?: string,
+    modelOverride?: string,
+    effortOverride?: string
+  ): Promise<ClaudeResult> {
+    const args = this.buildStreamJsonArgs(undefined, modelOverride, effortOverride);
+    return this.runStreamingJsonLine(args, cwd, content, onEvent, trackingId);
+  }
+
+  /**
+   * Continues a session with a multimodal user message. See
+   * `startSessionStreamingWithContent` for why this exists.
+   */
+  async continueSessionStreamingWithContent(
+    claudeSessionId: string,
+    content: StdinContentBlock[],
+    onEvent: (event: StreamEvent) => void,
+    trackingId?: string,
+    modelOverride?: string,
+    effortOverride?: string
+  ): Promise<ClaudeResult> {
+    const args = this.buildStreamJsonArgs(claudeSessionId, modelOverride, effortOverride);
+    return this.runStreamingJsonLine(args, undefined, content, onEvent, trackingId);
+  }
+
+  /**
+   * Builds the CLI argv for the stream-json stdin input path. Mirrors the
+   * plain-string streaming args, plus `--input-format=stream-json` (required
+   * for stdin JSON messages) — and omits `-p`/`--print <prompt>`, since the
+   * message now arrives as a JSON line on stdin instead.
+   */
+  private buildStreamJsonArgs(
+    claudeSessionId?: string,
+    modelOverride?: string,
+    effortOverride?: string
+  ): string[] {
+    const args: string[] = [
+      "-p",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      // Emit per-token deltas (wrapped in `stream_event`) so assistant text
+      // renders progressively instead of landing as one large chunk.
+      "--include-partial-messages",
+    ];
+    if (claudeSessionId) {
+      args.push("--resume", claudeSessionId);
+    }
+    args.push(...this.buildExtraArgs(modelOverride, effortOverride));
+    return args;
   }
 
   async continueSessionStreaming(
@@ -423,6 +513,120 @@ export class ClaudeRunner {
         // the follow-up prompt resumes correctly. Rejecting here would
         // make continueSessionStreaming's catch wipe the session id and
         // start fresh — losing all conversation history.
+        if (wasCancelled) {
+          resolve({ text: resultText, sessionId });
+          return;
+        }
+
+        if (code !== 0 && code !== null) {
+          reject(new Error(`claude exited with code ${code}`));
+          return;
+        }
+
+        resolve({ text: resultText, sessionId });
+      });
+
+      proc.on("error", reject);
+    });
+  }
+
+  /**
+   * Runs `claude` with the stream-json stdin input protocol: spawns with
+   * `--input-format=stream-json`, writes a single SDK `user` message JSON line
+   * to stdin (matching the format the CLI's `--input-format=stream-json`
+   * consumes — see directConnectManager.sendMessage in Claude Code's source),
+   * then streams the output exactly like `runStreaming`.
+   *
+   * The JSON envelope is:
+   *   {"type":"user","message":{"role":"user","content":<blocks>},
+   *    "parent_tool_use_id":null,"session_id":""}
+   *
+   * `content` blocks follow the Anthropic Messages API schema, so an image is
+   *   {"type":"image","source":{"type":"base64","media_type":...,"data":...}}
+   *
+   * The stdin handle is closed after the write: with `--print` the CLI treats
+   * a closed stdin as "no more input events", so a single-turn session ends
+   * cleanly, and `--resume` batches as expected without hanging.
+   */
+  private runStreamingJsonLine(
+    args: string[],
+    cwd: string | undefined,
+    content: StdinContentBlock[],
+    onEvent: (event: StreamEvent) => void,
+    trackingId?: string
+  ): Promise<ClaudeResult> {
+    return new Promise((resolve, reject) => {
+      logger.debug(`spawn streaming-json: claude ${maskArgs(args)}`);
+      const proc = spawn("claude", args, {
+        cwd,
+        env: this.sanitizeEnv(),
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      if (trackingId) {
+        this.runningProcesses.set(trackingId, proc);
+      }
+
+      // Write the SDK user message as a single JSON line, then end stdin so the
+      // CLI's --print mode knows there are no further input events.
+      const message = JSON.stringify({
+        type: "user",
+        message: { role: "user", content },
+        parent_tool_use_id: null,
+        session_id: "",
+      });
+      proc.stdin!.end(message + "\n");
+
+      let buffer = "";
+      let resultText = "";
+      let sessionId = "";
+
+      proc.stdout!.on("data", (data: Buffer) => {
+        buffer += data.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const parsed = JSON.parse(line);
+            this.processStreamLine(parsed, onEvent);
+
+            if (parsed.session_id) {
+              sessionId = parsed.session_id;
+            }
+            if (parsed.result !== undefined) {
+              resultText = parsed.result;
+            }
+            if (parsed.type === "result") {
+              sessionId = parsed.session_id ?? sessionId;
+              resultText = parsed.result ?? resultText;
+            }
+          } catch {
+            // Skip unparseable lines
+          }
+        }
+      });
+
+      proc.on("close", (code) => {
+        if (trackingId) {
+          this.runningProcesses.delete(trackingId);
+        }
+        const wasCancelled = trackingId
+          ? this.cancelledProcesses.delete(trackingId)
+          : false;
+
+        if (buffer.trim()) {
+          try {
+            const parsed = JSON.parse(buffer);
+            this.processStreamLine(parsed, onEvent);
+            if (parsed.session_id) sessionId = parsed.session_id;
+            if (parsed.result !== undefined) resultText = parsed.result;
+          } catch {
+            // ignore
+          }
+        }
+
         if (wasCancelled) {
           resolve({ text: resultText, sessionId });
           return;
