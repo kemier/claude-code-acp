@@ -347,6 +347,83 @@ export function getAvailableModels(): Array<{ id: string; name: string }> {
   return getAvailableModelsFromSettings();
 }
 
+/**
+ * Raw model entries as advertised by the proxy's /v1/models endpoint.
+ */
+export interface ProxyModelEntry {
+  id: string;
+  tags?: string[];
+}
+
+/**
+ * Raw health entries as advertised by the proxy's /v1/model-health endpoint.
+ */
+export interface ProxyModelHealthEntry {
+  id?: string;
+  ericai_backend_id?: string;
+  health?: {
+    healthy?: boolean;
+    lifecycle?: string;
+    running_replicas?: number;
+    status?: string;
+  };
+}
+
+/**
+ * Apply the shared ACP picker gate to a raw proxy catalog, mirroring:
+ *  - ericli's `readProxyModelList` (healthy + lifecycle !== 'Deprecated')
+ *  - `hasPickerTags` in ericli (tags include `coding` OR `near_sota`)
+ *  - the `update_catalog.sh` "Picker gate shared with the ericli /
+ *    claude-code-acp pickers" filter used for the codex catalog
+ *
+ * Rationale (same as ericli): the raw /v1/models list contains Deprecated
+ * models and `fast`-only chat variants that must not appear in the picker —
+ * e.g. gpt-oss-120b (tags=['fast'], no coding/near_sota), Qwen3.6-27B
+ * (lifecycle=Deprecated). The health gate uses the model-health endpoint so
+ * scaled-to-zero / unloaded models stay out, and falls back to including a
+ * model when health data is absent (a health endpoint error must not empty
+ * the picker).
+ *
+ * @param models   entries from /v1/models
+ * @param health   entries from /v1/model-health (may be empty on error)
+ * @param allModelsKnownHealthy  when true, every model id in `models` is
+ *        treated as healthy (used when model-health returned no data — same
+ *        fallback ericli applies when `healthyById.size === 0`)
+ * @returns the picker-worthy model ids, order preserved from `models`
+ */
+export function filterPickerModels(
+  models: ProxyModelEntry[],
+  health: ProxyModelHealthEntry[],
+  allModelsKnownHealthy = false,
+): string[] {
+  // Build the set of healthy (non-Deprecated) ids from the health endpoint.
+  const healthyById = new Set<string>();
+  if (!allModelsKnownHealthy) {
+    for (const m of health) {
+      const h = m.health ?? {};
+      if (h.healthy === true && h.lifecycle !== "Deprecated") {
+        if (m.id) healthyById.add(m.id);
+        if (m.ericai_backend_id) healthyById.add(m.ericai_backend_id);
+      }
+    }
+  }
+
+  const out: string[] = [];
+  for (const m of models) {
+    if (!m.id) continue;
+    const tags = Array.isArray(m.tags) ? m.tags : [];
+    // Picker gate: healthy + non-Deprecated + coding/near_sota tag.
+    if (!(tags.includes("coding") || tags.includes("near_sota"))) continue;
+    // Strict health gate whenever the health endpoint returned any entries;
+    // the all-healthy fallback only applies when it returned nothing at all
+    // (a health-endpoint error must not ghost the picker, but a model that is
+    // genuinely reported unhealthy/Deprecated stays out).
+    if (!allModelsKnownHealthy && health.length > 0 && !healthyById.has(m.id)) continue;
+    out.push(m.id);
+  }
+  return out;
+}
+
 /** Default effort from settings (`effortLevel`), if present. */
 export function getDefaultEffortFromSettings(): string | undefined {
   return loadClaudeSettings().effortLevel;

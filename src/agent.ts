@@ -34,9 +34,13 @@ import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
   discoverProxyModels,
   getAvailableModels,
+  getAvailableModelsFromSettings,
   getClaudeEnv,
   getDefaultEffortFromSettings,
   getDefaultModelFromSettings,
+  filterPickerModels,
+  type ProxyModelEntry,
+  type ProxyModelHealthEntry,
 } from "./claude-settings.js";
 import {
   validateCwd,
@@ -523,6 +527,86 @@ export async function loadModelContextWindows(): Promise<void> {
     }
   })();
   return modelContextWindowsLoadPromise;
+}
+
+// ─── Dynamic proxy model picker list ──────────────────────────────────────
+// By default the ACP model picker advertises the static list from
+// ~/.claude/settings.json (CLAUDE_ACP_AVAILABLE_MODELS), which can drift from
+// the live proxy catalog (e.g. gpt-oss-120b / Qwen3.6-27B hardcoded while the
+// proxy deprecates them, and healthy multimodal models like Qwen3.8-27B-FP8-1M
+// never added). Setting CLAUDE_ACP_PROXY_MODELS=1 flips the picker to the live
+// proxy catalog (/v1/models + /v1/model-health) filtered through the SAME gate
+// the codex catalog and ericli pickers use (healthy + non-Deprecated +
+// coding/near_sota tag), so all four agents agree on the picker. When the
+// proxy list is unavailable or empty, the picker falls back to the static
+// settings list so a proxy outage never empties the dropdown.
+const PROXY_MODELS_ENV = "CLAUDE_ACP_PROXY_MODELS";
+
+let proxyPickerModels: Array<{ id: string; name: string }> | null = null;
+let proxyPickerModelsPromise: Promise<void> | null = null;
+
+/**
+ * Fetch the live proxy catalog and filter it through the shared picker gate.
+ * Result is cached in `proxyPickerModels`; a failed fetch leaves it null so
+ * the next call retries. Throws when disabled (CLAUDE_ACP_PROXY_MODELS != "1")
+ * so callers can skip gracefully.
+ */
+export async function loadProxyPickerModels(): Promise<void> {
+  if (process.env[PROXY_MODELS_ENV] !== "1") return; // opt-in (tests stay hermetic)
+  if (proxyPickerModelsPromise) return proxyPickerModelsPromise;
+  proxyPickerModelsPromise = (async () => {
+    try {
+      const base = getProxyBaseUrl();
+      const [modelsResp, healthResp] = await Promise.all([
+        fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(5000) }),
+        fetch(`${base}/v1/model-health`, { signal: AbortSignal.timeout(5000) }),
+      ]);
+      let models: ProxyModelEntry[] = [];
+      if (modelsResp.ok) {
+        const body = (await modelsResp.json()) as { data?: ProxyModelEntry[] };
+        models = body.data ?? [];
+      }
+      let health: ProxyModelHealthEntry[] = [];
+      let healthOk = false;
+      if (healthResp.ok) {
+        const body = (await healthResp.json()) as { data?: ProxyModelHealthEntry[] };
+        health = body.data ?? [];
+        healthOk = true;
+      }
+      // When model-health returned no data, treat every catalog model as
+      // healthy so a health-endpoint error doesn't ghost the picker (mirrors
+      // ericli's `healthyById.size === 0` fallback). The tag gate still applies.
+      const ids = filterPickerModels(models, health, !healthOk || health.length === 0);
+      logger.info(
+        `Loaded ${ids.length} picker models from proxy` +
+          (process.env[PROXY_MODELS_ENV] === "1" ? " (dynamic)" : ""),
+      );
+      proxyPickerModels = ids.map((id) => ({ id, name: id }));
+    } catch (err) {
+      proxyPickerModels = null;
+      logger.warn(
+        `Could not load picker models from proxy: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      proxyPickerModelsPromise = null;
+    }
+  })();
+  return proxyPickerModelsPromise;
+}
+
+/**
+ * The models to advertise in the ACP picker.
+ *
+ * When CLAUDE_ACP_PROXY_MODELS=1 and the proxy list has loaded, that live
+ * filtered list wins. Otherwise (flag off, still loading, or proxy
+ * unreachable) fall back to the static settings list — the pre-existing
+ * behaviour — so an outage never empties the picker.
+ */
+function getPickerModelList(): Array<{ id: string; name: string }> {
+  if (process.env[PROXY_MODELS_ENV] === "1" && proxyPickerModels) {
+    return proxyPickerModels;
+  }
+  return getAvailableModelsFromSettings();
 }
 
 /**
@@ -1484,7 +1568,8 @@ function buildReviewTurnPrompt(diffCommand: string, scope: string): string {
 }
 
 function buildConfigOptions(store: SessionStore, sessionId: string) {
-  const availableModels = getAvailableModels();
+  // Dynamic proxy-filtered list when enabled, else the static settings list.
+  const availableModels = getPickerModelList();
   const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
   let currentModel = modelOverride || getDefaultModelFromSettings();
   // Picker options come strictly from settings/env. If the resolved default is
@@ -3218,6 +3303,7 @@ export function createClaudeCodeAgent(
       // in getContextWindowForModel already populate the map; this just nudges an
       // in-flight load along if the proxy wasn't reachable at spawn.
       void loadModelContextWindows();
+      void loadProxyPickerModels();
       // Only pass effort if the selected model actually supports it; otherwise
       // fall back to the model's default effort. Using resolveEffort() keeps
       // the actually-sent effort consistent with what the picker shows and
@@ -3558,6 +3644,7 @@ export function createClaudeCodeAgent(
         }
         if (!modelContextWindows.has(cwModel)) {
           void loadModelContextWindows();
+          void loadProxyPickerModels();
         }
       }
       // Log the stop reason so premature turn termination (end_turn vs

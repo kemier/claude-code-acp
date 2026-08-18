@@ -4,11 +4,16 @@ import {
   AgentSideConnection,
   ndJsonStream,
 } from "@agentclientprotocol/sdk";
-import { createClaudeCodeAgent, loadModelContextWindows } from "./agent.js";
+import {
+  createClaudeCodeAgent,
+  loadModelContextWindows,
+  loadProxyPickerModels,
+} from "./agent.js";
 import { logger } from "./logger.js";
 
 export { createClaudeCodeAgent } from "./agent.js";
 export { loadModelContextWindows } from "./agent.js";
+export { loadProxyPickerModels } from "./agent.js";
 export { ClaudeRunner } from "./claude-runner.js";
 export { SessionStore } from "./session-store.js";
 export type { SessionInfo } from "./session-store.js";
@@ -33,6 +38,10 @@ export function startAgent(): AgentSideConnection {
   // Fetch per-model context windows from ericai-proxy /v1/models.
   // Non-blocking — falls back to 200k default if the proxy is unreachable.
   loadModelContextWindows().catch(() => {});
+  // Fetch the live proxy catalog for the dynamic model picker when enabled
+  // (CLAUDE_ACP_PROXY_MODELS=1). Non-blocking — the picker falls back to the
+  // static settings list until the fetch resolves.
+  loadProxyPickerModels().catch(() => {});
 
   connection.closed.then(() => {
     logger.info("Connection closed.");
