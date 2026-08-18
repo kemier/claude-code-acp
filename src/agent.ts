@@ -1572,9 +1572,23 @@ function buildConfigOptions(store: SessionStore, sessionId: string) {
   return configOptions;
 }
 
+export interface ClaudeCodeAgentOptions {
+  /**
+   * How long to wait (ms) at turn end for pending subagent
+   * <task-notification> messages to arrive before marking them completed as
+   * a fallback. Real Claude awaits subagents before ending the turn;
+   * GLM/EricAI ends the turn early and the notifications land within 1-5s.
+   * Overridable so tests can avoid the full wait.
+   * @default 15000
+   */
+  pendingAgentWaitMs?: number;
+}
+
 export function createClaudeCodeAgent(
-  connection: AgentSideConnection
+  connection: AgentSideConnection,
+  options: ClaudeCodeAgentOptions = {}
 ): Agent {
+  const pendingAgentWaitMs = options.pendingAgentWaitMs ?? 15000;
   const store = new SessionStore();
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
@@ -4174,13 +4188,14 @@ export function createClaudeCodeAgent(
 
         // Bounded wait for pending subagents: the CLI ended the turn before all
         // subagent <task-notification> messages arrived. Real Claude awaits
-        // subagents before ending the turn; GLM/EricAI does not. Wait up to 15s
-        // for the remaining notifications — they often arrive within 1‑5s of the
-        // turn end. Only fall back to marking completed if the wait times out.
+        // subagents before ending the turn; GLM/EricAI does not. Wait up to
+        // `pendingAgentWaitMs` (default 15s) for the remaining notifications —
+        // they often arrive within 1‑5s of the turn end. Only fall back to
+        // marking completed if the wait times out.
         {
           const pendingAgentsTmp = sessionPendingAgents.get(sessionId);
           if (pendingAgentsTmp && pendingAgentsTmp.size > 0) {
-            const waitDeadline = Date.now() + 15000;
+            const waitDeadline = Date.now() + pendingAgentWaitMs;
             while (Date.now() < waitDeadline) {
               const stillPending = sessionPendingAgents.get(sessionId);
               if (!stillPending || stillPending.size === 0) break;
