@@ -546,13 +546,25 @@ let proxyPickerModels: Array<{ id: string; name: string }> | null = null;
 let proxyPickerModelsPromise: Promise<void> | null = null;
 
 /**
+ * Whether the dynamic proxy picker is enabled.
+ *
+ * Reads through `getClaudeEnv` so the flag works both when exported into the
+ * ACP parent process environment AND when set in the `env` block of
+ * ~/.claude/settings.json (which only reaches the Claude CLI subprocess; the
+ * ACP parent process never sees it in process.env).
+ */
+function isProxyModelsEnabled(): boolean {
+  return getClaudeEnv(PROXY_MODELS_ENV) === "1";
+}
+
+/**
  * Fetch the live proxy catalog and filter it through the shared picker gate.
  * Result is cached in `proxyPickerModels`; a failed fetch leaves it null so
  * the next call retries. Throws when disabled (CLAUDE_ACP_PROXY_MODELS != "1")
  * so callers can skip gracefully.
  */
 export async function loadProxyPickerModels(): Promise<void> {
-  if (process.env[PROXY_MODELS_ENV] !== "1") return; // opt-in (tests stay hermetic)
+  if (!isProxyModelsEnabled()) return; // opt-in (tests stay hermetic)
   if (proxyPickerModelsPromise) return proxyPickerModelsPromise;
   proxyPickerModelsPromise = (async () => {
     try {
@@ -579,7 +591,7 @@ export async function loadProxyPickerModels(): Promise<void> {
       const ids = filterPickerModels(models, health, !healthOk || health.length === 0);
       logger.info(
         `Loaded ${ids.length} picker models from proxy` +
-          (process.env[PROXY_MODELS_ENV] === "1" ? " (dynamic)" : ""),
+          (isProxyModelsEnabled() ? " (dynamic)" : ""),
       );
       proxyPickerModels = ids.map((id) => ({ id, name: id }));
     } catch (err) {
@@ -603,7 +615,7 @@ export async function loadProxyPickerModels(): Promise<void> {
  * behaviour — so an outage never empties the picker.
  */
 function getPickerModelList(): Array<{ id: string; name: string }> {
-  if (process.env[PROXY_MODELS_ENV] === "1" && proxyPickerModels) {
+  if (isProxyModelsEnabled() && proxyPickerModels) {
     return proxyPickerModels;
   }
   return getAvailableModelsFromSettings();
