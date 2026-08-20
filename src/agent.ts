@@ -546,6 +546,27 @@ let proxyPickerModels: Array<{ id: string; name: string }> | null = null;
 let proxyPickerModelsPromise: Promise<void> | null = null;
 
 /**
+ * Epoch ms of the last successful proxy picker refresh. Models can become
+ * healthy (scaled back up) after a session starts (e.g. glm-5.2), so a
+ * one-shot load at startup can leave a newly-healthy model out of the picker
+ * until the whole process restarts. A TTL lets subsequent refresh calls re-fetch
+ * so the picker catches up to the backend without hammering /v1/models.
+ */
+let lastProxyPickerModelsLoad = 0;
+const PROXY_PICKER_MODELS_TTL_MS = 30_000;
+
+/**
+ * Reset the module-level proxy picker cache. Used by tests so each case starts
+ * from a clean slate (the TTL would otherwise leak one test's successful load
+ * into the next within the same process).
+ */
+export function resetProxyPickerModelsCache(): void {
+  proxyPickerModels = null;
+  proxyPickerModelsPromise = null;
+  lastProxyPickerModelsLoad = 0;
+}
+
+/**
  * Whether the dynamic proxy picker is enabled.
  *
  * Reads through `getClaudeEnv` so the flag works both when exported into the
@@ -565,6 +586,11 @@ function isProxyModelsEnabled(): boolean {
  */
 export async function loadProxyPickerModels(): Promise<void> {
   if (!isProxyModelsEnabled()) return; // opt-in (tests stay hermetic)
+  // Within the TTL the cached list is still considered fresh, even if a
+  // prior fetch succeeded — avoid re-polling the proxy on every session op.
+  if (proxyPickerModels && Date.now() - lastProxyPickerModelsLoad < PROXY_PICKER_MODELS_TTL_MS) {
+    return;
+  }
   if (proxyPickerModelsPromise) return proxyPickerModelsPromise;
   proxyPickerModelsPromise = (async () => {
     try {
@@ -594,6 +620,7 @@ export async function loadProxyPickerModels(): Promise<void> {
           (isProxyModelsEnabled() ? " (dynamic)" : ""),
       );
       proxyPickerModels = ids.map((id) => ({ id, name: id }));
+      lastProxyPickerModelsLoad = Date.now();
     } catch (err) {
       proxyPickerModels = null;
       logger.warn(

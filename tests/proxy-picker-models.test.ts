@@ -11,7 +11,11 @@
 // all four agents agree on the picker.
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createClaudeCodeAgent, loadProxyPickerModels } from "../src/agent.js";
+import {
+  createClaudeCodeAgent,
+  loadProxyPickerModels,
+  resetProxyPickerModelsCache,
+} from "../src/agent.js";
 import { clearClaudeSettingsCache, filterPickerModels } from "../src/claude-settings.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 
@@ -50,6 +54,8 @@ const ENV_KEYS = [
   "CLAUDE_ACP_MODEL",
   "CLAUDE_ACP_AVAILABLE_MODELS",
   "CLAUDE_ACP_PROXY_MODELS",
+  "CLAUDE_SETTINGS_DIR",
+  "CLAUDE_PROJECT_DIR",
   "ERICAI_PROXY_URL",
   "ERICAI_PROXY_BASE_URL",
 ] as const;
@@ -62,6 +68,9 @@ beforeEach(() => {
   // Isolate from the developer's shell/real proxy: default to the static
   // path and a failing fetch, then individual tests opt in.
   for (const k of ENV_KEYS) delete process.env[k];
+  // Point settings at a nonexistent dir so the developer's real
+  // ~/.claude/settings.json cannot leak env-block values into assertions.
+  process.env.CLAUDE_SETTINGS_DIR = "/tmp/nonexistent-claude-settings";
   process.env.ANTHROPIC_MODEL = "test-model";
   process.env.ERICAI_PROXY_BASE_URL = "http://proxy.test.invalid";
   savedFetch = globalThis.fetch;
@@ -73,6 +82,7 @@ afterEach(() => {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
   }
+  resetProxyPickerModelsCache();
   globalThis.fetch = savedFetch;
   clearClaudeSettingsCache();
 });
@@ -213,5 +223,58 @@ describe("dynamic picker via proxy catalog (CLAUDE_ACP_PROXY_MODELS=1)", () => {
     const picker = await pickerOptions();
     expect(picker.options.map((o: any) => o.value)).toEqual(["glm-5.2", "gpt-oss-120b"]);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("re-fetches after the TTL so a model that became healthy later appears", async () => {
+    process.env.CLAUDE_ACP_PROXY_MODELS = "1";
+    vi.useFakeTimers();
+    try {
+      // First load: glm-5.2 is NOT yet healthy.
+      vi.setSystemTime(new Date("2026-08-19T00:00:00Z")); // 60s buckets: even index first
+      const baseModels = [
+        { id: "Qwen3.8-27B-FP8-1M", tags: ["multimodal", "coding"] },
+        { id: "glm-5.2", tags: ["near_sota"] },
+      ];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (url: string) => {
+          const index = Math.floor(Date.now() / 60_000); // flips after each fake 60s
+          const glmHealthy = index % 2 === 1;
+          if (url.includes("/v1/model-health")) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                data: [
+                  {
+                    id: "glm-5.2",
+                    health: { healthy: glmHealthy, lifecycle: "Experimental" },
+                  },
+                  {
+                    id: "Qwen3.8-27B-FP8-1M",
+                    health: { healthy: true, lifecycle: "Experimental" },
+                  },
+                ],
+              }),
+            };
+          }
+          return { ok: true, status: 200, json: async () => ({ data: baseModels }) };
+        }),
+      );
+
+      await loadProxyPickerModels(); // index 0 → glm unhealthy → excluded
+      let picker = await pickerOptions();
+      let values: string[] = picker.options.map((o: any) => o.value);
+      expect(values).toEqual(["Qwen3.8-27B-FP8-1M"]);
+
+      // Advance well past the TTL. Next load re-fetches; glm is now healthy.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await loadProxyPickerModels(); // index 1 → glm healthy → included
+      picker = await pickerOptions();
+      values = picker.options.map((o: any) => o.value);
+      expect(values).toContain("glm-5.2");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
