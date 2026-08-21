@@ -54,16 +54,19 @@ function createMockConnection() {
   } as unknown as AgentSideConnection;
 }
 
-async function runWithEvents(events: StreamEvent[]) {
+async function runWithEvents(
+  events: StreamEvent[],
+  agentOptions: { pendingAgentWaitMs?: number; cwd?: string } = {}
+) {
   scriptedEvents = events;
   const conn = createMockConnection();
-  const agent = createClaudeCodeAgent(conn);
+  const agent = createClaudeCodeAgent(conn, agentOptions);
   await agent.initialize({
     protocolVersion: 1,
     clientCapabilities: {},
     clientInfo: { name: "test", version: "1.0" },
   });
-  const session = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+  const session = await agent.newSession({ cwd: agentOptions.cwd ?? "/tmp", mcpServers: [] });
   await agent.prompt({
     sessionId: session.sessionId,
     prompt: [{ type: "text", text: "go" }],
@@ -151,16 +154,19 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].kind).toBe("execute");
   });
 
-  it("Bash tool → strips leading `cd <dir>\\n` so the title shows the real command", async () => {
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Bash",
-        toolInput: {
-          command: "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
+  it("Bash tool → strips leading `cd <dir>\n` so the title shows the real command", async () => {
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
+          },
         },
-      },
-    ]);
+      ],
+      { cwd: "/tmp" }
+    );
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     expect(toolCalls[0].title).toBe("git diff --stat");
     // The `cd` prefix moves to `cwd` so the FIRST line of rawInput.command is
@@ -171,17 +177,62 @@ describe("Agent tool_call notifications", () => {
   });
 
   it("Bash tool → strips leading `cd <dir> && ` on a single line", async () => {
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Bash",
-        toolInput: {
-          command: "cd /workspace/git/ezennin/claude-code-acp && npm run build",
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cd /workspace/git/ezennin/claude-code-acp && npm run build",
+          },
         },
-      },
-    ]);
+      ],
+      { cwd: "/tmp" }
+    );
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
     expect(toolCalls[0].title).toBe("npm run build");
+  });
+
+  it("Bash tool → keeps `cd <dir> && ` when the cd target matches the session cwd", async () => {
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cd /workspace/git/ezennin/claude-code-acp && npm run build",
+          },
+        },
+      ],
+      { cwd: "/workspace/git/ezennin/claude-code-acp" }
+    );
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("cd /workspace/git/ezennin/claude-code-acp && npm run build");
+    expect(toolCalls[0].rawInput.command).toBe(
+      "cd /workspace/git/ezennin/claude-code-acp && npm run build"
+    );
+    expect(toolCalls[0].rawInput.cwd).toBeUndefined();
+  });
+
+  it("Bash tool → keeps `cd <dir>\n` when the cd target matches the session cwd", async () => {
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat",
+          },
+        },
+      ],
+      { cwd: "/workspace/git/ezennin/claude-code-acp/" }
+    );
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("cd /workspace/git/ezennin/claude-code-acp");
+    expect(toolCalls[0].rawInput.command).toBe(
+      "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat"
+    );
+    expect(toolCalls[0].rawInput.cwd).toBeUndefined();
   });
 
   it("Bash tool → `cd <dir>\\n<cmd> && ...` keeps the real first command (&& must not cross newlines)", async () => {
@@ -638,31 +689,43 @@ describe("Agent todo/plan updates", () => {
 });
 
 describe("Subagent (Task tool) lifecycle", () => {
+  // The mock runner never delivers a <task-notification>, so subagents stay
+  // pending until the turn-end fallback. Pass a near-zero wait so the bounded
+  // 15s default (production) doesn't blow the 5s vitest timeout.
+  const shortWait = { pendingAgentWaitMs: 1 };
+
   beforeEach(() => {
     vi.clearAllMocks();
     scriptedEvents = [];
   });
 
   it("emits in_progress on Task tool_use, completed at turn end (not on tool_result)", async () => {
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Task",
-        toolInput: { description: "investigate", subagent_type: "general-purpose" },
-        toolUseId: "tu_1",
-      },
-      // Claude Code's Task tool_result is a launch ack ("Async agent launched
-      // successfully..."), NOT a completion signal — the subagent keeps running
-      // after it. So this must NOT flip the tool_call to completed.
-      { type: "user", text: "result text", toolResultIds: ["tu_1"] },
-    ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Task",
+          toolInput: { description: "investigate", subagent_type: "general-purpose" },
+          toolUseId: "tu_1",
+        },
+        // Claude Code's Task tool_result is a launch ack ("Async agent launched
+        // successfully..."), NOT a completion signal — the subagent keeps running
+        // after it. So this must NOT flip the tool_call to completed.
+        { type: "user", text: "result text", toolResultIds: ["tu_1"] },
+      ],
+      shortWait
+    );
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // First: in_progress when the subagent starts.
     expect(toolCalls[0].status).toBe("in_progress");
     // The tool_result launch ack must NOT produce a completed flip — only two
     // frames exist (the in_progress emit + the turn-end flush).
     expect(toolCalls).toHaveLength(2);
-    // Last: the turn-end flush flips the same toolCallId to completed.
+    // Last: the turn-end flush flips the same toolCallId to completed. The
+    // flip arrives as a tool_call_update (not tool_call) so the client updates
+    // the existing row instead of creating a duplicate.
     const flip = toolCalls[toolCalls.length - 1];
     expect(flip.status).toBe("completed");
     expect(flip.sessionUpdate).toBe("tool_call_update");
@@ -670,15 +733,20 @@ describe("Subagent (Task tool) lifecycle", () => {
   });
 
   it("stays in_progress across the launch-ack tool_result, then completes at turn end", async () => {
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Task",
-        toolInput: { description: "investigate" },
-        toolUseId: "tu_2",
-      },
-    ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Task",
+          toolInput: { description: "investigate" },
+          toolUseId: "tu_2",
+        },
+      ],
+      shortWait
+    );
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // in_progress emit + turn-end flush = 2 frames.
     expect(toolCalls).toHaveLength(2);
     expect(toolCalls[0].status).toBe("in_progress");
@@ -702,10 +770,12 @@ describe("Subagent (Task tool) lifecycle", () => {
       },
       { type: "user", text: "result text", toolResultIds: ["tu_3"] },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // First: in_progress when the tool starts.
     expect(toolCalls[0].status).toBe("in_progress");
-    // The tool_result flips the same toolCallId to completed.
+    // The tool_result flips the same toolCallId to completed via tool_call_update.
     const flip = toolCalls[toolCalls.length - 1];
     expect(flip.status).toBe("completed");
     expect(flip.sessionUpdate).toBe("tool_call_update");
@@ -724,7 +794,9 @@ describe("Subagent (Task tool) lifecycle", () => {
         toolUseId: "tu_4",
       },
     ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // in_progress emit + turn-end flush = 2 frames.
     expect(toolCalls).toHaveLength(2);
     expect(toolCalls[0].status).toBe("in_progress");
@@ -740,24 +812,29 @@ describe("Subagent (Task tool) lifecycle", () => {
     // When that notification arrives mid-turn, the subagent's tool_call must
     // flip to completed immediately, and the turn-end flush must NOT also fire
     // (the subagent was already removed from the pending map).
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Task",
-        toolInput: { description: "Trace interrupt message wiring", subagent_type: "Explore" },
-        toolUseId: "tu_4",
-      },
-      {
-        type: "user",
-        text:
-          '<task-notification>\n<task-id>af36e82b106748422</task-id>\n' +
-          '<output-file>/tmp/x/tasks/af36e82b106748422.output</output-file>\n' +
-          '<status>completed</status>\n' +
-          '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
-          '</task-notification>',
-      },
-    ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Task",
+          toolInput: { description: "Trace interrupt message wiring", subagent_type: "Explore" },
+          toolUseId: "tu_4",
+        },
+        {
+          type: "user",
+          text:
+            '<task-notification>\n<task-id>af36e82b106748422</task-id>\n' +
+            '<output-file>/tmp/x/tasks/af36e82b106748422.output</output-file>\n' +
+            '<status>completed</status>\n' +
+            '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
+            '</task-notification>',
+        },
+      ],
+      shortWait
+    );
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // in_progress emit + mid-turn completed flip = 2 frames. The turn-end
     // flush does NOT add a third (the subagent was already resolved).
     expect(toolCalls).toHaveLength(2);
@@ -771,23 +848,28 @@ describe("Subagent (Task tool) lifecycle", () => {
     // Only the subagent whose description appears in the notification resolves.
     // A notification for an unrelated agent must leave this one pending until
     // the turn-end flush.
-    const { updates } = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "Task",
-        toolInput: { description: "investigate auth flow" },
-        toolUseId: "tu_5",
-      },
-      {
-        type: "user",
-        text:
-          '<task-notification>\n<task-id>other</task-id>\n' +
-          '<status>completed</status>\n' +
-          '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
-          '</task-notification>',
-      },
-    ]);
-    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update");
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Task",
+          toolInput: { description: "investigate auth flow" },
+          toolUseId: "tu_5",
+        },
+        {
+          type: "user",
+          text:
+            '<task-notification>\n<task-id>other</task-id>\n' +
+            '<status>completed</status>\n' +
+            '<summary>Agent "Trace interrupt message wiring" completed</summary>\n' +
+            '</task-notification>',
+        },
+      ],
+      shortWait
+    );
+    const toolCalls = updates.filter(
+      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+    );
     // in_progress emit + turn-end flush = 2 frames. No mid-turn flip because
     // the notification named a different description.
     expect(toolCalls).toHaveLength(2);

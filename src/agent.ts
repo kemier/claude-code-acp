@@ -41,6 +41,7 @@ import {
   validateMcpCommand,
   validateMcpArgs,
 } from "./validation.js";
+import { resolve as resolvePath } from "node:path";
 
 function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -806,6 +807,11 @@ function hasUnclosedQuote(line: string): boolean {
   return single % 2 === 1 || double % 2 === 1;
 }
 
+function isSameDir(a: string, b: string): boolean {
+  const normalize = (p: string) => p.replace(/\/+$/, "") || "/";
+  return normalize(resolvePath(a)) === normalize(resolvePath(b));
+}
+
 /**
  * Split Claude Code's `cd <cwd>` prefix off a Bash command.
  *
@@ -826,7 +832,7 @@ function hasUnclosedQuote(line: string): boolean {
  * When no `cd` prefix is present, the command is returned unchanged and `cwd`
  * is undefined.
  */
-export function splitCdPrefix(command: string): { command: string; cwd?: string } {
+export function splitCdPrefix(command: string, cwd?: string): { command: string; cwd?: string } {
   const nl = command.indexOf("\n");
   const firstLine = (nl === -1 ? command : command.slice(0, nl)).trim();
   const rest = nl === -1 ? "" : command.slice(nl + 1);
@@ -835,6 +841,9 @@ export function splitCdPrefix(command: string): { command: string; cwd?: string 
   const cdAnd = firstLine.match(/^cd\s+(\S[^&]*?)\s*&&\s*(.+)$/);
   if (cdAnd) {
     const inline = cdAnd[2].trim();
+    if (cwd && isSameDir(cdAnd[1].trim(), cwd)) {
+      return { command };
+    }
     const remainder = rest ? `${inline}\n${rest}` : inline;
     return { command: remainder, cwd: cdAnd[1].trim() };
   }
@@ -842,6 +851,9 @@ export function splitCdPrefix(command: string): { command: string; cwd?: string 
   // Bare `cd <dir>` on its own line — the command starts on the next line.
   const cdOnly = firstLine.match(/^cd\s+(\S.*)$/);
   if (cdOnly && rest.trim()) {
+    if (cwd && isSameDir(cdOnly[1].trim(), cwd)) {
+      return { command };
+    }
     return { command: rest.replace(/^\n+/, ""), cwd: cdOnly[1].trim() };
   }
 
@@ -857,7 +869,7 @@ export function splitCdPrefix(command: string): { command: string; cwd?: string 
  * command is visible. Multi-line commands collapse to their first non-empty,
  * non-`cd` line. The full command is still preserved in `rawInput`.
  */
-function titleForCommand(command: string, description?: string): string {
+function titleForCommand(command: string, description?: string, cwd?: string): string {
   const c = command.trim();
   // Claude Code prefixes commands with `cd <cwd>`. Two shapes occur:
   //   1. `cd <dir> && <cmd>` — cd and the real command on ONE line.
@@ -874,11 +886,18 @@ function titleForCommand(command: string, description?: string): string {
     let t = ln.trim();
     if (!t) continue;
     // `cd <dir> && <rest>` on a single line → keep just <rest>.
-    const cdAnd = t.match(/^cd\s+\S[^&]*&&\s*(.*)$/);
+    const cdAnd = t.match(/^cd\s+(\S[^&]*?)&&\s*(.*)$/);
     if (cdAnd) {
-      t = cdAnd[1].trim();
+      if (cwd && isSameDir(cdAnd[1].trim(), cwd)) {
+        return t.length <= 120 ? t : t.slice(0, 117) + "…";
+      }
+      t = cdAnd[2].trim();
       if (!t) continue; // `cd <dir> && ` with nothing after — next line.
-    } else if (/^cd\s+\S/.test(t)) {
+    } else if (/^cd\s+(\S.*)$/.test(t)) {
+      const cdOnly = t.match(/^cd\s+(\S.*)$/);
+      if (cdOnly && cwd && isSameDir(cdOnly[1].trim(), cwd)) {
+        return t.length <= 120 ? t : t.slice(0, 117) + "…";
+      }
       // Bare leading `cd <dir>` line — the real command is on a later line.
       continue;
     }
@@ -927,6 +946,7 @@ function buildToolCallUpdate(
   toolCallId: string,
   toolName: string,
   toolInput: unknown,
+  cwd?: string,
 ): {
   sessionUpdate: "tool_call";
   toolCallId: string;
@@ -1020,7 +1040,7 @@ function buildToolCallUpdate(
       // Code's `cd <cwd>` prefix inside `command`. ACP clients derive the
       // displayed command from the first line of `rawInput.command`, so the
       // prefix would mask every command (see splitCdPrefix).
-      const split = splitCdPrefix(command);
+      const split = splitCdPrefix(command, cwd);
       const rawInput: Record<string, unknown> = {
         ...(typeof toolInput === "object" && toolInput !== null ? input : {}),
         command: split.command,
@@ -1029,7 +1049,7 @@ function buildToolCallUpdate(
       return {
         sessionUpdate: "tool_call",
         toolCallId,
-        title: titleForCommand(command, description),
+        title: titleForCommand(command, description, cwd),
         kind: "execute",
         status: "completed",
         rawInput,
@@ -2385,6 +2405,7 @@ export function createClaudeCodeAgent(
                             block.id ?? `replay-${Math.random().toString(36).slice(2, 8)}`,
                             block.name ?? "tool",
                             block.input ?? {},
+                            store.getCwd(sessionId),
                           ) as any,
                         );
                         // Reconstruct plan state from replayed TaskCreate/Update
@@ -3118,6 +3139,7 @@ export function createClaudeCodeAgent(
            toolCallId,
            event.toolName,
            event.toolInput,
+           store.getCwd(sessionId),
          );
          // Emit every tool as in_progress at its tool_use so the chat UI shows
          // a running phase (command text + spinner) while the tool executes.
@@ -3171,7 +3193,7 @@ export function createClaudeCodeAgent(
 
           // Build the descriptive title + kind + diff content once, then reuse
           // across the pending → completed/failed lifecycle.
-          const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput);
+          const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput, store.getCwd(sessionId));
 
           // Send pending tool_call status
           connection.sessionUpdate({
