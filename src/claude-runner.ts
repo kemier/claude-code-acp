@@ -125,6 +125,15 @@ export class ClaudeRunner {
    * starts fresh with no conversation history. See agent.ts prompt handler.
    */
   private cancelledProcesses = new Set<string>();
+  /**
+   * Pending SIGINT→SIGTERM escalation timers, keyed by trackingId. cancel()
+   * sends SIGINT first (a gentle turn interrupt that Claude Code's interactive
+   * mode handles); if the process has not exited within the grace window, the
+   * timer escalates to SIGTERM (hard kill). The timer is cleared when the
+   * process closes naturally, so a process that honors SIGINT is never
+   * SIGTERMed after the fact.
+   */
+  private cancelEscalationTimers = new Map<string, NodeJS.Timeout>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
 
@@ -416,14 +425,41 @@ export class ClaudeRunner {
 
   cancel(trackingId: string): void {
     const proc = this.runningProcesses.get(trackingId);
-    if (proc) {
-      // Mark as explicitly cancelled BEFORE the kill so the close handler
-      // resolves (clean cancel) rather than rejecting (treated as a crash /
-      // resume failure). This preserves the captured Claude session id.
-      this.cancelledProcesses.add(trackingId);
-      proc.kill("SIGTERM");
-      this.runningProcesses.delete(trackingId);
+    if (!proc) {
+      return;
     }
+    // Mark as explicitly cancelled BEFORE the kill so the close handler
+    // resolves (clean cancel) rather than rejecting (treated as a crash /
+    // resume failure). This preserves the captured Claude session id.
+    this.cancelledProcesses.add(trackingId);
+
+    // Try a gentle SIGINT (turn interrupt) first — Claude Code's interactive
+    // mode handles SIGINT as an in-turn interrupt, letting the process exit
+    // cleanly and keep the session id valid. If it has not exited within the
+    // grace window, escalate to SIGTERM (hard kill). There is no native
+    // "interrupt this turn" RPC on the CLI (see anthropics/claude-code#51078),
+    // so this is the gentlest reliable sequence available.
+    if (this.cancelEscalationTimers.has(trackingId)) {
+      // A cancel is already in progress for this trackingId — do not stack a
+      // second escalation timer.
+      return;
+    }
+    proc.kill("SIGINT");
+    const escalation = setTimeout(() => {
+      this.cancelEscalationTimers.delete(trackingId);
+      const stillRunning = this.runningProcesses.get(trackingId);
+      // Only escalate if the process is still alive and still tracked. If it
+      // exited cleanly from SIGINT, the close handler already removed it from
+      // runningProcesses and cleared the timer.
+      if (stillRunning && stillRunning.exitCode === null) {
+        try {
+          stillRunning.kill("SIGTERM");
+        } catch {
+          // Process already gone — nothing to escalate.
+        }
+      }
+    }, 3000);
+    this.cancelEscalationTimers.set(trackingId, escalation);
   }
 
   isRunning(trackingId: string): boolean {
@@ -529,6 +565,14 @@ export class ClaudeRunner {
       proc.on("close", (code) => {
         if (trackingId) {
           this.runningProcesses.delete(trackingId);
+          // The process exited (either from SIGINT or a completed turn) — clear
+          // any pending SIGINT→SIGTERM escalation timer so a process that
+          // honored SIGINT is never SIGTERMed after the fact.
+          const esc = this.cancelEscalationTimers.get(trackingId);
+          if (esc) {
+            clearTimeout(esc);
+            this.cancelEscalationTimers.delete(trackingId);
+          }
         }
         const wasCancelled = trackingId
           ? this.cancelledProcesses.delete(trackingId)
@@ -653,6 +697,12 @@ export class ClaudeRunner {
       proc.on("close", (code) => {
         if (trackingId) {
           this.runningProcesses.delete(trackingId);
+          // Clear any pending SIGINT→SIGTERM escalation timer (see cancel()).
+          const esc = this.cancelEscalationTimers.get(trackingId);
+          if (esc) {
+            clearTimeout(esc);
+            this.cancelEscalationTimers.delete(trackingId);
+          }
         }
         const wasCancelled = trackingId
           ? this.cancelledProcesses.delete(trackingId)
