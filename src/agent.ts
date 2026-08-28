@@ -1306,6 +1306,14 @@ export function createClaudeCodeAgent(
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
+  // Per-session auto-follow-up counter. When a turn ends with subagent(s)
+  // still pending (premature end_turn), we enqueue a synthetic steer that
+  // starts a new turn so the Claude CLI injects the pending
+  // <task-notification> results. This is bounded per session to prevent an
+  // infinite cascade (an auto-follow-up turn that itself spawns subagents
+  // could re-trigger). See `ericli-subagent-late-arrival-turn-trigger`.
+  const autoFollowUpCount = new Map<string, number>();
+  const AUTO_FOLLOW_UP_CAP = 3;
   // Sessions whose steer queue is currently being drained. drainSteerQueue()
   // awaits LLM turns, so without this a second call (pre-turn vs post-turn vs
   // post-compaction) could run concurrently and interleave two consumers over
@@ -3551,8 +3559,9 @@ export function createClaudeCodeAgent(
         // — at which point the <task-notification> lands and is matched there.
         const pendingAgents = sessionPendingAgents.get(sessionId);
         if (pendingAgents && pendingAgents.size > 0) {
+          const pendingCount = pendingAgents.size;
           logger.info(
-            `Turn ended with ${pendingAgents.size} subagent(s) still pending ` +
+            `Turn ended with ${pendingCount} subagent(s) still pending ` +
               `(no <task-notification> before end_turn) for session ${sessionId} ` +
               `— marking completed as fallback; result was likely lost.`,
           );
@@ -3570,6 +3579,34 @@ export function createClaudeCodeAgent(
           }
           pendingAgents.clear();
           sessionPendingAgents.delete(sessionId);
+
+          // ── Auto follow-up for late subagent results ────────────────────
+          // The turn ended before the subagent(s) reported back. The Claude
+          // CLI only injects a finished subagent's <task-notification> into
+          // the NEXT turn, so enqueue a synthetic steer that starts one — the
+          // main agent then sees the pending results and can incorporate them,
+          // instead of the results being silently lost until the user types
+          // "go on". Bounded by AUTO_FOLLOW_UP_CAP so an auto-follow-up turn
+          // that itself spawns subagents cannot cascade forever.
+          const count = autoFollowUpCount.get(sessionId) ?? 0;
+          if (count < AUTO_FOLLOW_UP_CAP) {
+            autoFollowUpCount.set(sessionId, count + 1);
+            const followUpText =
+              `[Auto] ${pendingCount} background subagent(s) finished after the turn ended. ` +
+              `Please incorporate their results (the <task-notification> blocks) and continue.`;
+            if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
+            steerQueues.get(sessionId)!.push(followUpText);
+            logger.info(
+              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued for session ${sessionId} ` +
+                `to retrieve ${pendingCount} late subagent result(s).`,
+            );
+            // Deliver it immediately (starts a new turn via continueSessionStreaming).
+            await drainSteerQueue();
+          } else {
+            logger.info(
+              `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
+            );
+          }
         }
 
         // Post-turn normal-tool flush. Tools whose tool_result never arrived
