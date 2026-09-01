@@ -193,7 +193,9 @@ describe("Agent tool_call notifications", () => {
     expect(toolCalls[0].title).toBe("npm run build");
   });
 
-  it("Bash tool → keeps `cd <dir> && ` when the cd target matches the session cwd", async () => {
+  it("Bash tool → drops `cd <dir> && ` when the cd target IS the session cwd", async () => {
+    // The session already runs there, so the one line the client renders should
+    // show the command, not the navigation.
     const { updates } = await runWithEvents(
       [
         {
@@ -207,14 +209,31 @@ describe("Agent tool_call notifications", () => {
       { cwd: "/workspace/git/ezennin/claude-code-acp" }
     );
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
-    expect(toolCalls[0].title).toBe("cd /workspace/git/ezennin/claude-code-acp && npm run build");
-    expect(toolCalls[0].rawInput.command).toBe(
-      "cd /workspace/git/ezennin/claude-code-acp && npm run build"
-    );
+    expect(toolCalls[0].title).toBe("npm run build");
+    expect(toolCalls[0].rawInput.command).toBe("npm run build");
+    // No redundant cwd is reported for the session directory itself.
     expect(toolCalls[0].rawInput.cwd).toBeUndefined();
   });
 
-  it("Bash tool → keeps `cd <dir>\n` when the cd target matches the session cwd", async () => {
+  it("Bash tool → keeps a cd into a SUBDIRECTORY, rewritten relative", async () => {
+    const { updates } = await runWithEvents(
+      [
+        {
+          type: "tool_use",
+          toolName: "Bash",
+          toolInput: {
+            command: "cd /workspace/git/ezennin/claude-code-acp/src && npm run build",
+          },
+        },
+      ],
+      { cwd: "/workspace/git/ezennin/claude-code-acp" }
+    );
+    const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
+    expect(toolCalls[0].title).toBe("cd src && npm run build");
+    expect(toolCalls[0].rawInput.cwd).toBe("/workspace/git/ezennin/claude-code-acp/src");
+  });
+
+  it("Bash tool → drops `cd <dir>\n` when the cd target IS the session cwd", async () => {
     const { updates } = await runWithEvents(
       [
         {
@@ -228,10 +247,8 @@ describe("Agent tool_call notifications", () => {
       { cwd: "/workspace/git/ezennin/claude-code-acp/" }
     );
     const toolCalls = updates.filter((u: any) => u.sessionUpdate === "tool_call");
-    expect(toolCalls[0].title).toBe("cd /workspace/git/ezennin/claude-code-acp");
-    expect(toolCalls[0].rawInput.command).toBe(
-      "cd /workspace/git/ezennin/claude-code-acp\ngit diff --stat"
-    );
+    expect(toolCalls[0].title).toBe("git diff --stat");
+    expect(toolCalls[0].rawInput.command).toBe("git diff --stat");
     expect(toolCalls[0].rawInput.cwd).toBeUndefined();
   });
 

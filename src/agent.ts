@@ -41,7 +41,7 @@ import {
   validateMcpCommand,
   validateMcpArgs,
 } from "./validation.js";
-import { resolve as resolvePath } from "node:path";
+import { isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath } from "node:path";
 
 function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -807,6 +807,30 @@ function hasUnclosedQuote(line: string): boolean {
   return single % 2 === 1 || double % 2 === 1;
 }
 
+/**
+ * Relative path when `target` is a directory INSIDE `cwd`, else null.
+ *
+ * `cwd` itself returns null — running in the session directory is the default.
+ * A relative target resolves against `cwd`, never process.cwd(), so applying
+ * this to an already-normalized command is a no-op.
+ */
+function subdirOfCwd(target: string, cwd?: string): string | null {
+  if (!cwd) {
+    return null;
+  }
+  try {
+    const base = resolvePath(cwd);
+    const abs = isAbsolutePath(target) ? resolvePath(target) : resolvePath(base, target);
+    const rel = relativePath(base, abs);
+    if (!rel || rel === "." || rel.startsWith("..") || isAbsolutePath(rel)) {
+      return null;
+    }
+    return rel;
+  } catch {
+    return null;
+  }
+}
+
 function isSameDir(a: string, b: string): boolean {
   const normalize = (p: string) => p.replace(/\/+$/, "") || "/";
   return normalize(resolvePath(a)) === normalize(resolvePath(b));
@@ -837,24 +861,40 @@ export function splitCdPrefix(command: string, cwd?: string): { command: string;
   const firstLine = (nl === -1 ? command : command.slice(0, nl)).trim();
   const rest = nl === -1 ? "" : command.slice(nl + 1);
 
-  // `cd <dir> && <inline rest>` — cd and the command share the first line.
-  const cdAnd = firstLine.match(/^cd\s+(\S[^&]*?)\s*&&\s*(.+)$/);
+  // `cd <dir> && <cmd>` / `cd <dir>; <cmd>` — cd and the command share the
+  // first line. Claude Code emits the `&&` form; other agents use `;`.
+  const cdAnd = firstLine.match(/^cd\s+(\S[^;&]*?)\s*(&&|;)\s*(.+)$/);
   if (cdAnd) {
-    const inline = cdAnd[2].trim();
-    if (cwd && isSameDir(cdAnd[1].trim(), cwd)) {
-      return { command };
-    }
+    const target = cdAnd[1].trim();
+    const inline = cdAnd[3].trim();
     const remainder = rest ? `${inline}\n${rest}` : inline;
-    return { command: remainder, cwd: cdAnd[1].trim() };
+    const sub = subdirOfCwd(target, cwd);
+    if (sub) {
+      // Inside the session cwd: the location carries information, so keep it in
+      // the title — but relative, not as a long absolute path.
+      const joined = `cd ${sub}${cdAnd[2] === ";" ? ";" : " &&"} ${inline}`;
+      return { command: rest ? `${joined}\n${rest}` : joined, cwd: target };
+    }
+    if (cwd && isSameDir(target, cwd)) {
+      // The session already runs there — drop the cd entirely and do not report
+      // a redundant cwd.
+      return { command: remainder };
+    }
+    return { command: remainder, cwd: target };
   }
 
   // Bare `cd <dir>` on its own line — the command starts on the next line.
   const cdOnly = firstLine.match(/^cd\s+(\S.*)$/);
   if (cdOnly && rest.trim()) {
-    if (cwd && isSameDir(cdOnly[1].trim(), cwd)) {
-      return { command };
+    const target = cdOnly[1].trim();
+    const body = rest.replace(/^\n+/, "");
+    // The cd is always removed from the newline form — clients render only the
+    // first line, so keeping it would hide the command. The directory still
+    // travels out-of-band in rawInput.cwd (except when it IS the session cwd).
+    if (cwd && isSameDir(target, cwd)) {
+      return { command: body };
     }
-    return { command: rest.replace(/^\n+/, ""), cwd: cdOnly[1].trim() };
+    return { command: body, cwd: target };
   }
 
   return { command };
@@ -885,19 +925,21 @@ function titleForCommand(command: string, description?: string, cwd?: string): s
   for (const ln of lines) {
     let t = ln.trim();
     if (!t) continue;
-    // `cd <dir> && <rest>` on a single line → keep just <rest>.
-    const cdAnd = t.match(/^cd\s+(\S[^&]*?)&&\s*(.*)$/);
+    // `cd <dir> && <rest>` / `cd <dir>; <rest>` on a single line.
+    //  - target is the session cwd      → drop the cd, keep <rest>
+    //  - target is INSIDE the cwd       → keep it, rewritten relative
+    //  - target is anywhere else        → drop the cd, keep <rest>
+    const cdAnd = t.match(/^cd\s+(\S[^;&]*?)\s*(&&|;)\s*(.*)$/);
     if (cdAnd) {
-      if (cwd && isSameDir(cdAnd[1].trim(), cwd)) {
-        return t.length <= 120 ? t : t.slice(0, 117) + "…";
+      const sub = subdirOfCwd(cdAnd[1].trim(), cwd);
+      if (sub) {
+        const joined = `cd ${sub}${cdAnd[2] === ";" ? ";" : " &&"} ${cdAnd[3].trim()}`.trim();
+        return joined.length <= 120 ? joined : joined.slice(0, 117) + "…";
       }
-      t = cdAnd[2].trim();
+      t = cdAnd[3].trim();
       if (!t) continue; // `cd <dir> && ` with nothing after — next line.
     } else if (/^cd\s+(\S.*)$/.test(t)) {
       const cdOnly = t.match(/^cd\s+(\S.*)$/);
-      if (cdOnly && cwd && isSameDir(cdOnly[1].trim(), cwd)) {
-        return t.length <= 120 ? t : t.slice(0, 117) + "…";
-      }
       // Bare leading `cd <dir>` line — the real command is on a later line.
       continue;
     }
