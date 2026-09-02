@@ -102,6 +102,38 @@ const PLAN_COLLABORATION_MODE = "plan";
 
 const sessionCollaborationModes = new Map<string, string>();
 
+/**
+ * Leave Plan mode for `sessionId` and tell the client.
+ *
+ * Claude Code signals plan completion with its ExitPlanMode tool. `setSessionMode`
+ * echoes client-initiated switches, so this is the only agent-initiated path; both
+ * the stored mode and the `current_mode_update` / `config_option_update`
+ * notifications are needed or the IDE picker keeps showing "Plan".
+ */
+async function leavePlanMode(
+  sessionId: string,
+  connection: { sessionUpdate: (p: any) => Promise<unknown> },
+  store: SessionStore,
+): Promise<void> {
+  if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) !== PLAN_COLLABORATION_MODE) {
+    return;
+  }
+  sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE);
+  logger.info(`Session ${sessionId} left plan mode (ExitPlanMode)`);
+  try {
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "current_mode_update", currentModeId: DEFAULT_COLLABORATION_MODE } as any,
+    });
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
+    });
+  } catch {
+    /* non-fatal — the next turn still runs without the plan-mode preamble */
+  }
+}
+
 function buildModeState(currentModeId: string) {
   return {
     availableModes: AVAILABLE_MODES,
@@ -3180,6 +3212,16 @@ export function createClaudeCodeAgent(
          // is a full snapshot, so the count reflects the live list size
          // rather than a running total of updates.
          handleTaskTool(sessionId, event.toolName, event.toolInput);
+         // Claude Code owns a native ExitPlanMode tool: the model calls it once
+         // the plan is ready and expects the host to leave Plan mode. Without
+         // mapping it the session stayed in Plan forever — the picker still read
+         // "Plan", the injected <collaboration_mode> block kept telling the model
+         // that an execution request is a request to PLAN the execution, and a
+         // follow-up "implement it" came back as code in the chat instead of
+         // edits. Clear the flag and tell the client so the picker follows.
+         if (event.toolName === "ExitPlanMode") {
+           void leavePlanMode(sessionId, connection, store);
+         }
          // Build a descriptive title + kind + (for edits) diff content +
          // locations, mirroring codex-acp, so the chat UI shows the action
          // verb and a click-to-open diff instead of a bare filename.
