@@ -70,3 +70,30 @@ describe("steer echo timing", () => {
     expect(body).toContain(".catch(()");
   });
 });
+
+/**
+ * The auto-compact lifecycle defers "completed" until the post-compaction
+ * continuation finishes (so the client flushes history only once the fresh panel
+ * has content). That deferred emit used to sit AFTER the continuation await, so a
+ * throw — Claude CLI error, aborted turn — left the lifecycle stuck at "start" and
+ * the client kept a "Compacting conversation..." banner for the rest of the
+ * session. Same stranding class as ericli's compaction row, which span forever
+ * because only the in_progress frame was ever sent.
+ */
+describe("deferred compaction completion", () => {
+  it("is emitted from a finally block, so a failing continuation still closes it", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
+    const emit = src.indexOf('compactResult.compactionId, "completed"');
+    expect(emit).toBeGreaterThan(0);
+    // Walk back to the nearest block opener and require it to be a finally.
+    const before = src.slice(0, emit);
+    expect(before.lastIndexOf("} finally {")).toBeGreaterThan(before.lastIndexOf("try {"));
+    // The comment must say why, for whoever reads this next.
+    expect(src).toContain("on failure it at least stops showing");
+  });
+
+  it("keeps the failure path for the non-deferred case", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
+    expect(src).toContain('emitCompactionLifecycle(connection, sessionId, compactionId, "failed", detail)');
+  });
+});

@@ -4323,63 +4323,71 @@ export function createClaudeCodeAgent(
              false, // no "No conversation to compact yet." text for auto-compact
              true,  // skipCompleted — emit "completed" after continuation
            ) as { compactionId: string; summary: string } | false;
-           // After compaction, re-send the original user prompt so the LLM
-           // continues the task in the fresh (compacted) session. This matches
-           // Codex behavior where compaction is transparent to the user — the
-           // task continues automatically after context is compressed.
-           logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
-           const claudeSid = store.getClaudeSessionId(sessionId);
-           if (claudeSid) {
-             // Frame the continuation prompt so the model knows it is resuming
-             // after a context compaction. Without this framing, the fresh
-             // session (which only has the summary) can hallucinate tool
-             // results as text ("ReadResult(file_path=...placeholder)...")
-             // because it lost the conversation context and tries to simulate
-             // prior tool calls it doesn't actually have results for.
-             const continueFraming = `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
-             // Preserve accompanying images (if any) when re-sending the
-             // original prompt after compaction.
-             const continueContent = [
-               { type: "text" as const, text: continueFraming },
-               ...(hasImages ? promptImages : []),
-             ];
-             const continueResult = hasImages
-               ? await runner.continueSessionStreamingWithContent(
-                   claudeSid,
-                   continueContent,
-                   onEvent,
-                   sessionId,
-                   modelOverride,
-                   effectiveEffort,
-                 )
-               : await runner.continueSessionStreaming(
-                   claudeSid,
-                   continueFraming,
-                   onEvent,
-                   sessionId,
-                   modelOverride,
-                   effectiveEffort,
-                 );
-             store.setClaudeSessionId(sessionId, continueResult.sessionId);
-             await Promise.all(permissionPromises);
-             // Update usage after continuation
-             const contEstimate = ctxEstimator.getEstimatedTokens();
-             const contContextWindow = getContextWindowForModel(effectiveModel);
-             sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
-             await connection.sessionUpdate({
-               sessionId,
-               update: {
-                 sessionUpdate: "usage_update",
-                 used: Math.min(contEstimate, contContextWindow),
-                 size: contContextWindow,
-               } as any,
-             }).catch(() => {});
-           }
-           // NOW emit "completed" — the continuation finished, so the client
-           // can safely flush (wipe old history, show compact notice, drain
-           // buffered continuation chunks into the fresh panel).
-           if (compactResult && typeof compactResult === 'object') {
-             await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
+           // try/finally: the continuation below can throw (Claude CLI error, aborted
+           // turn). The deferred "completed" used to sit after it, so a throw left the
+           // lifecycle stuck at "start" and the client kept a "Compacting
+           // conversation..." banner for the rest of the session.
+           try {
+             // After compaction, re-send the original user prompt so the LLM
+             // continues the task in the fresh (compacted) session. This matches
+             // Codex behavior where compaction is transparent to the user — the
+             // task continues automatically after context is compressed.
+             logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
+             const claudeSid = store.getClaudeSessionId(sessionId);
+             if (claudeSid) {
+               // Frame the continuation prompt so the model knows it is resuming
+               // after a context compaction. Without this framing, the fresh
+               // session (which only has the summary) can hallucinate tool
+               // results as text ("ReadResult(file_path=...placeholder)...")
+               // because it lost the conversation context and tries to simulate
+               // prior tool calls it doesn't actually have results for. Preserve
+               // accompanying images (if any) when re-sending the prompt.
+               const continueFraming = `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
+               const continueContent = [
+                 { type: "text" as const, text: continueFraming },
+                 ...(hasImages ? promptImages : []),
+               ];
+               const continueResult = hasImages
+                 ? await runner.continueSessionStreamingWithContent(
+                     claudeSid,
+                     continueContent,
+                     onEvent,
+                     sessionId,
+                     modelOverride,
+                     effectiveEffort,
+                   )
+                 : await runner.continueSessionStreaming(
+                     claudeSid,
+                     continueFraming,
+                     onEvent,
+                     sessionId,
+                     modelOverride,
+                     effectiveEffort,
+                   );
+               store.setClaudeSessionId(sessionId, continueResult.sessionId);
+               await Promise.all(permissionPromises);
+               // Update usage after continuation
+               const contEstimate = ctxEstimator.getEstimatedTokens();
+               const contContextWindow = getContextWindowForModel(effectiveModel);
+               sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
+               await connection.sessionUpdate({
+                 sessionId,
+                 update: {
+                   sessionUpdate: "usage_update",
+                   used: Math.min(contEstimate, contContextWindow),
+                   size: contContextWindow,
+                 } as any,
+               }).catch(() => {});
+             }
+           } finally {
+             // Emit "completed" now the continuation is over — successfully or
+             // not. On success the client can safely flush (wipe old history,
+             // show the compact notice, drain buffered continuation chunks into
+             // the fresh panel); on failure it at least stops showing
+             // "Compacting conversation..." forever.
+             if (compactResult && typeof compactResult === 'object') {
+               await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
+             }
            }
          }
         }
