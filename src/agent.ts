@@ -27,6 +27,7 @@ import {
   type ToolCallLocation,
 } from "@agentclientprotocol/sdk";
 import { SessionStore, type SessionInfo } from "./session-store.js";
+import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import {
@@ -2720,8 +2721,25 @@ export function createClaudeCodeAgent(
         logger.info(`Session ${sessionId} config mode set to ${value}`);
       } else if (configId === COLLABORATION_MODE_CONFIG_ID) {
         // Handle collaboration_mode specially (stored in separate map)
+        const previousCollabMode = sessionCollaborationModes.get(sessionId);
         sessionCollaborationModes.set(sessionId, value);
         logger.info(`Session ${sessionId} collaboration_mode set to ${value}`);
+        // The <collaboration_mode> block is built when the prompt starts, so a
+        // switch made DURING a turn was invisible to it: the model kept planning
+        // and the user had to open a new turn to say "you are not in plan mode
+        // now". Announce it on the steer queue, which the running turn drains.
+        if (
+          shouldAnnounceModeChange(previousCollabMode, value) &&
+          (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))
+        ) {
+          if (!steerQueues.has(sessionId)) {
+            steerQueues.set(sessionId, []);
+          }
+          steerQueues
+            .get(sessionId)!
+            .push(buildPlanModeChangeNotice(value === PLAN_COLLABORATION_MODE));
+          logger.info(`Session ${sessionId} mode change announced to the running turn`);
+        }
       } else {
         store.setConfigOverride(sessionId, configId, value);
         logger.info(`Session ${sessionId} config ${configId} set to ${value}`);
