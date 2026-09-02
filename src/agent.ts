@@ -2833,7 +2833,11 @@ export function createClaudeCodeAgent(
 
       const claudeSessionId = store.getClaudeSessionId(sessionId);
       const cwd = store.getCwd(sessionId)!;
-     let toolCallCounter = 0;
+     // Tool-call ids must be unique for the whole SESSION: clients resolve tool
+     // elements by id, so a per-turn counter made a new turn adopt the previous
+     // turn's rows. Kept on the store; the local reset below is gone too, since a
+     // steer drain used to restart numbering mid-turn.
+     const nextToolCallId = () => `call_${store.nextToolCallSeq(sessionId)}`;
      // Monotonic counter for ACP `messageId` on agent_message_chunk. The ACP
      // spec (ContentChunk.messageId) groups chunks into one logical message:
      // "All chunks belonging to the same message share the same messageId. A
@@ -3204,7 +3208,7 @@ export function createClaudeCodeAgent(
          }
        } else if (event.type === "tool_use" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
-         const toolCallId = `call_${++toolCallCounter}`;
+         const toolCallId = nextToolCallId();
          logger.debug(`Tool call: ${event.toolName}`);
          // TaskCreate/TaskUpdate/TaskList maintain a todo list — mirror it
          // into an ACP `plan` update so the chat UI shows a plan bar with
@@ -3278,7 +3282,7 @@ export function createClaudeCodeAgent(
          });
        } else if (event.type === "permission_request" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
-         const toolCallId = `call_${++toolCallCounter}`;
+         const toolCallId = nextToolCallId();
          const toolName = event.toolName;
          const toolInput = event.toolInput ?? {};
          logger.info(`Permission request: ${toolName}`);
@@ -3392,7 +3396,9 @@ export function createClaudeCodeAgent(
           break;
         }
         deliveredAny = true;
-       toolCallCounter = 0;
+       // NOTE: the tool-call counter is deliberately NOT reset here. Restarting
+       // it mid-turn on a steer drain made the steered work reuse the ids of the
+       // tools that ran before it, so the client updated the wrong rows.
        permissionPromises.length = 0;
        logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
 

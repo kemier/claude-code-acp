@@ -24,6 +24,8 @@ export interface SessionInfo {
 
 interface SessionData {
   cwd: string;
+  /** Monotonic tool-call sequence, unique for the life of the session. */
+  toolCallSeq?: number;
   claudeSessionId?: string;
   mcpServers: McpServerConfig[];
   createdAt: string;
@@ -146,6 +148,27 @@ export class SessionStore {
 
   getCwd(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.cwd;
+  }
+
+  /**
+   * Next tool-call sequence number for a session — monotonic for its whole life.
+   *
+   * The counter used to be a local in the prompt loop, so it restarted at 1 every
+   * turn AND was reset again whenever a steer message drained mid-turn. Clients
+   * resolve tool elements by id: vscode-acp keys a map on the wire id and builds
+   * DOM ids as 'tc-' + id, so a repeated call_1 made the new turn update the
+   * PREVIOUS turn's row — the same defect found in ericli, where a cancelled turn
+   * reached tc-8 and the replacement turn opened at tc-1 again.
+   */
+  nextToolCallSeq(sessionId: string): number {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      // No session (e.g. a late event after deletion): fall back to a clock-based
+      // value, which is still unique.
+      return Date.now();
+    }
+    session.toolCallSeq = (session.toolCallSeq ?? 0) + 1;
+    return session.toolCallSeq;
   }
 
   setClaudeSessionId(sessionId: string, claudeId: string): void {

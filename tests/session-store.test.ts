@@ -99,4 +99,34 @@ describe("SessionStore", () => {
       expect(store.getMcpServers("unknown")).toEqual([]);
     });
   });
+
+  describe("nextToolCallSeq", () => {
+    /**
+     * The tool-call counter used to be a local in the prompt loop, so it
+     * restarted at 1 every turn and was reset AGAIN when a steer message drained
+     * mid-turn. Clients resolve tool rows by id — vscode-acp keys a map on the
+     * wire id and builds DOM ids as 'tc-' + id — so a repeated call_1 made the
+     * new turn update the previous turn's row.
+     */
+    it("is monotonic across turns for one session", () => {
+      store.create("sess-seq", "/tmp/p");
+      const ids = [1, 2, 3, 4].map(() => store.nextToolCallSeq("sess-seq"));
+      expect(ids).toEqual([1, 2, 3, 4]);
+      expect(new Set(ids).size).toBe(ids.length);
+    });
+
+    it("counts independently per session", () => {
+      store.create("sess-a", "/tmp/a");
+      store.create("sess-b", "/tmp/b");
+      expect(store.nextToolCallSeq("sess-a")).toBe(1);
+      expect(store.nextToolCallSeq("sess-a")).toBe(2);
+      expect(store.nextToolCallSeq("sess-b")).toBe(1);
+      expect(store.nextToolCallSeq("sess-a")).toBe(3);
+    });
+
+    it("still returns something unique for an unknown session", () => {
+      const a = store.nextToolCallSeq("missing");
+      expect(a).toBeGreaterThan(0);
+    });
+  });
 });
