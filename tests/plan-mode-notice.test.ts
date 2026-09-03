@@ -41,3 +41,32 @@ describe("collaboration mode change mid-turn", () => {
     expect(body).toContain("shouldAnnounceModeChange(previousCollabMode, value)");
   });
 });
+
+/**
+ * The echo for a steered message must mean "delivered to the model", not "received".
+ *
+ * vscode-acp keeps a mid-turn message queued until the agent echoes it and treats that
+ * echo as the receipt releasing the NEXT queued message. Echoing on receipt let several
+ * interjections be dequeued client-side while the turn was still busy; they then all
+ * arrived at once and the model answered only the last. Fixed the same way in ericli.
+ */
+describe("steer echo timing", () => {
+  const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
+
+  it("receipt queues without echoing", () => {
+    const at = src.indexOf("steerQueues.get(sessionId)!.push(text);");
+    expect(at).toBeGreaterThan(0);
+    const handlerTail = src.slice(at, at + 900);
+    expect(handlerTail).toContain("no echo here");
+    expect(handlerTail).not.toContain("user_message_chunk");
+  });
+
+  it("the drain echoes each message as it goes to the model", () => {
+    const at = src.indexOf("const drainSteerQueue = async ()");
+    expect(at).toBeGreaterThan(0);
+    const body = src.slice(at, at + 2000);
+    expect(body).toContain("sessionUpdate: 'user_message_chunk'");
+    expect(body.indexOf("deliveredAny = true;")).toBeLessThan(body.indexOf("user_message_chunk"));
+    expect(body).toContain(".catch(()");
+  });
+});

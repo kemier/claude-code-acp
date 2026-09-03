@@ -473,13 +473,18 @@ describe("pre-turn compaction guard", () => {
 
 
 describe("steering (session/steer)", () => {
-  it("emits a user_message_chunk immediately for visual feedback", async () => {
+  it("does NOT echo a steer on receipt — the echo means delivered", async () => {
+    // vscode-acp treats the echo as the receipt that releases the NEXT queued
+    // message. Echoing here let several interjections be dequeued client-side while
+    // the turn was still busy; they then arrived together and the model answered only
+    // the last. The echo now happens in drainSteerQueue, as each message is handed to
+    // the model.
     const { conn, agent, sid } = await setup();
     await steer(agent, sid, "please also do X");
     const userChunks = (conn.sessionUpdate as any).mock.calls
       .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
       .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
-    expect(userChunks.some((t: string) => t.includes("please also do X"))).toBe(true);
+    expect(userChunks.some((t: string) => t.includes("please also do X"))).toBe(false);
   });
 
   it("drains a queued plain-text steer as a follow-up --resume prompt", async () => {
@@ -555,11 +560,13 @@ describe("steering (session/steer)", () => {
     await streamEnteredPromise;
     // While the main turn is gated (in flight, runner NOT running), steer.
     await agent.extNotification("session/steer", { sessionId: sid, text: "late steer during drain tail" });
-    // The steer must still produce its visual user_message_chunk.
-    const userChunks = (conn.sessionUpdate as any).mock.calls
+    // The steer must be QUEUED, not echoed yet: the echo now means "handed to the
+    // model", which the client uses as the receipt that releases its next queued
+    // message. Echoing here would release it while this one is still waiting.
+    const chunksBeforeDrain = (conn.sessionUpdate as any).mock.calls
       .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
       .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
-    expect(userChunks.some((t: string) => t.includes("late steer during drain tail"))).toBe(true);
+    expect(chunksBeforeDrain.some((t: string) => t.includes("late steer during drain tail"))).toBe(false);
     // Release the main turn → drain tail runs and should drain the queued steer.
     streamGate!();
     await inflight;
@@ -568,6 +575,11 @@ describe("steering (session/steer)", () => {
       (c) => c.kind === "continue" && c.prompt.includes("late steer during drain tail")
     );
     expect(steerCall).toBeDefined();
+    // And the echo lands once it is actually delivered.
+    const chunksAfterDrain = (conn.sessionUpdate as any).mock.calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "user_message_chunk")
+      .map((c: any) => c[0].update.content?.text ?? c[0].update.text);
+    expect(chunksAfterDrain.some((t: string) => t.includes("late steer during drain tail"))).toBe(true);
   });
 
   it("drops a steer for a genuinely idle session (no prompt in flight)", async () => {

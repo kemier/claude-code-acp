@@ -1698,19 +1698,13 @@ export function createClaudeCodeAgent(
     }
     steerQueues.get(sessionId)!.push(text);
     logger.info(`Steer queued for session ${sessionId}: ${text.length} chars`);
-    // Emit a user_message_chunk so the IDE shows the steering message
-    // as a user bubble in the chat (visual context).
-    try {
-      await connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "user_message_chunk",
-          content: { type: "text", text },
-        } as any,
-      });
-    } catch {
-      // ignore — best effort visual feedback
-    }
+    // NOTE: no echo here. It is emitted when the message is DRAINED to the model.
+    //
+    // vscode-acp keeps a mid-turn message queued until the agent echoes it and uses
+    // that echo as the receipt that releases the NEXT queued message. Echoing on
+    // receipt made the receipt meaningless: several interjections could be dequeued
+    // client-side while the turn was still busy, then all arrive at once and the
+    // model answers only the last. Same fault was fixed in ericli.
   }
 
   /**
@@ -3414,6 +3408,14 @@ export function createClaudeCodeAgent(
           break;
         }
         deliveredAny = true;
+        // Echo now that this message is actually going to the model, so the client's
+        // release signal means delivered rather than received.
+        await connection
+          .sessionUpdate({
+            sessionId,
+            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: steerText } } as any,
+          })
+          .catch(() => { /* non-fatal */ });
        // NOTE: the tool-call counter is deliberately NOT reset here. Restarting
        // it mid-turn on a steer drain made the steered work reuse the ids of the
        // tools that ran before it, so the client updated the wrong rows.
