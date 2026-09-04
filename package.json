@@ -8,7 +8,7 @@
     "claude-code-acp": "./bin/claude-code-acp.js"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && chmod +x dist/index.js",
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",

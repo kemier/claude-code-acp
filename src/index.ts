@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { Readable, Writable } from "node:stream";
 import {
   AgentSideConnection,
