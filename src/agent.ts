@@ -30,6 +30,7 @@ import { SessionStore, type SessionInfo } from "./session-store.js";
 import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
 import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
+import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
   discoverProxyModels,
   getAvailableModels,
@@ -2332,6 +2333,9 @@ export function createClaudeCodeAgent(
    ): Promise<LoadSessionResponse> {
      const { sessionId } = params;
 
+    // Best-effort KV cache restore before any replay — see slot-cache.ts.
+    await tryRestoreSlot(sessionId);
+
      // The agent is respawned per client session (and on window reload), so a
      // session the client is resuming may not be in this process's map. The
      // store rehydrates from disk at construction; if it still isn't there
@@ -3886,6 +3890,7 @@ export function createClaudeCodeAgent(
         _activeGoal.timeUsedSeconds += _turnElapsed;
         await publishGoalSnapshot(sessionId, connection);
       }
+      saveSessionSlot(sessionId);
       return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
     } catch (err) {
       // Check if cancelled
