@@ -169,6 +169,10 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   "mimo-v2.5-pro": ["low", "high"],
   "mimo-v2.5": ["low", "high"],
   "qwen2.5-14b-1m": [],
+  // Qwen3.8 chat template levels: low / medium / xhigh (no "high"; the
+  // template rejects "none" — thinking off comes from enable_thinking).
+  "qwen38-27b": ["low", "medium", "xhigh"],
+  "qwythos": ["low", "medium", "xhigh"],
 };
 
 const DEFAULT_EFFORTS = ["low", "medium", "high"];
