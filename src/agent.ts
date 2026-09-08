@@ -1748,6 +1748,11 @@ export function createClaudeCodeAgent(
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "No background terminals running." },
           messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          // Without this marker a client cannot tell command output from the
+          // assistant's own text, so vscode-acp's compact mode folded it into the
+          // running turn's collapsed block instead of showing it beside the command.
+          _meta: { commandOutput: true },
         } as any,
       });
       return { handled: true };
@@ -1770,6 +1775,11 @@ export function createClaudeCodeAgent(
           sessionUpdate: "agent_message_chunk",
          content: { type: "text", text: "Conversation cleared. Starting fresh." },
          messageId: nextCommandMessageId(),
+         // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+         // Without this marker a client cannot tell command output from the
+         // assistant's own text, so vscode-acp's compact mode folded it into the
+         // running turn's collapsed block instead of showing it beside the command.
+         _meta: { commandOutput: true },
        } as any,
      });
       await publishGoalSnapshot(sessionId, connection);
@@ -1784,6 +1794,11 @@ export function createClaudeCodeAgent(
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/review-branch" requires branch name.' },
             messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
           } as any,
         });
         return { handled: true };
@@ -1803,6 +1818,11 @@ export function createClaudeCodeAgent(
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/review-commit" requires commit sha.' },
             messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
           } as any,
         });
         return { handled: true };
@@ -1848,6 +1868,11 @@ export function createClaudeCodeAgent(
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: lines.join("\n") },
           messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          // Without this marker a client cannot tell command output from the
+          // assistant's own text, so vscode-acp's compact mode folded it into the
+          // running turn's collapsed block instead of showing it beside the command.
+          _meta: { commandOutput: true },
         } as any,
       });
       return { handled: true };
@@ -1921,6 +1946,11 @@ export function createClaudeCodeAgent(
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: skillsList },
           messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          // Without this marker a client cannot tell command output from the
+          // assistant's own text, so vscode-acp's compact mode folded it into the
+          // running turn's collapsed block instead of showing it beside the command.
+          _meta: { commandOutput: true },
         } as any,
       });
       return { handled: true };
@@ -1940,6 +1970,11 @@ export function createClaudeCodeAgent(
            sessionUpdate: "agent_message_chunk",
            content: { type: "text", text: statusText },
            messageId: nextCommandMessageId(),
+           // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+           // Without this marker a client cannot tell command output from the
+           // assistant's own text, so vscode-acp's compact mode folded it into the
+           // running turn's collapsed block instead of showing it beside the command.
+           _meta: { commandOutput: true },
          } as any,
        });
        await publishGoalSnapshot(sessionId, connection);
@@ -1956,6 +1991,11 @@ export function createClaudeCodeAgent(
            sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "Goal cleared." },
            messageId: nextCommandMessageId(),
+           // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+           // Without this marker a client cannot tell command output from the
+           // assistant's own text, so vscode-acp's compact mode folded it into the
+           // running turn's collapsed block instead of showing it beside the command.
+           _meta: { commandOutput: true },
          } as any,
        });
         await publishGoalSnapshot(sessionId, connection);
@@ -1972,6 +2012,11 @@ export function createClaudeCodeAgent(
               sessionUpdate: "agent_message_chunk",
              content: { type: "text", text: "Goal paused. Use /goal resume to continue." },
              messageId: nextCommandMessageId(),
+             // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+             // Without this marker a client cannot tell command output from the
+             // assistant's own text, so vscode-acp's compact mode folded it into the
+             // running turn's collapsed block instead of showing it beside the command.
+             _meta: { commandOutput: true },
            } as any,
          });
           await publishGoalSnapshot(sessionId, connection);
@@ -1982,6 +2027,11 @@ export function createClaudeCodeAgent(
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "No goal to pause. Set one with /goal <objective>." },
               messageId: nextCommandMessageId(),
+              // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+              // Without this marker a client cannot tell command output from the
+              // assistant's own text, so vscode-acp's compact mode folded it into the
+              // running turn's collapsed block instead of showing it beside the command.
+              _meta: { commandOutput: true },
             } as any,
           });
         }
@@ -2003,6 +2053,11 @@ export function createClaudeCodeAgent(
               sessionUpdate: "agent_message_chunk",
              content: { type: "text", text: `Goal resumed: ${goal.text.slice(0, 100)}` },
              messageId: nextCommandMessageId(),
+             // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+             // Without this marker a client cannot tell command output from the
+             // assistant's own text, so vscode-acp's compact mode folded it into the
+             // running turn's collapsed block instead of showing it beside the command.
+             _meta: { commandOutput: true },
            } as any,
          });
           await publishGoalSnapshot(sessionId, connection);
@@ -2013,6 +2068,11 @@ export function createClaudeCodeAgent(
               sessionUpdate: "agent_message_chunk",
               content: { type: "text", text: "No goal to resume. Set one with /goal <objective>." },
               messageId: nextCommandMessageId(),
+              // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+              // Without this marker a client cannot tell command output from the
+              // assistant's own text, so vscode-acp's compact mode folded it into the
+              // running turn's collapsed block instead of showing it beside the command.
+              _meta: { commandOutput: true },
             } as any,
           });
         }
@@ -2026,6 +2086,11 @@ export function createClaudeCodeAgent(
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: 'Command "/goal" requires goal text of at most 4000 characters.' },
             messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
           } as any,
         });
         return { handled: true };
@@ -2048,6 +2113,11 @@ export function createClaudeCodeAgent(
          sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: `Goal set: ${argument.slice(0, 200)}` },
          messageId: nextCommandMessageId(),
+         // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+         // Without this marker a client cannot tell command output from the
+         // assistant's own text, so vscode-acp's compact mode folded it into the
+         // running turn's collapsed block instead of showing it beside the command.
+         _meta: { commandOutput: true },
        } as any,
      });
       await publishGoalSnapshot(sessionId, connection);
@@ -2151,6 +2221,11 @@ export function createClaudeCodeAgent(
             sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: "No conversation to compact yet." },
             messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
           } as any,
         });
       }
@@ -3879,6 +3954,11 @@ export function createClaudeCodeAgent(
                     : `Turn ended with status: ${reason}.`,
               },
               messageId: nextCommandMessageId(),
+              // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+              // Without this marker a client cannot tell command output from the
+              // assistant's own text, so vscode-acp's compact mode folded it into the
+              // running turn's collapsed block instead of showing it beside the command.
+              _meta: { commandOutput: true },
             },
          }).catch(() => {});
        }
@@ -3928,6 +4008,11 @@ export function createClaudeCodeAgent(
               text: `Error: ${message}`,
             },
             messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
           },
         });
 
