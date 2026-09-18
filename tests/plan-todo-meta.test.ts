@@ -11,7 +11,7 @@ import * as fs from "fs";
  * default, so a checklist read as a strategy.
  *
  * The frame carries no kind of its own, so the adapter now states it in
- * _meta.acp.plan — the same adapter-neutral hint ericli sends. A client that
+ * _meta.acp.plan — the adapter-neutral hint shared across adapters. A client that
  * ignores _meta renders exactly as before, so this is additive.
  *
  * Verified while writing this: the plan bar has ALWAYS rendered a checklist

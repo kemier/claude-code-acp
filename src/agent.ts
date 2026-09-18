@@ -146,8 +146,8 @@ function buildModeState(currentModeId: string) {
 /**
  * Adapter-neutral method for reporting what a finished subagent found.
  *
- * Not under a `_claude/` prefix: ericli sends the same method with the same
- * shape, and a client that persists findings should not have to learn one
+ * Not under a `_claude/` prefix: other adapters send the same method with the
+ * same shape, and a client that persists findings should not have to learn one
  * dialect per adapter. The client treats it as a notification and may ignore it.
  */
 const SUBAGENT_FINDINGS_METHOD = "_acp/subagent/findings";
@@ -1733,7 +1733,7 @@ export function createClaudeCodeAgent(
       // channel for both a plan and a task list, and the client titles the bar
       // "Plan" by default, so a checklist read as a strategy.
       //
-      // Adapter-neutral hint (the same one ericli sends): a client that ignores
+      // Adapter-neutral hint, shared with the other adapters: a client that ignores
       // _meta renders exactly as before.
       _meta: { acp: { plan: { kind: "todo", title: "Todos" } } },
     } as any);

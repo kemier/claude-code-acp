@@ -16,7 +16,7 @@ import { extractTaskNotificationSummary } from "../src/agent.js";
  * or a skill.
  *
  * The summary is now forwarded over `_acp/subagent/findings`, the same
- * adapter-neutral method ericli sends, so a client needs one implementation
+ * adapter-neutral method the other adapters send, so a client needs one implementation
  * rather than one per adapter.
  */
 
