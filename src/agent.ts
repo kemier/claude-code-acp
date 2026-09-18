@@ -1728,7 +1728,15 @@ export function createClaudeCodeAgent(
     deliver({
       sessionUpdate: "plan",
       entries,
-    });
+      // These come from Claude Code's TaskCreate/TaskUpdate/TaskList tools — a
+      // TODO list, as the note at the top of this section says. ACP has one
+      // channel for both a plan and a task list, and the client titles the bar
+      // "Plan" by default, so a checklist read as a strategy.
+      //
+      // Adapter-neutral hint (the same one ericli sends): a client that ignores
+      // _meta renders exactly as before.
+      _meta: { acp: { plan: { kind: "todo", title: "Todos" } } },
+    } as any);
     return true;
   }
 
