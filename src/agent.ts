@@ -143,7 +143,71 @@ function buildModeState(currentModeId: string) {
   };
 }
 
-/** All possible effort levels (Claude Code CLI --effort flag). */
+/**
+ * Adapter-neutral method for reporting what a finished subagent found.
+ *
+ * Not under a `_claude/` prefix: ericli sends the same method with the same
+ * shape, and a client that persists findings should not have to learn one
+ * dialect per adapter. The client treats it as a notification and may ignore it.
+ */
+const SUBAGENT_FINDINGS_METHOD = "_acp/subagent/findings";
+
+/** Bound on a reported summary — enough to be useful, not a transcript dump. */
+const MAX_FINDINGS_SUMMARY_CHARS = 8000;
+
+/**
+ * Pull a finished subagent's result out of its `<task-notification>`.
+ *
+ * Claude Code delivers a completed subagent as a user message like:
+ *
+ *   <task-notification>
+ *   Agent "Trace interrupt message wiring" completed
+ *   <summary>… what it found …</summary>
+ *   </task-notification>
+ *
+ * The `<summary>` is the part worth keeping. When it is absent the notification
+ * body is used instead, minus the agent-name line that only repeats the
+ * description we already send as the task.
+ *
+ * Returns null when nothing substantive is left, so an empty notification is not
+ * reported as a finding with no content.
+ */
+export function extractTaskNotificationSummary(
+  notif: string,
+  description: string,
+): { summary: string; stopped: boolean } | null {
+  const text = String(notif || "");
+  // "… [stopped]" marks a subagent that did not run to completion. Its partial
+  // work is still worth recording, but not as a success.
+  const stopped = /\bstopped\b/i.test(text);
+
+  let body = "";
+  const sm = /<summary>([\s\S]*?)<\/summary>/i.exec(text);
+  if (sm) {
+    body = sm[1];
+  } else {
+    body = text
+      .replace(/<\/?task-notification>/gi, "")
+      // Drop the "Agent \"desc\" completed" / "background agent \"desc\" …" line:
+      // it carries no findings and duplicates the task we already send.
+      .replace(/^\s*(background\s+)?agent\s+"[^"]*"[^\n]*\n?/gim, "");
+  }
+  // The description appears verbatim in the notification (that is how the
+  // spawn→completion match is made) and adds nothing next to `task`.
+  if (description) {
+    body = body.split(description).join("").trim();
+  }
+  body = body.trim();
+  if (!body) {
+    return null;
+  }
+  if (body.length > MAX_FINDINGS_SUMMARY_CHARS) {
+    body = body.slice(0, MAX_FINDINGS_SUMMARY_CHARS) + "\n…(truncated)";
+  }
+  return { summary: body, stopped };
+}
+
+
 const ALL_EFFORT_LEVELS: Record<string, { name: string; description: string }> = {
   low: { name: "Low", description: "Fast, minimal reasoning" },
   medium: { name: "Medium", description: "Balanced reasoning" },
@@ -3157,6 +3221,34 @@ export function createClaudeCodeAgent(
                     } as any,
                   })
                   .catch(() => {});
+                // Report what the subagent actually FOUND, not just that it
+                // stopped.
+                //
+                // This notification is the only place its result exists on this
+                // side: Claude Code delivers a finished subagent as this user
+                // message, its content never enters the main conversation's
+                // prompt, and the client's own memory capture records tool_call
+                // titles plus the main assistant text — never tool results. So
+                // without this the work is unrecoverable the moment the turn
+                // ends, and could never become memory or a skill.
+                //
+                // Fire-and-forget: a client that does not implement the method,
+                // or does not want the data, must not disturb a subagent that has
+                // already finished.
+                const findings = extractTaskNotificationSummary(notif, info.description);
+                if (findings) {
+                  connection
+                    .extNotification(SUBAGENT_FINDINGS_METHOD, {
+                      sessionId,
+                      id: tuId,
+                      type: "subagent",
+                      label: info.description,
+                      task: info.description,
+                      status: findings.stopped ? "stopped" : "completed",
+                      summary: findings.summary,
+                    })
+                    .catch(() => {});
+                }
                 logger.info(
                   `Subagent "${info.description}" (${tuId}) completion ` +
                     `notified via <task-notification>; marked completed.`,
