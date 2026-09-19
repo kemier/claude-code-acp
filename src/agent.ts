@@ -4091,6 +4091,10 @@ export function createClaudeCodeAgent(
           _cancelledGoal.timeUsedSeconds += _turnElapsed;
           void publishGoalSnapshot(sessionId, connection).catch(() => {});
         }
+        // A cancelled turn still leaves the full prompt prefix in the slot's
+        // KV — persisting it lets the next resume skip the cold prefill even
+        // though this turn never completed.
+        saveSessionSlot(sessionId);
         return { stopReason: "cancelled" };
       }
 

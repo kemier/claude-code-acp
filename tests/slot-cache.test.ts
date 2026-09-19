@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  getAllSlots,
   getLlamaServerUrl,
-  getSlotInfo,
   isSlotCacheEnabled,
   restoreSlotCache,
   saveSlotCache,
@@ -59,12 +59,12 @@ describe("getLlamaServerUrl", () => {
   });
 });
 
-describe("getSlotInfo", () => {
+describe("getAllSlots", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("reads the matching slot from the /slots list endpoint", async () => {
+  it("reads all slots from the /slots list endpoint", async () => {
     process.env.CLAUDE_LLAMA_SERVER_URL = "http://host:8008";
     const fetchMock = vi.fn(async (url: string) => {
       expect(String(url)).toBe("http://host:8008/slots");
@@ -78,13 +78,11 @@ describe("getSlotInfo", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const info = await getSlotInfo(0);
-    expect(info).toEqual({
-      id: 0,
-      nPromptTokens: 5000,
-      nPromptTokensCache: 100,
-      isProcessing: false,
-    });
+    const slots = await getAllSlots();
+    expect(slots).toEqual([
+      {id: 0, nPromptTokens: 5000, isProcessing: false},
+      {id: 1, nPromptTokens: 0, isProcessing: false},
+    ]);
   });
 
   it("returns null when the slot endpoint is unreachable", async () => {
@@ -95,7 +93,7 @@ describe("getSlotInfo", () => {
         throw new Error("connection refused");
       }),
     );
-    expect(await getSlotInfo(0)).toBe(null);
+    expect(await getAllSlots()).toBe(null);
   });
 });
 
@@ -216,5 +214,37 @@ describe("session wrappers", () => {
 
     await tryRestoreSlot("sess-1");
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("tryRestoreSlot restores into every empty slot on multi-slot servers", async () => {
+    process.env.CLAUDE_SLOT_CACHE_ENABLED = "true";
+    process.env.CLAUDE_LLAMA_SERVER_URL = "http://host:8008";
+    const restored: string[] = [];
+    const fetchMock = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u === "http://host:8008/slots") {
+        return {
+          ok: true,
+          json: async () => [
+            {id: 0, n_prompt_tokens: 8000, n_prompt_tokens_cache: 0, is_processing: true},
+            {id: 1, n_prompt_tokens: 0, n_prompt_tokens_cache: 0, is_processing: false},
+            {id: 2, n_prompt_tokens: 0, n_prompt_tokens_cache: 0, is_processing: false},
+          ],
+        };
+      }
+      restored.push(u);
+      return {
+        ok: true,
+        json: async () => ({filename: "sess-1.bin", n_restored: 10, n_read: 1000}),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await tryRestoreSlot("sess-1");
+    // Slot 0 is busy (8000 tokens) — only the two empty slots get the restore.
+    expect(restored).toEqual([
+      "http://host:8008/slots/1?action=restore",
+      "http://host:8008/slots/2?action=restore",
+    ]);
   });
 });
