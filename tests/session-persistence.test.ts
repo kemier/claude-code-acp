@@ -3,16 +3,18 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-// SessionStore resolves its store path from homedir() at import time, so point
-// HOME at a scratch dir BEFORE importing it.
+// SessionStore resolves its store path at import time, so point it at a scratch
+// dir BEFORE importing it. CLAUDE_ACP_STORE_DIR is the documented override (see
+// session-store.ts); HOME is still redirected for anything else that reads it.
 let home: string;
 home = mkdtempSync(join(tmpdir(), "ccacp-store-"));
 process.env.HOME = home;
+process.env.CLAUDE_ACP_STORE_DIR = join(home, ".claude-code-acp");
 delete process.env.ACPX_SESSION_NAME;
 
 const { SessionStore } = await import("../src/session-store.js");
 
-const STORE_FILE = () => join(process.env.HOME!, ".claude-code-acp", "sessions.json");
+const STORE_FILE = () => join(process.env.CLAUDE_ACP_STORE_DIR!, "sessions.json");
 
 describe("SessionStore persistence across agent restarts", () => {
   beforeEach(() => {

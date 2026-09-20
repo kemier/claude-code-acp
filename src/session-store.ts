@@ -4,7 +4,18 @@ import { homedir } from "node:os";
 import type { McpServerConfig } from "./claude-runner.js";
 import { logger } from "./logger.js";
 
-const STORE_DIR = join(homedir(), ".claude-code-acp");
+/**
+ * Where session state lives.
+ *
+ * `CLAUDE_ACP_STORE_DIR` exists because the test suite writes this file for
+ * real: any test that does not mock `node:fs` persisted into the developer's
+ * own ~/.claude-code-acp/sessions.json, and a full `vitest run` replaced the
+ * live map with fixture entries (`cwd:/tmp` → `uuid-perm`) — destroying the
+ * cwd → Claude-session mapping of every real session on the machine. Measured:
+ * a 16-session store reduced to one fixture record. tests/setup.ts points this
+ * at a per-run temp dir so the suite can never touch live state again.
+ */
+const STORE_DIR = process.env.CLAUDE_ACP_STORE_DIR || join(homedir(), ".claude-code-acp");
 const STORE_FILE = join(STORE_DIR, "sessions.json");
 
 export interface SessionInfo {
