@@ -243,6 +243,21 @@ describe("model & effort pickers", () => {
     }
   });
 
+  it("Qwen3.8-Flash-Next effort picker offers only low/medium", async () => {
+    // The Ray cluster's extra_body_suggestions for Qwen3.8-Flash-Next-FP8
+    // advertise only low/medium (verified via `ericai api models.list`):
+    // `high` 500s at the deployed chat template and upstream's `xhigh` 422s
+    // at the vLLM schema. The picker must not offer a rejected tier.
+    process.env.CLAUDE_ACP_AVAILABLE_MODELS = "Qwen3.8-Flash-Next";
+    process.env.ANTHROPIC_MODEL = "Qwen3.8-Flash-Next";
+    clearClaudeSettingsCache();
+    const { agent } = await setup();
+    const r: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+    const effortPicker = r.configOptions.find((o: any) => o.id === "effort");
+    expect(effortPicker).toBeDefined();
+    expect(effortPicker.options.map((o: any) => o.value)).toEqual(["low", "medium"]);
+  });
+
   it("selecting a non-reasoning model hides the effort picker", async () => {
     const { agent } = await setup();
     const r1: any = await agent.newSession({ cwd: "/tmp", mcpServers: [] });

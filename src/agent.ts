@@ -270,6 +270,10 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   // template rejects "none" — thinking off comes from enable_thinking).
   "qwen38-27b": ["low", "medium", "xhigh"],
   "qwythos": ["low", "medium", "xhigh"],
+  // Qwen3.8-Flash-Next: the Ray cluster's extra_body_suggestions advertise
+  // only low/medium (verified via `ericai api models.list`). `high` 500s at
+  // the deployed chat template; upstream's `xhigh` 422s at the vLLM schema.
+  "Qwen3.8-Flash-Next": ["low", "medium"],
 };
 
 const DEFAULT_EFFORTS = ["low", "medium", "high"];
