@@ -1,0 +1,57 @@
+import { describe, it, expect } from "vitest";
+import { ClaudeRunner, isProxyBaseUrl } from "../src/claude-runner.js";
+
+// buildExtraArgs is private on ClaudeRunner; this targeted suite exercises it
+// on the real module WITHOUT mocking claude-runner (the watchdog suite mocks
+// that module and must stay separate).
+function extraArgsFor(base: string | undefined, keep?: string): string[] {
+  const savedBase = process.env.ANTHROPIC_BASE_URL;
+  const savedKeep = process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
+  try {
+    if (base === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = base;
+    if (keep === undefined) delete process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
+    else process.env.CLAUDE_ACP_KEEP_WEB_TOOLS = keep;
+    const runner = new ClaudeRunner();
+    return (runner as any).buildExtraArgs(undefined, undefined);
+  } finally {
+    if (savedBase === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = savedBase;
+    if (savedKeep === undefined) delete process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
+    else process.env.CLAUDE_ACP_KEEP_WEB_TOOLS = savedKeep;
+  }
+}
+
+describe("isProxyBaseUrl", () => {
+  it("treats unset as direct (keeps web tools)", () => {
+    expect(isProxyBaseUrl(undefined)).toBe(false);
+  });
+  it("treats anthropic.com and subdomains as direct", () => {
+    expect(isProxyBaseUrl("https://api.anthropic.com")).toBe(false);
+    expect(isProxyBaseUrl("https://my-gateway.anthropic.com/v1")).toBe(false);
+  });
+  it("treats anything else as a proxy (drops web tools)", () => {
+    expect(isProxyBaseUrl("http://127.0.0.1:8317")).toBe(true);
+    expect(isProxyBaseUrl("https://proxy.corp.example.com/v1")).toBe(true);
+    expect(isProxyBaseUrl("anthropic.com.evil.example")).toBe(true);
+    expect(isProxyBaseUrl("not a url")).toBe(true);
+  });
+});
+
+describe("buildExtraArgs drops server-side web tools on a proxy route", () => {
+  it("adds --disallowedTools WebSearch,WebFetch for a proxy base URL", () => {
+    const args = extraArgsFor("http://127.0.0.1:8317");
+    const i = args.indexOf("--disallowedTools");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe("WebSearch,WebFetch");
+  });
+
+  it("does NOT add it for a direct Anthropic route", () => {
+    expect(extraArgsFor("https://api.anthropic.com")).not.toContain("--disallowedTools");
+    expect(extraArgsFor(undefined)).not.toContain("--disallowedTools");
+  });
+
+  it("honors the CLAUDE_ACP_KEEP_WEB_TOOLS=1 escape hatch", () => {
+    expect(extraArgsFor("http://127.0.0.1:8317", "1")).not.toContain("--disallowedTools");
+  });
+});

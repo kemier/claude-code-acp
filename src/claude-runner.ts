@@ -110,6 +110,24 @@ export interface StreamEvent {
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
 const REDACT_FLAGS = new Set(["--resume"]);
 
+/**
+ * True when the base URL routes LLM calls somewhere other than the real
+ * Anthropic API — a proxy/gateway (ericai-proxy, a local relay, anything
+ * non-anthropic). Empty/undefined or a *.anthropic.com host means real
+ * Anthropic is in front (direct, or a pass-through on the official host),
+ * where the server-side WebSearch/WebFetch tools do work.
+ */
+export function isProxyBaseUrl(baseUrl: string | undefined): boolean {
+  if (!baseUrl) return false;
+  try {
+    const host = new URL(baseUrl).hostname;
+    return !/(^|\.)anthropic\.com$/i.test(host);
+  } catch {
+    // Unparseable URL — treat as a proxy (it is certainly not the API).
+    return true;
+  }
+}
+
 export function maskArgs(args: string[]): string {
   const masked: string[] = [];
   for (let i = 0; i < args.length; i++) {
@@ -194,6 +212,18 @@ export class ClaudeRunner {
     const model = modelOverride || this.config.model;
     if (model) {
       extra.push("--model", model);
+    }
+    // WebSearch/WebFetch are server-side Anthropic tools: the search/fetch is
+    // executed by Anthropic's API, not the CLI. With ANTHROPIC_BASE_URL pointed
+    // at a proxy serving non-Claude models (ericai-proxy: GLM/DeepSeek/Qwen),
+    // nobody executes them — the tool_use opens and waits for a tool_result
+    // that never arrives, which the chat shows as a hung turn. Drop them from
+    // the advertised set so the model never calls an unsupported tool. A
+    // direct Anthropic route keeps them (real Claude models do execute them).
+    // Override with CLAUDE_ACP_KEEP_WEB_TOOLS=1 on a proxy route that does
+    // front a web-search-capable backend.
+    if (!process.env.CLAUDE_ACP_KEEP_WEB_TOOLS && isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL)) {
+      extra.push("--disallowedTools", "WebSearch,WebFetch");
     }
     if (effortOverride) {
       extra.push("--effort", effortOverride);
@@ -824,6 +854,9 @@ export class ClaudeRunner {
     // drops every heartbeat and the chat UI shows a frozen, silent in_progress
     // tool that looks exactly like a hung session. Forwarding it lets agent.ts
     // refresh the tool_call_update with the elapsed time.
+    // Defense in depth: even if the tool still fires (e.g. an override kept
+    // it, or a session started before the gate existed), relay the elapsed
+    // time so agent.ts can surface a watchdog instead of a silent freeze.
     if (parsed.type === "tool_progress") {
       onEvent({
         type: "tool_progress",

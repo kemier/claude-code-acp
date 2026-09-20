@@ -28,7 +28,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { SessionStore, type SessionInfo } from "./session-store.js";
 import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
-import { ClaudeRunner, type StreamEvent } from "./claude-runner.js";
+import { ClaudeRunner, isProxyBaseUrl, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
@@ -300,6 +300,13 @@ function resolveSessionModel(
     modelOverride ?? (store.getConfigOverrides(sessionId)["model"] as string | undefined);
   return override || getDefaultModelFromSettings();
 }
+
+// Watchdog timers for server-side web tools (WebSearch/WebFetch) that can
+// never be executed on a proxy route, keyed by session so a settled turn can
+// clear them wholesale. Each timer also no-ops if its tool completed or was
+// flushed in the meantime.
+const webToolWatchdogs = new Map<string, Set<NodeJS.Timeout>>();
+const WEB_TOOL_TIMEOUT_MS = 90_000;
 
 /** Built-in slash commands (mirrors codex-acp's CodexCommands). */
 const BUILTIN_COMMANDS = [
@@ -3590,6 +3597,58 @@ export function createClaudeCodeAgent(
              sessionPendingTools.set(sessionId, pendingTools);
            }
            pendingTools.set(event.toolUseId, toolCallId);
+           // Server-side tool watchdog. WebSearch/WebFetch execute on
+           // Anthropic's API, so on a proxy route (non-anthropic
+           // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes
+           // them and the tool hangs with no tool_result ever arriving. The
+           // CLI is told not to advertise them (claude-runner
+           // buildExtraArgs), but the adapter must never depend on that
+           // alone: flip the row to failed after a bounded wait so the user
+           // sees a named cause instead of a frozen spinner. Cancel is
+           // handled centrally at the prompt return (the cancelled flag +
+           // "Turn ended with N tool(s) still pending" flush), so the timer
+           // only needs to skip when the tool completes normally — hence the
+           // per-session map plus a clear when the turn settles.
+           if (
+             (event.toolName === "WebSearch" || event.toolName === "WebFetch") &&
+             isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL) &&
+             !/^claude/i.test(resolveSessionModel(store, sessionId, modelOverride))
+           ) {
+             const tuId = event.toolUseId;
+             const timer = setTimeout(() => {
+               webToolWatchdogs.get(sessionId)?.delete(timer);
+               const pend = sessionPendingTools.get(sessionId);
+               if (!pend?.has(tuId)) return; // completed / flushed already
+               pend.delete(tuId);
+               if (pend.size === 0) sessionPendingTools.delete(sessionId);
+               logger.info(
+                 `Web tool ${event.toolName} (${tuId}) timed out after ${WEB_TOOL_TIMEOUT_MS}ms ` +
+                   `on a proxy route — no server-side backend executed it.`,
+               );
+               connection
+                 .sessionUpdate({
+                   sessionId,
+                   update: {
+                     sessionUpdate: "tool_call_update",
+                     toolCallId,
+                     status: "failed",
+                     _meta: {
+                       claudeCode: {
+                         error:
+                           "Web tools are executed by the Anthropic API and are not available on this proxy route.",
+                       },
+                     },
+                   } as any,
+                 })
+                 .catch(() => {});
+             }, WEB_TOOL_TIMEOUT_MS);
+             let timers = webToolWatchdogs.get(sessionId);
+             if (!timers) {
+               timers = new Set();
+               webToolWatchdogs.set(sessionId, timers);
+             }
+             timers.add(timer);
+           }
          }
          connection.sessionUpdate({
            sessionId,
@@ -4073,6 +4132,11 @@ export function createClaudeCodeAgent(
         // before end_turn (e.g. a tool_use emitted in the final assistant
         // message with no following user/tool_result) would otherwise hang in
         // in_progress forever. Mark them completed as a fallback.
+        // The turn has settled — its web-tool watchdogs can no longer fire
+        // meaningfully (the pending-tools map is about to be flushed), so
+        // clear them to keep no timer alive past the turn.
+        for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
+        webToolWatchdogs.delete(sessionId);
         const pendingTools = sessionPendingTools.get(sessionId);
         if (pendingTools && pendingTools.size > 0) {
           logger.info(
@@ -4244,6 +4308,10 @@ export function createClaudeCodeAgent(
       saveSessionSlot(sessionId);
       return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
     } catch (err) {
+      // The turn is unwinding (cancel or failure) — no watchdog may fire
+      // against tools the post-turn flush is about to settle.
+      for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
+      webToolWatchdogs.delete(sessionId);
       // Check if cancelled
       if (cancelledSessions.has(sessionId)) {
         cancelledSessions.delete(sessionId);
