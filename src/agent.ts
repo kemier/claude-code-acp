@@ -336,6 +336,11 @@ const BUILTIN_COMMANDS = [
     name: "ps",
     description: "List background terminal processes.",
     input: null,
+    // Read-only snapshot: dispatchSlashCommand services it from current state
+    // with no LLM turn and no state change, so vscode-acp may send it mid-turn
+    // as a side-channel request (surviving any streaming turn on the agent
+    // side) instead of queuing it. Mirrors ericli's /ps declaration.
+    _meta: { turnSafe: true },
   },
   {
     name: "goal",
@@ -346,11 +351,15 @@ const BUILTIN_COMMANDS = [
     name: "skills",
     description: "List available skills.",
     input: null,
+    // Read-only: scans the skill dirs and emits a snapshot. No turn, no state.
+    _meta: { turnSafe: true },
   },
   {
     name: "status",
     description: "Display session configuration and token usage.",
     input: null,
+    // Read-only snapshot of config/usage; no turn, no state change.
+    _meta: { turnSafe: true },
   },
   {
     name: "clear",
