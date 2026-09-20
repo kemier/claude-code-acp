@@ -301,7 +301,8 @@ function resolveSessionModel(
   return override || getDefaultModelFromSettings();
 }
 
-// Watchdog timers for server-side web tools (WebSearch/WebFetch) that can
+// Watchdog timers for the server-side WebSearch tool (the CLI performs
+// WebFetch itself, so only WebSearch can hang) that can
 // never be executed on a proxy route, keyed by session so a settled turn can
 // clear them wholesale. Each timer also no-ops if its tool completed or was
 // flushed in the meantime.
@@ -3597,11 +3598,12 @@ export function createClaudeCodeAgent(
              sessionPendingTools.set(sessionId, pendingTools);
            }
            pendingTools.set(event.toolUseId, toolCallId);
-           // Server-side tool watchdog. WebSearch/WebFetch execute on
+           // Server-side tool watchdog. WebSearch executes on
            // Anthropic's API, so on a proxy route (non-anthropic
            // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes
-           // them and the tool hangs with no tool_result ever arriving. The
-           // CLI is told not to advertise them (claude-runner
+           // it and the tool hangs with no tool_result ever arriving (the
+           // CLI performs WebFetch itself, so it is not at risk). The
+           // CLI is told not to advertise it (claude-runner
            // buildExtraArgs), but the adapter must never depend on that
            // alone: flip the row to failed after a bounded wait so the user
            // sees a named cause instead of a frozen spinner. Cancel is
@@ -3610,7 +3612,7 @@ export function createClaudeCodeAgent(
            // only needs to skip when the tool completes normally — hence the
            // per-session map plus a clear when the turn settles.
            if (
-             (event.toolName === "WebSearch" || event.toolName === "WebFetch") &&
+             event.toolName === "WebSearch" &&
              isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL) &&
              !/^claude/i.test(resolveSessionModel(store, sessionId, modelOverride))
            ) {

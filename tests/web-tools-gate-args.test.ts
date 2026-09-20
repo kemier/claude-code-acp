@@ -39,11 +39,14 @@ describe("isProxyBaseUrl", () => {
 });
 
 describe("buildExtraArgs drops server-side web tools on a proxy route", () => {
-  it("adds --disallowedTools WebSearch,WebFetch for a proxy base URL", () => {
+  it("adds --disallowedTools WebSearch for a proxy base URL", () => {
     const args = extraArgsFor("http://127.0.0.1:8317");
     const i = args.indexOf("--disallowedTools");
     expect(i).toBeGreaterThanOrEqual(0);
-    expect(args[i + 1]).toBe("WebSearch,WebFetch");
+    expect(args[i + 1]).toBe("WebSearch");
+    // WebFetch is executed client-side by the CLI and returns real results
+    // through the proxy — it must stay available.
+    expect(args[i + 1]).not.toContain("WebFetch");
   });
 
   it("does NOT add it for a direct Anthropic route", () => {

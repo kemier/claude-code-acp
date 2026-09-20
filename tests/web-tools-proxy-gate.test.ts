@@ -130,20 +130,27 @@ describe("web-tool watchdog fails a hung server-side tool", () => {
     }
   });
 
-  it("leaves a completed web tool alone when the result lands in time", async () => {
-    const run = await runWithEvents([
-      {
-        type: "tool_use",
-        toolName: "WebFetch",
-        toolInput: { url: "https://example.com" },
-        toolUseId: "tu_fetch",
-      },
-      { type: "user", text: "fetched", toolResultIds: ["tu_fetch"] },
-    ]);
-    const updates = await run.finish();
-    const frames = updates.filter(
-      (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
-    );
-    expect(frames.some((u: any) => u.status === "failed")).toBe(false);
+  it("leaves a WebFetch alone: the CLI fetches client-side on proxy routes", async () => {
+    vi.useFakeTimers();
+    try {
+      const run = await runWithEvents([
+        {
+          type: "tool_use",
+          toolName: "WebFetch",
+          toolInput: { url: "https://example.com" },
+          toolUseId: "tu_fetch",
+        },
+      ]);
+      // Advance past the watchdog window while the turn is open — WebFetch
+      // must NOT be failed, it returns results even on a proxy route.
+      await vi.advanceTimersByTimeAsync(95_000);
+      const updates = await run.finish();
+      const frames = updates.filter(
+        (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+      );
+      expect(frames.some((u: any) => u.status === "failed")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

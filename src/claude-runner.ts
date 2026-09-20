@@ -115,7 +115,7 @@ const REDACT_FLAGS = new Set(["--resume"]);
  * Anthropic API — a proxy/gateway (ericai-proxy, a local relay, anything
  * non-anthropic). Empty/undefined or a *.anthropic.com host means real
  * Anthropic is in front (direct, or a pass-through on the official host),
- * where the server-side WebSearch/WebFetch tools do work.
+ * where the server-side WebSearch tool does work.
  */
 export function isProxyBaseUrl(baseUrl: string | undefined): boolean {
   if (!baseUrl) return false;
@@ -213,17 +213,19 @@ export class ClaudeRunner {
     if (model) {
       extra.push("--model", model);
     }
-    // WebSearch/WebFetch are server-side Anthropic tools: the search/fetch is
-    // executed by Anthropic's API, not the CLI. With ANTHROPIC_BASE_URL pointed
-    // at a proxy serving non-Claude models (ericai-proxy: GLM/DeepSeek/Qwen),
-    // nobody executes them — the tool_use opens and waits for a tool_result
-    // that never arrives, which the chat shows as a hung turn. Drop them from
-    // the advertised set so the model never calls an unsupported tool. A
-    // direct Anthropic route keeps them (real Claude models do execute them).
+    // WebSearch is a server-side Anthropic tool: the search is executed by
+    // Anthropic's API, not the CLI. With ANTHROPIC_BASE_URL pointed at a proxy
+    // serving non-Claude models (ericai-proxy: GLM/DeepSeek/Qwen), nobody
+    // executes it — the tool_use opens and waits for a tool_result that never
+    // arrives, which the chat shows as a hung turn. Drop it from the advertised
+    // set so the model never calls an unsupported tool. A direct Anthropic
+    // route keeps it (real Claude models do execute it). WebFetch is NOT
+    // dropped: the CLI performs the fetch client-side and returns real
+    // results through the proxy, so it stays available.
     // Override with CLAUDE_ACP_KEEP_WEB_TOOLS=1 on a proxy route that does
     // front a web-search-capable backend.
     if (!process.env.CLAUDE_ACP_KEEP_WEB_TOOLS && isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL)) {
-      extra.push("--disallowedTools", "WebSearch,WebFetch");
+      extra.push("--disallowedTools", "WebSearch");
     }
     if (effortOverride) {
       extra.push("--effort", effortOverride);
