@@ -346,6 +346,11 @@ const BUILTIN_COMMANDS = [
     name: "goal",
     description: "Set a goal to keep pursuing.",
     input: { hint: "[<objective>|clear|pause|resume]" },
+    // Turn-safe for the subcommands that need NO LLM turn (bare status, /clear
+    // and its aliases, /pause, /resume). exactArgs (not a plain array, not
+    // true) so that `/goal <objective>` still starts a turn and therefore
+    // queues mid-turn — same declaration vscode-acp's tests and ericli use.
+    _meta: { turnSafe: { exactArgs: ['', 'clear', 'stop', 'off', 'reset', 'none', 'cancel', 'pause', 'resume'] } },
   },
   {
     name: "skills",
