@@ -530,6 +530,30 @@ const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
 /** The CLI's max-output default for model ids it does not recognize. */
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
 
+// ─── Replay prompt framing strip ──────────────────────────────────────────
+// The steer drain and the goal turn wrap the user's text in framing prefixes
+// before sending it to the CLI: "[Follow-up instruction from user]\n…" and
+// "[Goal: …]\n\n…" (plus the goal preamble "Please start working toward this
+// goal now:\n\n…"). The Claude CLI persists the *wrapped* text into the JSONL
+// transcript, so on resume/loadSession the wrapper — the framing, the goal
+// annotation, and nested combinations — is replayed into the chat panel as if
+// the user had typed it, duplicating the same line once per steered round.
+// It also accumulates: a steer of a steer stacks wrappers. Strip the framing
+// on replay so the user's own words come back clean. Iterated to a fixed
+// point because the wrappers nest.
+const REPLAY_PROMPT_FRAMING_RE =
+  /^(?:\[Follow-up instruction from user\]\n|\[Goal:[^\]]*\]\n\n|Please start working toward this goal now:\n\n)+/;
+
+export function stripReplayPromptFraming(text: string): string {
+  let prev: string;
+  let cur = text;
+  do {
+    prev = cur;
+    cur = cur.replace(REPLAY_PROMPT_FRAMING_RE, "");
+  } while (cur !== prev);
+  return cur;
+}
+
 /**
  * Scan Claude CLI's on-disk transcripts for a working directory and surface
  * them as SessionInfo entries — the same way kiro-cli enumerates
@@ -2636,7 +2660,10 @@ export function createClaudeCodeAgent(
                 if (entry.type === "user") {
                   const msg = entry.message;
                   if (!msg) continue;
-                  const content = msg.content;
+                  let content = msg.content;
+                  if (typeof content === "string") {
+                    content = stripReplayPromptFraming(content);
+                  }
                   if (typeof content === "string" && content.trim()) {
                     replayedUpdates.push({
                       sessionUpdate: "user_message_chunk",
@@ -2645,9 +2672,11 @@ export function createClaudeCodeAgent(
                   } else if (Array.isArray(content)) {
                     for (const block of content) {
                       if (block.type === "text" && block.text) {
+                        const clean = stripReplayPromptFraming(block.text);
+                        if (!clean.trim()) continue;
                         replayedUpdates.push({
                           sessionUpdate: "user_message_chunk",
-                          content: { type: "text", text: block.text },
+                          content: { type: "text", text: clean },
                         });
                       }
                     }
