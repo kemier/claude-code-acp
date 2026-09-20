@@ -533,6 +533,15 @@ export class ClaudeRunner {
       let buffer = "";
       let resultText = "";
       let sessionId = "";
+      // Captured so a non-zero exit can say WHY. Without it the rejection was a
+      // bare "claude exited with code 1", which the resume fallback could not
+      // tell apart from a stale session id — so a dead upstream cost the whole
+      // conversation. See isTransientTurnFailure in agent.ts.
+      let stderrText = "";
+
+      proc.stderr!.on("data", (data: Buffer) => {
+        stderrText += data.toString();
+      });
 
       proc.stdout!.on("data", (data: Buffer) => {
         buffer += data.toString();
@@ -605,7 +614,8 @@ export class ClaudeRunner {
         }
 
         if (code !== 0 && code !== null) {
-          reject(new Error(`claude exited with code ${code}`));
+          const detail = stderrText.trim() || resultText.trim();
+          reject(new Error(`claude exited with code ${code}${detail ? `: ${detail.slice(0, 2000)}` : ""}`));
           return;
         }
 
@@ -666,6 +676,15 @@ export class ClaudeRunner {
       let buffer = "";
       let resultText = "";
       let sessionId = "";
+      // Captured so a non-zero exit can say WHY. Without it the rejection was a
+      // bare "claude exited with code 1", which the resume fallback could not
+      // tell apart from a stale session id — so a dead upstream cost the whole
+      // conversation. See isTransientTurnFailure in agent.ts.
+      let stderrText = "";
+
+      proc.stderr!.on("data", (data: Buffer) => {
+        stderrText += data.toString();
+      });
 
       proc.stdout!.on("data", (data: Buffer) => {
         buffer += data.toString();
@@ -725,7 +744,8 @@ export class ClaudeRunner {
         }
 
         if (code !== 0 && code !== null) {
-          reject(new Error(`claude exited with code ${code}`));
+          const detail = stderrText.trim() || resultText.trim();
+          reject(new Error(`claude exited with code ${code}${detail ? `: ${detail.slice(0, 2000)}` : ""}`));
           return;
         }
 

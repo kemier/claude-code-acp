@@ -172,6 +172,39 @@ const MAX_FINDINGS_SUMMARY_CHARS = 8000;
  * Returns null when nothing substantive is left, so an empty notification is not
  * reported as a finding with no content.
  */
+/**
+ * True when a failed `claude` turn failed for a reason that says nothing about
+ * the session id — a dead or unhappy upstream, not a stale conversation.
+ *
+ * This decides whether a failed `--resume` may destroy the session mapping.
+ * Reported case: the local model proxy was killed mid-session, `--resume` exited
+ * 1 with "API Error: Connection refused", and the resume fallback read that as
+ * "expired session", cleared the persisted id and started a FRESH Claude
+ * conversation. The user resumed, said "go on", and the agent answered "I don't
+ * have any prior task in this session" — 68 commands of context abandoned while
+ * the transcript still sat on disk. Retrying an outage costs nothing; losing the
+ * conversation is unrecoverable through the UI.
+ *
+ * `sawApiError` comes from the stream's own result event (isError), which is the
+ * most reliable signal: it is set whenever Claude reported an API-level failure,
+ * whatever the wording.
+ */
+export function isTransientTurnFailure(message: string, sawApiError = false): boolean {
+  if (sawApiError) {
+    return true;
+  }
+  const m = String(message || '');
+  return (
+    /API Error/i.test(m) ||
+    /connection refused|ECONNREFUSED|ECONNRESET|EPIPE/i.test(m) ||
+    /ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND/i.test(m) ||
+    /socket hang up|fetch failed|network error|tunnel|proxy/i.test(m) ||
+    /\b(?:429|5\d\d)\b/.test(m) ||
+    /overloaded|rate.?limit|too many requests|timed? ?out|timeout/i.test(m) ||
+    /unauthorized|forbidden|invalid.{0,12}api.{0,4}key|token expired/i.test(m)
+  );
+}
+
 export function extractTaskNotificationSummary(
   notif: string,
   description: string,
@@ -3780,9 +3813,23 @@ export function createClaudeCodeAgent(
                   effectiveEffort
                 );
           } catch (resumeErr) {
+            const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+            // A dead upstream must NOT cost the conversation. Starting fresh
+            // here clears the persisted Claude session id, and nothing in the UI
+            // can put it back — the user resumes, says "go on", and the agent
+            // has no prior context while the transcript is still on disk.
+            // Only a failure that actually implicates the session id may fall
+            // back; anything transient is surfaced so a retry can resume.
+            if (isTransientTurnFailure(resumeMsg, turnErrored)) {
+              logger.warn(
+                `Resume failed for ${claudeSessionIdForTurn} with a transient failure — ` +
+                  `keeping the session id so a retry can resume: ${resumeMsg}`,
+              );
+              throw resumeErr;
+            }
             // Resume failed (expired session, etc.) — fall back to new session
             logger.warn(
-              `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeErr instanceof Error ? resumeErr.message : String(resumeErr)}`
+              `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeMsg}`
             );
             store.clearPersistedSession(cwd);
             result = hasImages
