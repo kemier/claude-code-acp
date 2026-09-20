@@ -1769,6 +1769,14 @@ export function createClaudeCodeAgent(
       logger.info(`Steer request for idle session ${sessionId} — ignoring (no active turn)`);
       return;
     }
+    // The turn this steer was aimed at is being cancelled. Queuing it now would
+    // reintroduce exactly what the cancel discards: the steer would sit here
+    // until the NEXT turn's drain and be answered after a message the user sent
+    // later. The client still holds it queued, so it drains as its own prompt.
+    if (cancelledSessions.has(sessionId)) {
+      logger.info(`Steer request for cancelled session ${sessionId} — ignoring (turn is stopping)`);
+      return;
+    }
     // Queue the message for delivery after the current turn finishes.
     if (!steerQueues.has(sessionId)) {
       steerQueues.set(sessionId, []);
@@ -4139,6 +4147,27 @@ export function createClaudeCodeAgent(
     async cancel(params: CancelNotification): Promise<void> {
       logger.info(`Cancel request for session ${params.sessionId}`);
       cancelledSessions.add(params.sessionId);
+      // Discard steers that never reached the model.
+      //
+      // Claude CLI cannot inject mid-turn, so a steer waits in this queue until
+      // the main turn ends (drainSteerQueue). A cancel exits runPrompt BEFORE
+      // that drain, so the steer used to survive and was delivered at the end of
+      // the NEXT turn — reported as: queue two messages, "Send Now" the second,
+      // both bubbles appear, and the last thing the model works on is the first
+      // message. drainSteerQueue already states the policy ("Cancellation
+      // discards the rest — the user asked to stop"); it only ever applied when a
+      // drain was already running.
+      //
+      // Nothing is lost: vscode-acp keeps the message in its own queue until the
+      // agent echoes it, so an undelivered steer drains as an ordinary prompt in
+      // its own turn, after the one the user asked for.
+      const pendingSteers = steerQueues.get(params.sessionId);
+      if (pendingSteers && pendingSteers.length > 0) {
+        logger.info(
+          `Cancel: discarding ${pendingSteers.length} undelivered steer(s) for session ${params.sessionId}`,
+        );
+        pendingSteers.length = 0;
+      }
       runner.cancel(params.sessionId);
     },
 
