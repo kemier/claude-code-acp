@@ -219,13 +219,22 @@ export class ClaudeRunner {
     // executes it — the tool_use opens and waits for a tool_result that never
     // arrives, which the chat shows as a hung turn. Drop it from the advertised
     // set so the model never calls an unsupported tool. A direct Anthropic
-    // route keeps it (real Claude models do execute it). WebFetch is NOT
-    // dropped: the CLI performs the fetch client-side and returns real
-    // results through the proxy, so it stays available.
-    // Override with CLAUDE_ACP_KEEP_WEB_TOOLS=1 on a proxy route that does
-    // front a web-search-capable backend.
+    // route keeps it (real Claude models do execute it).
+    // WebFetch is fetched by the CLI itself (client-side), so the proxy route
+    // does not break it — but where the network blocks it (e.g. China), the
+    // fetch stalls. Add it to the dropped set via
+    // CLAUDE_ACP_DISALLOWED_WEB_TOOLS=WebSearch,WebFetch on such hosts.
+    // CLAUDE_ACP_KEEP_WEB_TOOLS=1 drops nothing at all (proxy that does front
+    // a web-search-capable backend).
     if (!process.env.CLAUDE_ACP_KEEP_WEB_TOOLS && isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL)) {
-      extra.push("--disallowedTools", "WebSearch");
+      const dropped = (process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS || "WebSearch")
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+        .join(",");
+      if (dropped) {
+        extra.push("--disallowedTools", dropped);
+      }
     }
     if (effortOverride) {
       extra.push("--effort", effortOverride);

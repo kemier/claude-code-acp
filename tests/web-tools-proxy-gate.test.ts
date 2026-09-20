@@ -153,4 +153,30 @@ describe("web-tool watchdog fails a hung server-side tool", () => {
       vi.useRealTimers();
     }
   });
+
+  it("fails a stalled WebFetch when the operator names it in CLAUDE_ACP_DISALLOWED_WEB_TOOLS", async () => {
+    vi.useFakeTimers();
+    process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS = "WebSearch,WebFetch";
+    try {
+      const run = await runWithEvents([
+        {
+          type: "tool_use",
+          toolName: "WebFetch",
+          toolInput: { url: "https://example.com" },
+          toolUseId: "tu_fetch_block",
+        },
+      ]);
+      await vi.advanceTimersByTimeAsync(95_000);
+      const updates = await run.finish();
+      const frames = updates.filter(
+        (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
+      );
+      const failed = frames.find((u: any) => u.status === "failed");
+      expect(failed, "env-named WebFetch must be failed after the timeout").toBeTruthy();
+      expect(failed._meta?.claudeCode?.error).toMatch(/not available on this proxy route/i);
+    } finally {
+      delete process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS;
+      vi.useRealTimers();
+    }
+  });
 });

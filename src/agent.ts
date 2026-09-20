@@ -301,13 +301,30 @@ function resolveSessionModel(
   return override || getDefaultModelFromSettings();
 }
 
-// Watchdog timers for the server-side WebSearch tool (the CLI performs
-// WebFetch itself, so only WebSearch can hang) that can
-// never be executed on a proxy route, keyed by session so a settled turn can
-// clear them wholesale. Each timer also no-ops if its tool completed or was
-// flushed in the meantime.
+// Watchdog timers for web tools that can never return on the current route:
+// WebSearch always (it executes on Anthropic's API, which a proxy route has no
+// executor for), and WebFetch when the operator names it in
+// CLAUDE_ACP_DISALLOWED_WEB_TOOLS (the CLI fetches client-side, so a
+// network-blocked host — e.g. China — stalls it). Keyed by session so a
+// settled turn can clear them wholesale. Each timer also no-ops if its tool
+// completed or was flushed in the meantime.
 const webToolWatchdogs = new Map<string, Set<NodeJS.Timeout>>();
 const WEB_TOOL_TIMEOUT_MS = 90_000;
+
+function watchedWebTools(): Set<string> {
+  const names = new Set(["WebSearch"]);
+  const drop = process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS;
+  if (
+    drop &&
+    drop
+      .split(",")
+      .map((t) => t.trim())
+      .includes("WebFetch")
+  ) {
+    names.add("WebFetch");
+  }
+  return names;
+}
 
 /** Built-in slash commands (mirrors codex-acp's CodexCommands). */
 const BUILTIN_COMMANDS = [
@@ -3598,21 +3615,23 @@ export function createClaudeCodeAgent(
              sessionPendingTools.set(sessionId, pendingTools);
            }
            pendingTools.set(event.toolUseId, toolCallId);
-           // Server-side tool watchdog. WebSearch executes on
-           // Anthropic's API, so on a proxy route (non-anthropic
-           // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes
-           // it and the tool hangs with no tool_result ever arriving (the
-           // CLI performs WebFetch itself, so it is not at risk). The
-           // CLI is told not to advertise it (claude-runner
-           // buildExtraArgs), but the adapter must never depend on that
-           // alone: flip the row to failed after a bounded wait so the user
-           // sees a named cause instead of a frozen spinner. Cancel is
+           // Server-side / network-blocked web tool watchdog. WebSearch
+           // executes on Anthropic's API, so on a proxy route (non-anthropic
+           // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes it
+           // and the tool hangs with no tool_result ever arriving. WebFetch is
+           // fetched client-side by the CLI — normally fine through a proxy —
+           // but on a host whose network blocks it the fetch stalls, so the
+           // operator names it in CLAUDE_ACP_DISALLOWED_WEB_TOOLS and it gets
+           // the same treatment. The CLI is told not to advertise them
+           // (claude-runner buildExtraArgs), but the adapter must never depend
+           // on that alone: flip the row to failed after a bounded wait so the
+           // user sees a named cause instead of a frozen spinner. Cancel is
            // handled centrally at the prompt return (the cancelled flag +
            // "Turn ended with N tool(s) still pending" flush), so the timer
            // only needs to skip when the tool completes normally — hence the
            // per-session map plus a clear when the turn settles.
            if (
-             event.toolName === "WebSearch" &&
+             watchedWebTools().has(event.toolName ?? "") &&
              isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL) &&
              !/^claude/i.test(resolveSessionModel(store, sessionId, modelOverride))
            ) {

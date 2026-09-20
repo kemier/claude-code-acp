@@ -4,14 +4,17 @@ import { ClaudeRunner, isProxyBaseUrl } from "../src/claude-runner.js";
 // buildExtraArgs is private on ClaudeRunner; this targeted suite exercises it
 // on the real module WITHOUT mocking claude-runner (the watchdog suite mocks
 // that module and must stay separate).
-function extraArgsFor(base: string | undefined, keep?: string): string[] {
+function extraArgsFor(base: string | undefined, keep?: string, drop?: string): string[] {
   const savedBase = process.env.ANTHROPIC_BASE_URL;
   const savedKeep = process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
+  const savedDrop = process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS;
   try {
     if (base === undefined) delete process.env.ANTHROPIC_BASE_URL;
     else process.env.ANTHROPIC_BASE_URL = base;
     if (keep === undefined) delete process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
     else process.env.CLAUDE_ACP_KEEP_WEB_TOOLS = keep;
+    if (drop === undefined) delete process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS;
+    else process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS = drop;
     const runner = new ClaudeRunner();
     return (runner as any).buildExtraArgs(undefined, undefined);
   } finally {
@@ -19,6 +22,8 @@ function extraArgsFor(base: string | undefined, keep?: string): string[] {
     else process.env.ANTHROPIC_BASE_URL = savedBase;
     if (savedKeep === undefined) delete process.env.CLAUDE_ACP_KEEP_WEB_TOOLS;
     else process.env.CLAUDE_ACP_KEEP_WEB_TOOLS = savedKeep;
+    if (savedDrop === undefined) delete process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS;
+    else process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS = savedDrop;
   }
 }
 
@@ -56,5 +61,12 @@ describe("buildExtraArgs drops server-side web tools on a proxy route", () => {
 
   it("honors the CLAUDE_ACP_KEEP_WEB_TOOLS=1 escape hatch", () => {
     expect(extraArgsFor("http://127.0.0.1:8317", "1")).not.toContain("--disallowedTools");
+  });
+
+  it("drops WebFetch too when CLAUDE_ACP_DISALLOWED_WEB_TOOLS names it (network-blocked hosts)", () => {
+    const args = extraArgsFor("http://127.0.0.1:8317", undefined, "WebSearch,WebFetch");
+    const i = args.indexOf("--disallowedTools");
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(args[i + 1]).toBe("WebSearch,WebFetch");
   });
 });
