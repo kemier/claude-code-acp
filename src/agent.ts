@@ -3310,6 +3310,56 @@ export function createClaudeCodeAgent(
           }
         }
       }
+      // A subagent's tool results live only in the subagent's own stream —
+      // the main conversation sees the launch ack ("Async agent launched
+      // successfully…") and the eventual <task-notification>, never a
+      // tool_result carrying the subagent's child tool_use_ids. If any
+      // tool_progress heartbeat ever mapped a sidechain id into the parent's
+      // pending-tools map, it could never flip to completed here; drop such
+      // stale entries so they don't sit in_progress until the post-turn flush.
+      if (
+        event.type === "user" &&
+        event.isSidechain &&
+        event.toolResultIds?.length
+      ) {
+        const staleTools = sessionPendingTools.get(sessionId);
+        if (staleTools && staleTools.size > 0) {
+          for (const tuId of event.toolResultIds) {
+            staleTools.delete(tuId);
+          }
+          if (staleTools.size === 0) {
+            sessionPendingTools.delete(sessionId);
+          }
+        }
+      }
+      // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
+      // is resolved by this user message's tool_results to "completed". The
+      // runner emits toolResultIds on the user event (claude-runner.ts). This
+      // is what surfaces the running → completed transition for Bash/Read/Edit.
+      if (event.type === "user" && event.toolResultIds?.length) {
+        const pendingTools = sessionPendingTools.get(sessionId);
+        if (pendingTools && pendingTools.size > 0) {
+          for (const tuId of event.toolResultIds) {
+            const acpCallId = pendingTools.get(tuId);
+            if (acpCallId) {
+              pendingTools.delete(tuId);
+              connection
+                .sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: acpCallId,
+                    status: "completed",
+                  } as any,
+                })
+                .catch(() => {});
+            }
+          }
+          if (pendingTools.size === 0) {
+            sessionPendingTools.delete(sessionId);
+          }
+        }
+      }
     // Handle result event — Claude CLI reports CUMULATIVE usage across all
     // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
     // single-call turn, input_tokens = real context size (accurate). For a
@@ -3516,6 +3566,39 @@ export function createClaudeCodeAgent(
            sessionId,
            update: emitted,
          });
+       } else if (event.type === "tool_progress" && event.toolUseId) {
+         // Claude CLI's periodic heartbeat while a tool runs. A long-running
+         // tool (a Bash poll with sleep/ssh loops) emits nothing else for
+         // minutes — no deltas, no tool_result — so without forwarding these
+         // heartbeats the chat UI shows a frozen in_progress tool that looks
+         // exactly like a hung session (the "session hangs, Stop fixes it"
+         // symptom). Refresh the existing tool_call with the elapsed time so
+         // the row visibly ticks. Sidechain (subagent) heartbeats are skipped
+         // — subagent tools are tracked via sessionPendingAgents, and their
+         // tool_use_ids are not in this session's pending-tools map.
+         if (!event.toolSidechain) {
+           const pendingTools = sessionPendingTools.get(sessionId);
+           const acpCallId = pendingTools?.get(event.toolUseId);
+           if (acpCallId) {
+             connection
+               .sessionUpdate({
+                 sessionId,
+                 update: {
+                   sessionUpdate: "tool_call_update",
+                   toolCallId: acpCallId,
+                   status: "in_progress",
+                   _meta: {
+                     claudeCode: {
+                       toolProgress: {
+                         elapsedSeconds: event.toolElapsedSeconds,
+                       },
+                     },
+                   },
+                 } as any,
+               })
+               .catch(() => {});
+           }
+         }
        } else if (event.type === "permission_request" && event.toolName) {
          ctxEstimator.addToolCall(event.toolName, event.toolInput);
          const toolCallId = nextToolCallId();

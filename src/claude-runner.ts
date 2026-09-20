@@ -44,7 +44,7 @@ export type StdinContentBlock =
   | { type: string; [key: string]: unknown };
 
 export interface StreamEvent {
-  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user";
+  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user" | "tool_progress";
  text?: string;
  toolName?: string;
  toolInput?: unknown;
@@ -91,6 +91,20 @@ export interface StreamEvent {
    * block. UI rendering treats both identically.
    */
   fromAssistantBlock?: boolean;
+  /**
+   * For tool_progress events: seconds the tool has been running, as reported
+   * by Claude CLI's periodic heartbeat (`elapsed_time_seconds`). Surfaced so a
+   * long-running tool (a Bash poll that sleeps for minutes) shows visible
+   * progress in the chat UI instead of looking like a hung turn.
+   */
+  toolElapsedSeconds?: number;
+  /**
+   * For tool_progress events: true when the heartbeat carries a non-null
+   * `parent_tool_use_id`, i.e. it belongs to a subagent's tool rather than
+   * the main conversation's. Sidechain heartbeats must not be forwarded as
+   * updates to the parent's tool calls.
+   */
+  toolSidechain?: boolean;
 }
 
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
@@ -423,6 +437,32 @@ export class ClaudeRunner {
     return env;
   }
 
+  /**
+   * Signal a spawned claude process. The streaming spawns use `detached:
+   * true`, so the child leads its own process group and signaling `-pid`
+   * reaches every descendant the turn's tools forked (a Bash poll's
+   * `bash → sleep/ssh` tree). Without the group signal those grandchildren
+   * outlive the cancelled turn as orphans — continuing to run, consume the
+   * remote resource and hold the network long after the UI says "cancelled".
+   * Falls back to signaling just the child when the group is gone (already
+   * reaped, ESRCH) or the pid is not a group leader (ESRCH/EPERM/unknown).
+   */
+  private signalProcessTree(proc: ChildProcess, signal: NodeJS.Signals): void {
+    if (proc.pid !== undefined) {
+      try {
+        process.kill(-proc.pid, signal);
+        return;
+      } catch {
+        // Group leader gone or not a group — fall through to the child only.
+      }
+    }
+    try {
+      proc.kill(signal);
+    } catch {
+      // Process already gone — nothing to signal.
+    }
+  }
+
   cancel(trackingId: string): void {
     const proc = this.runningProcesses.get(trackingId);
     if (!proc) {
@@ -433,18 +473,19 @@ export class ClaudeRunner {
     // resume failure). This preserves the captured Claude session id.
     this.cancelledProcesses.add(trackingId);
 
-    // Try a gentle SIGINT (turn interrupt) first — Claude Code's interactive
-    // mode handles SIGINT as an in-turn interrupt, letting the process exit
-    // cleanly and keep the session id valid. If it has not exited within the
-    // grace window, escalate to SIGTERM (hard kill). There is no native
-    // "interrupt this turn" RPC on the CLI (see anthropics/claude-code#51078),
-    // so this is the gentlest reliable sequence available.
+    // SIGINT to the whole group — Claude Code's interactive mode treats SIGINT
+    // as an in-turn interrupt and exits cleanly, keeping the session id valid;
+    // the group signal also interrupts the tool processes the turn spawned.
+    // If nothing has exited within the grace window, escalate the whole group
+    // to SIGTERM (hard kill). There is no native "interrupt this turn" RPC on
+    // the CLI (see anthropics/claude-code#51078), so this is the gentlest
+    // reliable sequence available.
     if (this.cancelEscalationTimers.has(trackingId)) {
       // A cancel is already in progress for this trackingId — do not stack a
       // second escalation timer.
       return;
     }
-    proc.kill("SIGINT");
+    this.signalProcessTree(proc, "SIGINT");
     const escalation = setTimeout(() => {
       this.cancelEscalationTimers.delete(trackingId);
       const stillRunning = this.runningProcesses.get(trackingId);
@@ -452,11 +493,7 @@ export class ClaudeRunner {
       // exited cleanly from SIGINT, the close handler already removed it from
       // runningProcesses and cleared the timer.
       if (stillRunning && stillRunning.exitCode === null) {
-        try {
-          stillRunning.kill("SIGTERM");
-        } catch {
-          // Process already gone — nothing to escalate.
-        }
+        this.signalProcessTree(stillRunning, "SIGTERM");
       }
     }, 3000);
     this.cancelEscalationTimers.set(trackingId, escalation);
@@ -520,10 +557,15 @@ export class ClaudeRunner {
   ): Promise<ClaudeResult> {
     return new Promise((resolve, reject) => {
       logger.debug(`spawn streaming: claude ${maskArgs(args)}`);
+      // detached puts claude in its own process group so cancel() can
+      // signal(-pgid) the whole tree — a Bash tool's `bash → sleep/ssh`
+      // grandchildren keep running (and keep the turn's output flowing) when
+      // only the claude parent is signalled, orphaning the turn's work.
       const proc = spawn(this.resolveClaudeBin(), args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
 
       if (trackingId) {
@@ -653,10 +695,13 @@ export class ClaudeRunner {
   ): Promise<ClaudeResult> {
     return new Promise((resolve, reject) => {
       logger.debug(`spawn streaming-json: claude ${maskArgs(args)}`);
+      // detached: own process group — see runStreaming for why cancel()
+      // needs to signal the whole tree, not just the claude parent.
       const proc = spawn("claude", args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
       });
 
       if (trackingId) {
@@ -766,6 +811,28 @@ export class ClaudeRunner {
         ? parsed.slash_commands.filter((c: any) => typeof c === "string")
         : [];
       onEvent({ type: "system_init", slashCommands });
+      return;
+    }
+
+    // Handle tool_progress — a periodic heartbeat Claude CLI emits while a
+    // tool runs ({"type":"tool_progress","tool_use_id":…,"tool_name":…
+    // ,"elapsed_time_seconds":…}, see SDKToolProgressMessageSchema). It rides
+    // at the ENVELOPE level (a top-level line, not nested inside
+    // `stream_event`), so it must be matched before the unwrap below. While a
+    // long Bash tool polls (sleep loops, ssh waits) the CLI emits NOTHING
+    // else for it — no deltas, no tool_result — so without this the adapter
+    // drops every heartbeat and the chat UI shows a frozen, silent in_progress
+    // tool that looks exactly like a hung session. Forwarding it lets agent.ts
+    // refresh the tool_call_update with the elapsed time.
+    if (parsed.type === "tool_progress") {
+      onEvent({
+        type: "tool_progress",
+        toolUseId: typeof parsed.tool_use_id === "string" ? parsed.tool_use_id : undefined,
+        toolName: typeof parsed.tool_name === "string" ? parsed.tool_name : undefined,
+        toolElapsedSeconds:
+          typeof parsed.elapsed_time_seconds === "number" ? parsed.elapsed_time_seconds : undefined,
+        toolSidechain: parsed.parent_tool_use_id != null,
+      });
       return;
     }
 
@@ -946,6 +1013,9 @@ export class ClaudeRunner {
         // turn termination (vs a model that kept calling tools).
         stopReason: parsed.subtype ?? parsed.stop_reason ?? parsed.stopReason,
         isError: parsed.is_error === true || parsed.subtype === "error_max_turns",
+        // A subagent's own conversation ends with its own result line; the
+        // envelope carries a non-null parent_tool_use_id for sidechains.
+        isSidechain: parsed.parent_tool_use_id != null,
       });
     }
   }
