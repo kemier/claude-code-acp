@@ -43,21 +43,33 @@ describe("collaboration mode change mid-turn", () => {
 });
 
 /**
- * The echo for a steered message must mean "delivered to the model", not "received".
+ * The "delivered" echo for a steered message must mean "sent to the model", not
+ * "received".
  *
- * vscode-acp keeps a mid-turn message queued until the agent echoes it and treats that
- * echo as the receipt releasing the NEXT queued message. Echoing on receipt let several
- * interjections be dequeued client-side while the turn was still busy; they then all
- * arrived at once and the model answered only the last. Fixed the same way in ericli.
+ * vscode-acp keeps a mid-turn message queued until the agent echoes it and
+ * treats that echo as the receipt releasing the NEXT queued message. Echoing a
+ * plain user_message_chunk on receipt let several interjections be dequeued
+ * client-side while the turn was still busy; they then all arrived at once and
+ * the model answered only the last.
+ *
+ * The two-stage fix (mirrors ericli): on receipt the agent emits a DISTINCT
+ * `user_message_accepted` notification (visual-only — the client shows the
+ * mid-turn bubble but keeps the entry queued), and emits the `user_message_chunk`
+ * delivered-echo only when the message is actually drained to the model. The
+ * accepted type decouples "shown" from "delivered" so the queue semantics stay
+ * intact.
  */
 describe("steer echo timing", () => {
   const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
 
-  it("receipt queues without echoing", () => {
+  it("receipt acks with user_message_accepted, NOT a delivered user_message_chunk", () => {
     const at = src.indexOf("steerQueues.get(sessionId)!.push(text);");
     expect(at).toBeGreaterThan(0);
-    const handlerTail = src.slice(at, at + 900);
-    expect(handlerTail).toContain("no echo here");
+    const handlerTail = src.slice(at, at + 1400);
+    // Stage-1 visual ack IS emitted on receipt…
+    expect(handlerTail).toContain("user_message_accepted");
+    // …but the delivered-echo (the receipt that releases the next queued
+    // message) is NOT — that only fires in drainSteerQueue.
     expect(handlerTail).not.toContain("user_message_chunk");
   });
 

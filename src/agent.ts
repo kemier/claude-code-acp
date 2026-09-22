@@ -2076,13 +2076,31 @@ export function createClaudeCodeAgent(
     }
     steerQueues.get(sessionId)!.push(text);
     logger.info(`Steer queued for session ${sessionId}: ${text.length} chars`);
-    // NOTE: no echo here. It is emitted when the message is DRAINED to the model.
+    // Stage 1 of the two-stage steer receipt (mirrors ericli's Option A):
+    // emit a DISTINCT `user_message_accepted` notification so vscode-acp can
+    // show the user's mid-turn bubble immediately (inserted before the running
+    // turn) instead of leaving a queue chip tagged "in turn" for the whole
+    // tool call.
     //
-    // vscode-acp keeps a mid-turn message queued until the agent echoes it and uses
-    // that echo as the receipt that releases the NEXT queued message. Echoing on
-    // receipt made the receipt meaningless: several interjections could be dequeued
-    // client-side while the turn was still busy, then all arrive at once and the
-    // model answers only the last. Same fault was fixed in ericli.
+    // This is deliberately NOT a delivered-echo chunk. A plain delivered chunk
+    // on receipt would be treated by the client as DELIVERED — it would splice
+    // the queue entry and release the next queued message, so several
+    // interjections during one long tool call all arrive at the drain at once
+    // and the model answers only the last (the pile-up bug ericli hit). The
+    // `user_message_accepted` type is visually-only: the client shows the
+    // bubble but keeps the entry in the queue. The stage-2 delivered echo
+    // (emitted in drainSteerQueue when the message is actually sent to the
+    // model) is the only signal that splices the entry and releases the next
+    // message — so the queue semantics stay intact.
+    await connection
+      .sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "user_message_accepted",
+          content: { type: "text", text },
+        } as any,
+      })
+      .catch(() => { /* non-fatal: visual-only ack */ });
   }
 
   /**

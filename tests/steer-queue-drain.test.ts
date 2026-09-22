@@ -181,4 +181,34 @@ describe("steer queue drain ordering", () => {
     await prompt(agent, sid, "next");
     expect(prompts().some((p) => p.includes("IGNORED"))).toBe(false);
   });
+
+  it("emits a user_message_accepted (stage-1) on receipt, distinct from the delivered chunk", async () => {
+    const { conn, agent, sid } = await setup();
+    await prompt(agent, sid, "hello"); // establish a Claude session
+
+    // Steer while a turn is active: the agent must ack immediately with a
+    // user_message_accepted so the client shows the mid-turn bubble, but it must
+    // NOT emit a user_message_chunk on receipt (that would be treated as
+    // delivered and prematurely release the next queued message).
+    const updatesBefore: any[] = [];
+    const spy = conn.sessionUpdate as any;
+    spy.mockImplementation((u: any) => {
+      updatesBefore.push(u.update);
+      return Promise.resolve(undefined);
+    });
+    running = true;
+    await agent.extNotification("session/steer", { sessionId: sid, text: "MID-TURN-MSG" });
+    running = false;
+
+    const accepted = updatesBefore.filter(
+      (u) => u?.sessionUpdate === "user_message_accepted" &&
+             u?.content?.text === "MID-TURN-MSG",
+    );
+    const chunksOnReceipt = updatesBefore.filter(
+      (u) => u?.sessionUpdate === "user_message_chunk" &&
+             u?.content?.text === "MID-TURN-MSG",
+    );
+    expect(accepted.length).toBe(1); // stage-1 ack fired on receipt
+    expect(chunksOnReceipt.length).toBe(0); // no premature delivered-echo
+  });
 });
