@@ -421,6 +421,67 @@ describe("slash commands & estimator", () => {
     readdirSync.mockImplementation(() => []);
     readFileSync.mockImplementation(() => "{}");
   });
+
+  it("/list-agents shows this session and other local Claude sessions", async () => {
+    const realJoin = await import("node:path").then((m) => m.join);
+    const sessionsDir = realJoin(os.homedir(), ".claude", "sessions");
+
+    const selfEntry = JSON.stringify({
+      pid: process.pid,
+      sessionId: "01a00000-0000-0000-0000-000000000001",
+      name: "test-agent",
+      cwd: "/tmp/proj",
+      startedAt: Date.now() - 60_000,
+      status: "busy",
+    });
+    const otherEntry = JSON.stringify({
+      pid: 99999,
+      sessionId: "01b00000-0000-0000-0000-000000000002",
+      name: "other-agent",
+      cwd: "/workspace/other-repo",
+      startedAt: Date.now() - 3_600_000,
+      status: "idle",
+    });
+
+    const readdirSync = vi.mocked(fs.readdirSync);
+    const readFileSync = vi.mocked(fs.readFileSync);
+
+    readdirSync.mockImplementation((p: any, _opts: any) => {
+      if (String(p) === sessionsDir) {
+        return [
+          { name: "123.json", isFile: () => true },
+          { name: "456.json", isFile: () => true },
+        ] as any;
+      }
+      return [] as any;
+    });
+    readFileSync.mockImplementation((p: any) => {
+      const s = String(p);
+      if (s.endsWith("123.json")) return selfEntry;
+      if (s.endsWith("456.json")) return otherEntry;
+      return "{}";
+    });
+
+    const sid = await newSession();
+    await prompt(sid, "/list-agents");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const msg = calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk",
+    );
+    const text: string = msg[0].update.content.text;
+    expect(text).toContain("This session: test-agent");
+    expect(text).toContain("Other Claude sessions (1)");
+    expect(text).toContain("[idle]");
+    expect(text).toContain("other-agent");
+    expect(text).toContain("/workspace/other-repo");
+    // commandOutput marker must be set for transient snapshot rendering
+    expect(msg[0].update._meta?.commandOutput).toBe(true);
+
+    // restore default mocks for other tests
+    readdirSync.mockImplementation(() => []);
+    readFileSync.mockImplementation(() => "{}");
+  });
 });
 
 // The steer-drain loop now calls the same dispatchSlashCommand() helper that

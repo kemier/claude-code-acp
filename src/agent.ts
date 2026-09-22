@@ -354,6 +354,14 @@ const BUILTIN_COMMANDS = [
     _meta: { turnSafe: true },
   },
   {
+    name: "list-agents",
+    description: "List other Claude Code sessions on this machine.",
+    input: null,
+    // Read-only: scans ~/.claude/sessions/*.json and emits a snapshot.
+    // No turn, no state change.
+    _meta: { turnSafe: true },
+  },
+  {
     name: "goal",
     description: "Set a goal to keep pursuing.",
     input: { hint: "[<objective>|clear|pause|resume]" },
@@ -1584,7 +1592,7 @@ function parseSlashCommand(prompt: string): { name: string; rest: string } | nul
 
 /** Check if a prompt is a read-only slash command (no LLM turn needed). */
 function isReadOnlyCommand(name: string): boolean {
-  return name === "ps" || name === "status" || name === "skills";
+  return name === "ps" || name === "status" || name === "skills" || name === "list-agents";
 }
 
 /**
@@ -2094,6 +2102,89 @@ export function createClaudeCodeAgent(
         update: {
           sessionUpdate: "agent_message_chunk",
           content: { type: "text", text: "No background terminals running." },
+          messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          // Without this marker a client cannot tell command output from the
+          // assistant's own text, so vscode-acp's compact mode folded it into the
+          // running turn's collapsed block instead of showing it beside the command.
+          _meta: { commandOutput: true },
+        } as any,
+      });
+      return { handled: true };
+    }
+
+    if (name === "list-agents") {
+      const { readdirSync, readFileSync } = await import("node:fs");
+      const { join: joinPath } = await import("node:path");
+      const { homedir } = await import("node:os");
+
+      const sessionsDir = joinPath(homedir(), ".claude", "sessions");
+      interface SessionEntry {
+        pid?: number;
+        sessionId?: string;
+        name?: string;
+        cwd?: string;
+        startedAt?: number;
+        status?: string;
+      }
+      const entries: SessionEntry[] = [];
+      let dirEntries: import("node:fs").Dirent[];
+      try {
+        dirEntries = readdirSync(sessionsDir, { withFileTypes: true });
+      } catch {
+        dirEntries = [];
+      }
+      for (const d of dirEntries) {
+        if (!d.isFile() || !d.name.endsWith(".json")) continue;
+        try {
+          const raw = readFileSync(joinPath(sessionsDir, d.name), "utf-8");
+          entries.push(JSON.parse(raw) as SessionEntry);
+        } catch {
+          // skip unreadable
+        }
+      }
+
+      const myPid = process.pid;
+      const claudeSid = store.getClaudeSessionId(sessionId);
+      const isSelf = (e: SessionEntry) =>
+        e.pid === myPid || (claudeSid && e.sessionId === claudeSid);
+
+      const self = entries.find(isSelf);
+      const others = entries.filter((e) => !isSelf(e));
+
+      const fmtElapsed = (ms: number): string => {
+        const s = Math.floor((Date.now() - ms) / 1000);
+        if (s < 60) return `${s}s ago`;
+        const m = Math.floor(s / 60);
+        if (m < 60) return `${m}m ago`;
+        const h = Math.floor(m / 60);
+        if (h < 24) return `${h}h ago`;
+        return `${Math.floor(h / 24)}d ago`;
+      };
+
+      const lines: string[] = [];
+      if (self?.name) {
+        const shortId = self.sessionId ? self.sessionId.slice(0, 6) : "";
+        lines.push(`This session: ${self.name}${shortId ? ` [${shortId}]` : ""} (the name other sessions use to message it)`);
+      }
+      if (others.length > 0) {
+        lines.push(`\nOther Claude sessions (${others.length}):`);
+        for (const o of others) {
+          const nm = o.name ?? "unknown";
+          const cwd = o.cwd ?? "";
+          const started = o.startedAt ? fmtElapsed(o.startedAt) : "";
+          const status = o.status ?? "";
+          lines.push(`  [${status}] · ${nm} · ${cwd}${started ? ` · started ${started}` : ""}`);
+        }
+      } else {
+        lines.push("\nNo other Claude sessions running.");
+      }
+
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: lines.join("\n") },
           messageId: nextCommandMessageId(),
           // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
           // Without this marker a client cannot tell command output from the
