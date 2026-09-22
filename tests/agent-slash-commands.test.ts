@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createClaudeCodeAgent } from "../src/agent.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
+import * as fs from "node:fs";
+import * as os from "node:os";
 
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => false),
@@ -365,6 +367,55 @@ describe("slash commands & estimator", () => {
     // State-mutating natives are NOT turn-safe (no _meta at all).
     expect(byName("model")?._meta).toBeUndefined();
     expect(byName("init")?._meta).toBeUndefined();
+  });
+
+  it("/skills lists skills from ~/.agents/skills (cross-agent global)", async () => {
+    // Point every scanned dir at a non-existent path EXCEPT
+    // ~/.agents/skills, which contains one skill dir with a SKILL.md.
+    const realJoin = await import("node:path").then((m) => m.join);
+    // agent.ts reads homedir() via node:os (NOT mocked here), so the scan
+    // target is the REAL home's .agents/skills.
+    const agentsSkillsDir = realJoin(os.homedir(), ".agents", "skills");
+
+    const existsSync = vi.mocked(fs.existsSync);
+    const readdirSync = vi.mocked(fs.readdirSync);
+    const readFileSync = vi.mocked(fs.readFileSync);
+
+    existsSync.mockImplementation((p: any) => {
+      const s = String(p);
+      return s === agentsSkillsDir || s === realJoin(agentsSkillsDir, "zhihu", "SKILL.md");
+    });
+    readdirSync.mockImplementation((_p: any, opts: any) => {
+      if (opts?.withFileTypes) {
+        return [
+          { name: "zhihu", isDirectory: () => true },
+          { name: "not-a-skill.txt", isDirectory: () => false },
+        ] as any;
+      }
+      return [];
+    });
+    readFileSync.mockImplementation((p: any) => {
+      if (String(p).endsWith("zhihu/SKILL.md")) {
+        return "---\nname: zhihu\ndescription: Search Zhihu\n---\n# Zhihu\n";
+      }
+      return "{}";
+    });
+
+    const sid = await newSession();
+    await prompt(sid, "/skills");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const msg = calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk",
+    );
+    const text: string = msg[0].update.content.text;
+    expect(text).toContain("/zhihu");
+    expect(text).toContain("Search Zhihu");
+
+    // restore default mocks for other tests
+    existsSync.mockImplementation(() => false);
+    readdirSync.mockImplementation(() => []);
+    readFileSync.mockImplementation(() => "{}");
   });
 });
 

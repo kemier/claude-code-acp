@@ -2128,6 +2128,7 @@ export function createClaudeCodeAgent(
       };
 
       scanSkillsDir(joinPath(homedir(), ".claude", "skills"), "global");
+      scanSkillsDir(joinPath(homedir(), ".agents", "skills"), "global");
       scanSkillsDir(joinPath(cwd, ".agents", "skills"), "project");
       let dir = cwd;
       for (let i = 0; i < 10; i++) {
@@ -2139,7 +2140,7 @@ export function createClaudeCodeAgent(
 
       let skillsList: string;
       if (skillsMap.size === 0) {
-        skillsList = "No skills configured.\n\nSkills are loaded from:\n- ~/.claude/skills/\n- <project>/.agents/skills/\n- <workspace>/.agents/skills/";
+        skillsList = "No skills configured.\n\nSkills are loaded from:\n- ~/.claude/skills/\n- ~/.agents/skills/\n- <project>/.agents/skills/\n- <workspace>/.agents/skills/";
       } else {
         const lines: string[] = ["Available skills:\n"];
         for (const [sname, info] of skillsMap) {
