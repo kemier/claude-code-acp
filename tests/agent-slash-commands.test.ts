@@ -122,10 +122,12 @@ describe("slash commands & estimator", () => {
     const calls = (conn.sessionUpdate as any).mock.calls;
     const msg = calls.find((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk");
     const text: string = msg[0].update.content.text;
-    expect(text).toContain("**Model:**");
-    expect(text).toContain("**Mode:** agent");
-    expect(text).toContain("**Directory:** /tmp/proj");
-    expect(text).toContain(`**Session:** \`${sid}\``);
+    // Plain text, not markdown — command-output rows render via textContent,
+    // so markdown source would show up verbatim.
+    expect(text).toContain("Model:");
+    expect(text).toContain("Mode: agent");
+    expect(text).toContain("Directory: /tmp/proj");
+    expect(text).toContain(`Session: ${sid}`);
   });
 
   it("/goal with empty arg shows status, not a turn", async () => {

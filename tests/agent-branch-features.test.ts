@@ -349,8 +349,8 @@ describe("/ps, /skills, /status", () => {
     const { conn, agent, sid } = await setup();
     await prompt(agent, sid, "/goal ship it");
     await prompt(agent, sid, "/status");
-    const status = messages(conn).find((m) => m.includes("**Model:**"));
-    expect(status).toContain("**Goal:** ship it");
+    const status = messages(conn).find((m) => m.includes("Model:"));
+    expect(status).toContain("Goal: ship it");
   });
 });
 
@@ -522,7 +522,7 @@ describe("steering (session/steer)", () => {
     await prompt(agent, sid, "next");
     // /status dispatched as a command → status output appears, and the literal
     // "/status" is NOT sent to the CLI as a prompt.
-    expect(messages(conn).some((m) => m.includes("**Model:**"))).toBe(true);
+    expect(messages(conn).some((m) => m.includes("Model:"))).toBe(true);
     expect(recorded.some((c) => c.prompt === "/status")).toBe(false);
   });
 

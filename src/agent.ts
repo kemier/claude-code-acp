@@ -2308,15 +2308,20 @@ export function createClaudeCodeAgent(
       const compactState = isAutoCompactEnabled()
         ? `at ${threshold.toLocaleString()} tokens (${((threshold / contextWindow) * 100).toFixed(1)}% of window)`
         : "disabled";
+      // Plain text, not markdown: this is delivered as a transient SNAPSHOT row
+      // (_meta.commandOutput) and vscode-acp renders command-output rows via
+      // textContent (addCommandOutputRow → addMessageDOM 'system'), which shows
+      // markdown source verbatim — the literal "**Model:**" asterisks. Plain
+      // "Label: value" lines render cleanly and match the /ps panel's look.
       const lines = [
-        `**Model:** ${currentModel}`,
-        `**Mode:** ${currentMode}`,
-        `**Directory:** ${cwd}`,
-        `**Session:** \`${sessionId}\``,
-        goal ? `**Goal:** ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "**Goal:** none",
-        `**Context:** ${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${usedPct.toFixed(1)}%)`,
-        `**Max output:** ${getMaxOutputTokens().toLocaleString()} tokens`,
-        `**Auto-compact:** ${compactState}`,
+        `Model: ${currentModel}`,
+        `Mode: ${currentMode}`,
+        `Directory: ${cwd}`,
+        `Session: ${sessionId}`,
+        goal ? `Goal: ${goal.paused ? "(paused) " : ""}${goal.text.slice(0, 100)}` : "Goal: none",
+        `Context: ${usedTokens.toLocaleString()} / ${contextWindow.toLocaleString()} tokens (${usedPct.toFixed(1)}%)`,
+        `Max output: ${getMaxOutputTokens().toLocaleString()} tokens`,
+        `Auto-compact: ${compactState}`,
       ];
       await connection.sessionUpdate({
         sessionId,
