@@ -181,6 +181,64 @@ describe("loadSession replay compaction truncation", () => {
     expect(texts).toEqual(["first user", "first reply", "second user"]);
   });
 
+  it("skips a compact-summary continuation entry so it is not replayed as a user message", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1.0" },
+    });
+
+    const sessionId = "bbbbbbbb-aaaa-cccc-dddd-eeeeeeeeeeee";
+    const cwd = "/tmp/proj";
+    const transcriptPath = `/home/test/.claude/projects/-tmp-proj/${sessionId}.jsonl`;
+    // After a context overflow the CLI rewrites the conversation and records
+    // the new leading turn as a user entry flagged isCompactSummary — the
+    // machine "This session is being continued from a previous conversation…"
+    // banner. It must not be replayed as a user message; only the real
+    // post-compact prompt is.
+    const lines: any[] = [
+      {
+        type: "user",
+        isCompactSummary: true,
+        isVisibleInTranscriptOnly: true,
+        message: {
+          content:
+            "This session is being continued from a previous conversation that " +
+            "ran out of context. The summary below covers the earlier portion " +
+            "of the conversation.\n\nSummary:\n1. Primary Request and Intent:\n  …",
+        },
+        timestamp: "t2",
+      },
+      { type: "user", message: { content: "real post-compact prompt" }, timestamp: "t3" },
+      {
+        type: "assistant",
+        message: { content: [{ type: "text", text: "post-compact reply" }] },
+        timestamp: "t4",
+      },
+    ];
+    fsState.files[transcriptPath] = lines.map((l) => JSON.stringify(l)).join("\n");
+    fsState.exists.add(transcriptPath);
+
+    await agent.loadSession!({ sessionId, cwd, mcpServers: [] });
+
+    const texts = updates
+      .filter((u) => u.sessionUpdate === "user_message_chunk")
+      .map((u) => u.content?.text)
+      .filter(Boolean);
+
+    // The compact-summary banner must not surface as a user message…
+    expect(
+      texts.some((t) => /This session is being continued from a previous conversation/.test(t)),
+    ).toBe(false);
+    // …and the real prompt + reply must still replay.
+    expect(texts).toContain("real post-compact prompt");
+    expect(
+      updates.some(
+        (u) => u.sessionUpdate === "agent_message_chunk" && u.content?.text === "post-compact reply",
+      ),
+    ).toBe(true);
+  });
+
   it("reconstructs the plan snapshot from replayed TaskCreate/TaskUpdate tool_use blocks", async () => {
     await agent.initialize({
       protocolVersion: 1,

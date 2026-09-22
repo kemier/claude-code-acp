@@ -2996,6 +2996,18 @@ export function createClaudeCodeAgent(
                 // replaying them would interleave subagent chatter into the
                 // main history.
                 if (entry.isSidechain) continue;
+                // Compact-summary continuation: when the CLI's context overflows
+                // mid-session it rewrites the conversation and records the new
+                // leading turn as a `user`-type entry whose content is the
+                // machine-generated "This session is being continued from a
+                // previous conversation… Summary: …" banner (14-19 KB). It is
+                // flagged isCompactSummary / isVisibleInTranscriptOnly — metadata
+                // for the CLI, not a user prompt. The type==="user" branch below
+                // would otherwise replay that wall of summary text as a user
+                // message, and on resume it renders as a user bubble the user
+                // never typed. Skip it here, at the source, so it never reaches
+                // the replay buffer.
+                if (entry.isCompactSummary) continue;
                 // Compaction marker: the CLI replaces the conversation with
                 // this summary. Drop everything replayed so far (it is no
                 // longer live context) and reset derived plan state.
