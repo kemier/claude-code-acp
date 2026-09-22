@@ -395,6 +395,28 @@ const BUILTIN_COMMANDS = [
   },
 ];
 
+/**
+ * Claude CLI-native slash commands that are READ-ONLY introspection — they
+ * inspect session/model/context state and neither start an LLM turn nor change
+ * anything. When the CLI's system_init reports them we mark them turnSafe so
+ * vscode-acp can fire them mid-turn as a side-channel (same rationale as the
+ * builtin /ps, /status, /skills declarations). This is a static allowlist
+ * because the CLI's system_init only sends flat name strings, not
+ * descriptions or capability metadata, so the adapter must know which natives
+ * are safe on its own.
+ *
+ * Anything NOT here is conservatively treated as potentially state-mutating
+ * (e.g. /model, /config, /output-style) and left non-turnSafe, which makes
+ * vscode-acp queue it behind the running turn.
+ */
+const NATIVE_TURN_SAFE_COMMANDS = new Set([
+  "context",
+  "usage",
+  "insights",
+  "recap",
+  "heapdump",
+]);
+
 /** Per-session goal state. */
 const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number }>();
 
@@ -3222,13 +3244,35 @@ export function createClaudeCodeAgent(
         // Handle system/init — extract native Claude CLI slash commands and
         // surface them to vscode-acp via available_commands_update.
         if (event.type === "system_init" && event.slashCommands && event.slashCommands.length > 0) {
+          // The CLI's slash_commands list is the UNION of its builtins, skills,
+          // and agents (plus plugin commands). Two of those categories are not
+          // "commands" in the ACP sense, so exclude them before merging:
+          //   - skills: invocable as /<name> but they're skill invocations, not
+          //     session commands; showing them as "Claude Code: /<skill>" is
+          //     misleading and they're already surfaced by /skills.
+          //   - agents: subagent types (Explore, Plan, ...) — you never type
+          //     /Explore as a slash command; the CLI lists them for the Task
+          //     tool. Listing them here made the picker full of bogus entries.
+          const skillSet = new Set(event.skillNames ?? []);
+          const agentSet = new Set(event.agentNames ?? []);
+          const builtinNames = new Set(BUILTIN_COMMANDS.map((b) => b.name));
+          // Native command name → is it read-only/turn-safe? A command is
+          // turn-safe when the CLI itself serves it from the terminal
+          // (terminal_slash_commands — no LLM turn, pure inspection) OR it's in
+          // the static read-only allowlist. Everything else is left unsafe so
+          // vscode-acp queues it behind the running turn.
+          const terminalSafe = new Set(event.terminalSlashCommands ?? []);
           const nativeCommands = event.slashCommands
-            .filter((name) => !BUILTIN_COMMANDS.some((b) => b.name === name))
-            .map((name) => ({
-              name,
-              description: `Claude Code: /${name}`,
-              input: null,
-            }));
+            .filter((name) => !builtinNames.has(name) && !skillSet.has(name) && !agentSet.has(name))
+            .map((name) => {
+              const turnSafe = terminalSafe.has(name) || NATIVE_TURN_SAFE_COMMANDS.has(name);
+              return {
+                name,
+                description: `Claude Code: /${name}`,
+                input: null,
+                ...(turnSafe ? { _meta: { turnSafe: true } } : {}),
+              };
+            });
           const allCommands = [...BUILTIN_COMMANDS, ...nativeCommands];
           connection.sessionUpdate({
             sessionId,

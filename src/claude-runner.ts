@@ -69,6 +69,26 @@ export interface StreamEvent {
   */
  isSidechain?: boolean;
   slashCommands?: string[];
+  /**
+   * Claude CLI's own list of slash commands it serves from the terminal
+   * (e.g. "doctor", "color", "reload-plugins"). These are read-only,
+   * non-LLM interactions, so agent.ts marks them turn-safe when merging the
+   * native command set into available_commands_update.
+   */
+  terminalSlashCommands?: string[];
+  /**
+   * Claude CLI's skill names. They appear inside `slash_commands` (a skill is
+   * invocable as `/<name>`), but they are NOT "commands" in the ACP sense —
+   * agent.ts excludes them from the merged list so the picker doesn't show a
+   * skill like `/zhihu` as a command with a bogus `Claude Code: /zhihu` label.
+   */
+  skillNames?: string[];
+  /**
+   * Claude CLI's agent (subagent) names — "claude", "Explore", "general-purpose",
+   * "Plan", etc. The CLI lists them for the Task tool; they are NOT slash
+   * commands a user types, so agent.ts excludes them from the command list too.
+   */
+  agentNames?: string[];
   /** Claude CLI result stop reason (e.g. "end_turn", "max_turns"). */
   stopReason?: string;
   /** True when Claude CLI reports the result as an error (e.g. max turns). */
@@ -851,7 +871,16 @@ export class ClaudeRunner {
       const slashCommands: string[] = Array.isArray(parsed.slash_commands)
         ? parsed.slash_commands.filter((c: any) => typeof c === "string")
         : [];
-      onEvent({ type: "system_init", slashCommands });
+      const terminalSlashCommands: string[] = Array.isArray(parsed.terminal_slash_commands)
+        ? parsed.terminal_slash_commands.filter((c: any) => typeof c === "string")
+        : [];
+      const skillNames: string[] = Array.isArray(parsed.skills)
+        ? parsed.skills.filter((c: any) => typeof c === "string")
+        : [];
+      const agentNames: string[] = Array.isArray(parsed.agents)
+        ? parsed.agents.filter((c: any) => typeof c === "string")
+        : [];
+      onEvent({ type: "system_init", slashCommands, terminalSlashCommands, skillNames, agentNames });
       return;
     }
 

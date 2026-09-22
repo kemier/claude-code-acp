@@ -5,6 +5,7 @@ import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 vi.mock("node:fs", () => ({
   existsSync: vi.fn(() => false),
   readFileSync: vi.fn(() => "{}"),
+  readdirSync: vi.fn(() => []),
   writeFileSync: vi.fn(),
   mkdirSync: vi.fn(),
 }));
@@ -204,8 +205,7 @@ describe("slash commands & estimator", () => {
     expect(capturedOnEvent).toBeNull();
   });
 
-  it("does not double-count assistant text emitted as both streaming delta and final block", async () => {
-    const sid = await newSession();
+  it("does not double-count assistant text emitted as both streaming delta and final block", async () => {    const sid = await newSession();
     await prompt(sid, "hello");
 
     const calls = (conn.sessionUpdate as any).mock.calls;
@@ -309,6 +309,62 @@ describe("slash commands & estimator", () => {
     expect(messages.some((m: string) => /maximum number of turns/i.test(m))).toBe(true);
     // The prompt still resolves (does not throw) — end_turn is returned.
     expect(res.stopReason).toBe("end_turn");
+  });
+
+  it("merges native CLI commands on system_init, excluding skills/agents and tagging read-only ones turn-safe", async () => {
+    const sid = await newSession();
+    // Start a turn so the mock captures onEvent, then emit a realistic
+    // system_init the way claude-runner.ts does. Mirrors the real CLI payload:
+    // slash_commands is the union of builtins+skills+agents+plugin, while
+    // skills/agents/terminal_slash_commands are separate flat lists.
+    await prompt(sid, "hello");
+    (conn.sessionUpdate as any).mockClear();
+    capturedOnEvent!({
+      type: "system_init",
+      slashCommands: [
+        "clear", "compact", "context", "model", "usage", "recap", "init",
+        "doctor", "color", "reload-plugins",
+        "zhihu", "graphify",        // skills
+        "Explore", "general-purpose", // agents
+        "run",                       // plugin command
+      ],
+      terminalSlashCommands: ["doctor", "color", "reload-plugins"],
+      skillNames: ["zhihu", "graphify"],
+      agentNames: ["claude", "Explore", "general-purpose", "Plan", "statusline-setup"],
+    });
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const acUpdate = calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "available_commands_update",
+    );
+    expect(acUpdate).toBeTruthy();
+    const commands: any[] = acUpdate[0].update.availableCommands;
+    const byName = (n: string) => commands.find((c: any) => c.name === n);
+
+    // Builtins are still present (ps, status, ...).
+    expect(byName("ps")).toBeTruthy();
+    expect(byName("status")).toBeTruthy();
+
+    // Skills and agents are EXCLUDED from the command list.
+    expect(byName("zhihu")).toBeUndefined();
+    expect(byName("graphify")).toBeUndefined();
+    expect(byName("Explore")).toBeUndefined();
+    expect(byName("general-purpose")).toBeUndefined();
+
+    // Native commands ARE present.
+    expect(byName("context")).toBeTruthy();
+    expect(byName("model")).toBeTruthy();
+
+    // Read-only natives are turn-safe: via terminal_slash_commands (doctor)
+    // and via the static allowlist (context, usage, recap).
+    expect(byName("doctor")?._meta?.turnSafe).toBe(true);
+    expect(byName("context")?._meta?.turnSafe).toBe(true);
+    expect(byName("recap")?._meta?.turnSafe).toBe(true);
+    expect(byName("usage")?._meta?.turnSafe).toBe(true);
+
+    // State-mutating natives are NOT turn-safe (no _meta at all).
+    expect(byName("model")?._meta).toBeUndefined();
+    expect(byName("init")?._meta).toBeUndefined();
   });
 });
 
