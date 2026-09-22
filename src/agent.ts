@@ -2713,6 +2713,15 @@ export function createClaudeCodeAgent(
                   let content = msg.content;
                   if (typeof content === "string") {
                     content = stripReplayPromptFraming(content);
+                    // Interrupt notices are machine artifacts, not user prompts.
+                    // Emitting them as user_message_chunk forces the webview to
+                    // finalizeCurrentAssistantTurn() before its own skip check,
+                    // splitting the last assistant turn and pushing the notice
+                    // after the summary. Skip them here so they never reach the
+                    // replay buffer.
+                    if (/^\[Request interrupted by user\]/i.test(content.trim())) {
+                      continue;
+                    }
                   }
                   if (typeof content === "string" && content.trim()) {
                     replayedUpdates.push({
@@ -2724,6 +2733,7 @@ export function createClaudeCodeAgent(
                       if (block.type === "text" && block.text) {
                         const clean = stripReplayPromptFraming(block.text);
                         if (!clean.trim()) continue;
+                        if (/^\[Request interrupted by user\]/i.test(clean.trim())) continue;
                         replayedUpdates.push({
                           sessionUpdate: "user_message_chunk",
                           content: { type: "text", text: clean },
