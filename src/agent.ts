@@ -3005,9 +3005,24 @@ export function createClaudeCodeAgent(
                 // for the CLI, not a user prompt. The type==="user" branch below
                 // would otherwise replay that wall of summary text as a user
                 // message, and on resume it renders as a user bubble the user
-                // never typed. Skip it here, at the source, so it never reaches
-                // the replay buffer.
-                if (entry.isCompactSummary) continue;
+                // never typed.
+                //
+                // It also marks the post-compaction boundary. The CLI does NOT
+                // write a separate `type === "summary"` entry (that marker is
+                // dead in every real transcript), so this is the ONLY signal
+                // that the conversation was rewritten. Treat it the same as a
+                // summary marker: drop everything replayed so far (pre-compact
+                // turns are no longer live context — the CLI replaced them with
+                // the summary) and reset derived plan state. Only turns after
+                // the LAST isCompactSummary entry are replayed, so a resumed
+                // session shows the post-compact conversation, not the full
+                // pre-compact history.
+                if (entry.isCompactSummary) {
+                  replayedUpdates.length = 0;
+                  sessionTodos.delete(sessionId);
+                  compactedAtLeastOnce = true;
+                  continue;
+                }
                 // Compaction marker: the CLI replaces the conversation with
                 // this summary. Drop everything replayed so far (it is no
                 // longer live context) and reset derived plan state.

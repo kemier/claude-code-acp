@@ -239,6 +239,60 @@ describe("loadSession replay compaction truncation", () => {
     ).toBe(true);
   });
 
+  it("truncates replay to only turns after the LAST isCompactSummary entry", async () => {
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1.0" },
+    });
+
+    const sessionId = "dddddddd-aaaa-cccc-dddd-eeeeeeeeeeee";
+    const cwd = "/tmp/proj";
+    const transcriptPath = `/home/test/.claude/projects/-tmp-proj/${sessionId}.jsonl`;
+    // The CLI does NOT write a `type === "summary"` marker — compaction is
+    // recorded ONLY via isCompactSummary user entries. Each one replaces the
+    // conversation with a summary, so every pre-compact turn before the LAST
+    // such entry is dead context and must not replay.
+    const lines: any[] = [
+      // Pre-first-compaction exchange (must be dropped)
+      { type: "user", message: { content: "old user msg 1" }, timestamp: "t0" },
+      { type: "assistant", message: { content: [{ type: "text", text: "old reply 1" }] }, timestamp: "t1" },
+      // First compaction
+      { type: "user", isCompactSummary: true, message: { content: "This session is being continued… Summary: …" }, timestamp: "t2" },
+      // Post-first-compaction exchange (must ALSO be dropped — it's before the LAST compaction)
+      { type: "user", message: { content: "middle user msg" }, timestamp: "t3" },
+      { type: "assistant", message: { content: [{ type: "text", text: "middle reply" }] }, timestamp: "t4" },
+      // Second (LAST) compaction
+      { type: "user", isCompactSummary: true, message: { content: "This session is being continued… Summary: … (second)" }, timestamp: "t5" },
+      // Post-last-compaction exchange (MUST replay)
+      { type: "user", message: { content: "latest user msg" }, timestamp: "t6" },
+      { type: "assistant", message: { content: [{ type: "text", text: "latest reply" }] }, timestamp: "t7" },
+    ];
+    fsState.files[transcriptPath] = lines.map((l) => JSON.stringify(l)).join("\n");
+    fsState.exists.add(transcriptPath);
+
+    await agent.loadSession!({ sessionId, cwd, mcpServers: [] });
+
+    const texts = updates
+      .filter(
+        (u) =>
+          u.sessionUpdate === "user_message_chunk" ||
+          u.sessionUpdate === "agent_message_chunk",
+      )
+      .map((u) => u.content?.text)
+      .filter(Boolean);
+
+    // Only the post-LAST-compaction turns replay.
+    expect(texts).toEqual(["latest user msg", "latest reply"]);
+    // Pre-compaction and middle turns must be truncated.
+    expect(texts).not.toContain("old user msg 1");
+    expect(texts).not.toContain("old reply 1");
+    expect(texts).not.toContain("middle user msg");
+    expect(texts).not.toContain("middle reply");
+    // No compact-summary banners.
+    expect(texts.some((t) => /This session is being continued/.test(t))).toBe(false);
+  });
+
   it("reconstructs the plan snapshot from replayed TaskCreate/TaskUpdate tool_use blocks", async () => {
     await agent.initialize({
       protocolVersion: 1,
