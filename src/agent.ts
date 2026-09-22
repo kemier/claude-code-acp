@@ -650,7 +650,11 @@ export async function loadProxyPickerModels(): Promise<void> {
  * behaviour — so an outage never empties the picker.
  */
 function getPickerModelList(): Array<{ id: string; name: string }> {
-  if (isProxyModelsEnabled() && proxyPickerModels) {
+  // The length check matters: an empty proxy list (fetched fine, but the
+  // gate filtered every model — e.g. all scaled to zero) is truthy in JS and
+  // would otherwise win over the settings list, crashing buildConfigOptions
+  // at `availableModels[0].id`.
+  if (isProxyModelsEnabled() && proxyPickerModels && proxyPickerModels.length > 0) {
     return proxyPickerModels;
   }
   return getAvailableModelsFromSettings();
@@ -1590,9 +1594,23 @@ function parseSlashCommand(prompt: string): { name: string; rest: string } | nul
   };
 }
 
-/** Check if a prompt is a read-only slash command (no LLM turn needed). */
-function isReadOnlyCommand(name: string): boolean {
-  return name === "ps" || name === "status" || name === "skills" || name === "list-agents";
+/** Read-only /goal subcommands that need no LLM turn (matches the exactArgs
+ *  declared in BUILTIN_COMMANDS for /goal's turnSafe meta). */
+const GOAL_READ_ONLY_SUBS = new Set([
+  "", "clear", "stop", "off", "reset", "none", "cancel", "pause", "resume",
+]);
+
+/** Check if a slash command is read-only (no LLM turn needed). Used both for
+ *  the per-session prompt-lock bypass (read-only commands run concurrently
+ *  with an in-flight turn) and for dispatchSlashCommand's fast path. */
+function isReadOnlyCommand(name: string, rest?: string): boolean {
+  if (name === "ps" || name === "status" || name === "skills" || name === "list-agents") {
+    return true;
+  }
+  if (name === "goal" && GOAL_READ_ONLY_SUBS.has((rest ?? "").trim().toLowerCase())) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -3327,6 +3345,25 @@ export function createClaudeCodeAgent(
       // `-p <string>` path unchanged (zero behavior change).
       const promptImages = acpImageBlocksToStdinBlocks(prompt);
       const hasImages = promptImages.length > 0;
+
+      // Read-only slash commands (/ps, /status, /skills, /list-agents, and
+      // the no-turn subcommands of /goal) are fully serviced by
+      // dispatchSlashCommand without touching shared per-session state
+      // (sessionTodos, sessionEstimators, the Claude session id, the onEvent
+      // closure). They bypass the per-session prompt lock so the result
+      // appears immediately — not after the in-flight turn finishes. The lock
+      // exists to prevent concurrent runPrompt bodies from racing on that
+      // shared state; a read-only snapshot neither writes to it nor needs the
+      // steer drain or auto-compact check that runPrompt also runs.
+      const cmd = parseSlashCommand(text);
+      if (cmd && isReadOnlyCommand(cmd.name, cmd.rest)) {
+        const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, text);
+        if (dispatchResult.handled) {
+          return { stopReason: "end_turn" };
+        }
+        // Not a read-only subcommand (e.g. /goal <objective> starts a turn) —
+        // fall through to the serialized path.
+      }
 
       // Serialize against any in-flight prompt on this session. See
       // sessionPromptLocks above: the SDK runs concurrent prompt() handlers,

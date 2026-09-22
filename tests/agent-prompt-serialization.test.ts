@@ -82,6 +82,10 @@ describe("per-session prompt serialization", () => {
     vi.clearAllMocks();
     releaseFirstTurn = () => {};
     firstTurnStarted = () => {};
+    // The proxy discovery at newSession time must not reach the developer's
+    // live proxy: point it at an unreachable address. The picker then falls
+    // back to the static settings list and no fetch can race the tests.
+    process.env.ERICAI_PROXY_URL = "http://127.0.0.1:59999";
     conn = createMockConnection();
     agent = createClaudeCodeAgent(conn);
     await agent.initialize({
@@ -96,7 +100,7 @@ describe("per-session prompt serialization", () => {
     return r.sessionId;
   }
 
-  it("a slash command sent mid-turn is not lost — it runs after the turn and emits its chunk", async () => {
+  it("a read-only slash command mid-turn is not lost — it responds immediately, not after the turn", async () => {
     const sid = await newSession();
 
     let started = false;
@@ -117,29 +121,25 @@ describe("per-session prompt serialization", () => {
       prompt: [{ type: "text", text: "/skills" }],
     });
 
-    // /skills must NOT have emitted its chunk yet — it is queued behind the
-    // first turn. Give it a tick to prove it hasn't run concurrently.
-    await new Promise((r) => setTimeout(r, 10));
-    const chunkBefore = (conn.sessionUpdate as any).mock.calls.filter(
-      (c: any) =>
-        c[0]?.update?.sessionUpdate === "agent_message_chunk" &&
-        /Available skills|No skills configured/.test(c[0]?.update?.content?.text ?? "")
-    );
-    expect(chunkBefore).toHaveLength(0);
+    // /skills is read-only and bypasses the per-session prompt lock, so its
+    // chunk is emitted immediately — while the first turn is still in flight —
+    // not serialized behind it. This is the whole point of the bypass: the
+    // user sees the snapshot at send time, not after the in-flight turn ends.
+    await vi.waitFor(() => {
+      const chunks = (conn.sessionUpdate as any).mock.calls.filter(
+        (c: any) =>
+          c[0]?.update?.sessionUpdate === "agent_message_chunk" &&
+          /Available skills|No skills configured/.test(c[0]?.update?.content?.text ?? "")
+      );
+      expect(chunks.length).toBeGreaterThan(0);
+    });
+    // The first turn is STILL in flight when the chunk lands.
+    expect(started).toBe(true);
 
-    // Release the first turn. Now /skills runs.
+    // Release the first turn; both settle.
     releaseFirstTurn();
     await first;
     await skills;
-
-    // The /skills chunk survived serialization.
-    const calls = (conn.sessionUpdate as any).mock.calls;
-    const skillsChunk = calls.find(
-      (c: any) =>
-        c[0]?.update?.sessionUpdate === "agent_message_chunk" &&
-        /Available skills|No skills configured/.test(c[0]?.update?.content?.text ?? "")
-    );
-    expect(skillsChunk).toBeTruthy();
   });
 
   it("two regular prompts run sequentially, never concurrently", async () => {
@@ -178,5 +178,36 @@ describe("per-session prompt serialization", () => {
     await p2;
 
     expect(overlap).toBe(false);
+  });
+
+  it("an empty dynamic proxy list falls back to the static settings picker (never empties it)", async () => {
+    // Simulate the hazard: the dynamic picker is enabled (settings env block
+    // has CLAUDE_ACP_PROXY_MODELS=1) and the proxy fetched OK, but the shared
+    // gate filtered EVERY model (e.g. all scaled to zero) → cached list is [].
+    // [] is truthy in JS, so getPickerModelList must check length, not
+    // truthiness, and fall back to the static settings list instead of
+    // crashing buildConfigOptions at `availableModels[0].id`.
+    const { loadProxyPickerModels, resetProxyPickerModelsCache } = await import("../src/agent.js");
+    resetProxyPickerModelsCache();
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (url: string) => {
+      if (String(url).includes("/v1/model-health")) {
+        return { ok: true, status: 200, json: async () => ({ data: [] }) };
+      }
+      // Every catalog model fails the coding/near_sota gate.
+      return { ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-oss-120b", tags: ["fast"] }] }) };
+    }) as typeof fetch;
+    try {
+      await loadProxyPickerModels();
+      // A fresh session must still build its config options from the static
+      // settings list — no crash, non-empty picker.
+      const r = await agent.newSession({ cwd: "/tmp/proj", mcpServers: [] });
+      const modelOption = (r.configOptions as any[]).find((o) => o.id === "model");
+      expect(modelOption).toBeTruthy();
+      expect(modelOption.options.length).toBeGreaterThan(0);
+    } finally {
+      globalThis.fetch = realFetch;
+      resetProxyPickerModelsCache();
+    }
   });
 });
