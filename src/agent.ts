@@ -2423,9 +2423,11 @@ export function createClaudeCodeAgent(
      if (!argument) {
        // /goal with no argument — show current goal status (matches Claude Code CLI behavior).
        const g = sessionGoals.get(sessionId);
+       // Plain text (not markdown) — this is a transient command-output row that
+       // the client renders via textContent, so markdown source would show verbatim.
        const statusText = g
-         ? `**Goal:** ${g.paused ? "(paused) " : ""}${g.text.slice(0, 200)}`
-         : "**Goal:** none";
+         ? `Goal: ${g.paused ? "(paused) " : ""}${g.text.slice(0, 200)}`
+         : "Goal: none";
        await connection.sessionUpdate({
          sessionId,
          update: {
@@ -3356,18 +3358,25 @@ export function createClaudeCodeAgent(
       // dispatchSlashCommand without touching shared per-session state
       // (sessionTodos, sessionEstimators, the Claude session id, the onEvent
       // closure). They bypass the per-session prompt lock so the result
-      // appears immediately — not after the in-flight turn finishes. The lock
-      // exists to prevent concurrent runPrompt bodies from racing on that
-      // shared state; a read-only snapshot neither writes to it nor needs the
-      // steer drain or auto-compact check that runPrompt also runs.
+      // appears immediately — not after the in-flight turn finishes.
+      //
+      // CRITICAL: when the command is handled we must RETURN here, not fall
+      // through to the serialized path. dispatchSlashCommand is NOT idempotent
+      // (e.g. /goal clear|pause mutates sessionGoals and the read-only commands
+      // emit a snapshot), and runPrompt re-dispatches the same command a second
+      // time. Falling through would double-emit the snapshot (and double-mutate
+      // goal state) — and the queued second dispatch is what made a mid-turn
+      // command "drain and trigger another turn" after end_turn.
+      //
+      // When dispatchSlashCommand does NOT handle it (defensive: a /goal
+      // subcommand that actually starts a turn, e.g. /goal <objective>), fall
+      // through to the serialized path so that turn runs normally.
       const cmd = parseSlashCommand(text);
       if (cmd && isReadOnlyCommand(cmd.name, cmd.rest)) {
         const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, text);
         if (dispatchResult.handled) {
           return { stopReason: "end_turn" };
         }
-        // Not a read-only subcommand (e.g. /goal <objective> starts a turn) —
-        // fall through to the serialized path.
       }
 
       // Serialize against any in-flight prompt on this session. See

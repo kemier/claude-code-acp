@@ -136,9 +136,10 @@ describe("slash commands & estimator", () => {
 
     const calls = (conn.sessionUpdate as any).mock.calls;
     const msg = calls.find((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk");
-    // /goal with no argument shows the current goal status (or "**Goal:** none"
+    // /goal with no argument shows the current goal status (or "Goal: none"
     // when no goal is set) — matches Claude Code CLI behavior (1442197).
-    expect(msg[0].update.content.text).toMatch(/^\*\*Goal:\*\*/);
+    // Plain text, not markdown: command-output rows render via textContent.
+    expect(msg[0].update.content.text).toMatch(/^Goal:/);
     // No streaming turn should have been started for an empty /goal.
     expect(capturedOnEvent).toBeNull();
   });
