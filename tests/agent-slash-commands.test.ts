@@ -357,16 +357,20 @@ describe("slash commands & estimator", () => {
     expect(byName("context")).toBeTruthy();
     expect(byName("model")).toBeTruthy();
 
-    // Read-only natives are turn-safe: via terminal_slash_commands (doctor)
-    // and via the static allowlist (context, usage, recap).
-    expect(byName("doctor")?._meta?.turnSafe).toBe(true);
+    // Read-only natives are turn-safe via the static allowlist
+    // (context, usage, recap).
     expect(byName("context")?._meta?.turnSafe).toBe(true);
     expect(byName("recap")?._meta?.turnSafe).toBe(true);
     expect(byName("usage")?._meta?.turnSafe).toBe(true);
 
-    // State-mutating natives are NOT turn-safe (no _meta at all).
+    // State-mutating or cosmetic natives are NOT turn-safe (no _meta at all).
+    // doctor/color/reload-plugins are in the CLI's terminal_slash_commands but
+    // are not read-only introspection useful mid-turn, so they stay unsafe.
     expect(byName("model")?._meta).toBeUndefined();
     expect(byName("init")?._meta).toBeUndefined();
+    expect(byName("doctor")?._meta).toBeUndefined();
+    expect(byName("color")?._meta).toBeUndefined();
+    expect(byName("reload-plugins")?._meta).toBeUndefined();
   });
 
   it("/skills lists skills from ~/.agents/skills (cross-agent global)", async () => {

@@ -3257,16 +3257,19 @@ export function createClaudeCodeAgent(
           const skillSet = new Set(event.skillNames ?? []);
           const agentSet = new Set(event.agentNames ?? []);
           const builtinNames = new Set(BUILTIN_COMMANDS.map((b) => b.name));
-          // Native command name → is it read-only/turn-safe? A command is
-          // turn-safe when the CLI itself serves it from the terminal
-          // (terminal_slash_commands — no LLM turn, pure inspection) OR it's in
-          // the static read-only allowlist. Everything else is left unsafe so
-          // vscode-acp queues it behind the running turn.
-          const terminalSafe = new Set(event.terminalSlashCommands ?? []);
+          // Native command name → is it read-only/turn-safe? A native is
+          // turn-safe ONLY if it's in the static read-only allowlist. We do NOT
+          // trust the CLI's terminal_slash_commands (doctor/color/reload-plugins)
+          // as a turnSafe signal: that list means "the CLI handles it in the
+          // terminal layer", which is true for cosmetic or state-mutating
+          // commands (color = terminal theme, reload-plugins = re-read config)
+          // that are not read-only introspection useful to fire mid-turn.
+          // Everything not in the allowlist is left unsafe so vscode-acp queues
+          // it behind the running turn.
           const nativeCommands = event.slashCommands
             .filter((name) => !builtinNames.has(name) && !skillSet.has(name) && !agentSet.has(name))
             .map((name) => {
-              const turnSafe = terminalSafe.has(name) || NATIVE_TURN_SAFE_COMMANDS.has(name);
+              const turnSafe = NATIVE_TURN_SAFE_COMMANDS.has(name);
               return {
                 name,
                 description: `Claude Code: /${name}`,
