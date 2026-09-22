@@ -266,9 +266,16 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   "mimo-v2.5-pro": ["low", "high"],
   "mimo-v2.5": ["low", "high"],
   "qwen2.5-14b-1m": [],
-  // Qwen3.8 chat template levels: low / medium / xhigh (no "high"; the
-  // template rejects "none" — thinking off comes from enable_thinking).
-  "qwen38-27b": ["low", "medium", "xhigh"],
+  // Qwen3.8-27B (standard + FP8-1M): only low/medium are sendable. Verified
+  // raw against the backendsso vLLM (2026-09-22): "high" 500s at the chat
+  // template ("Supported types are xhigh (default), medium, and low"),
+  // "xhigh" 422s at the outer schema ("Input should be 'low', 'medium' or
+  // 'high'"). The proxy drops high/xhigh before the wire, so advertising
+  // them would make the picker show a "High" that silently maps to
+  // enable_thinking:false — hide it. (Stale "qwen38-27b" slug removed; the
+  // live model id from /v1/models is "Qwen3.8-27B".)
+  "Qwen3.8-27B": ["low", "medium"],
+  "Qwen3.8-27B-FP8-1M": ["low", "medium"],
   "qwythos": ["low", "medium", "xhigh"],
   // Qwen3.8-Flash-Next: the Ray cluster's extra_body_suggestions advertise
   // only low/medium (verified via `ericai api models.list`). `high` 500s at
