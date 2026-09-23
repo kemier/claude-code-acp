@@ -52,6 +52,16 @@ vi.mock("../src/claude-runner.js", () => {
           });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
+        // Sentinel prompt to simulate a Claude CLI `local` command result
+        // (/usage, /heapdump, ...): the CLI services it itself with no LLM
+        // turn, returning the output as the `result` of a single `result`
+        // event with no stop reason and no usage (see processSlashCommand
+        // case 'local' → { shouldQuery:false, resultText }). The adapter must
+        // surface that text as a commandOutput row instead of dropping it.
+        if (_prompt === "/heapdump" || _prompt === "/usage") {
+          onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
+          return { text: "", sessionId: "claude-uuid-abc" };
+        }
         // Emit both a streaming text delta AND the final assistant block with
         // the same text — this is what --verbose mode does. The estimator must
         // count the text only once.
@@ -66,6 +76,16 @@ vi.mock("../src/claude-runner.js", () => {
       async (_sessionId: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
         capturedPrompt = _prompt;
+        // Sentinel prompt to simulate a Claude CLI `local` command result
+        // (/usage, /heapdump, ...): the CLI services it itself with no LLM
+        // turn, returning the output as the `result` of a single `result`
+        // event with no stop reason and no usage (see processSlashCommand
+        // case 'local' → { shouldQuery:false, resultText }). The adapter must
+        // surface that text as a commandOutput row instead of dropping it.
+        if (_prompt === "/heapdump" || _prompt === "/usage") {
+          onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
+          return { text: "", sessionId: "claude-uuid-abc" };
+        }
         onEvent({ type: "assistant", apiCallIndex: 0 });
         onEvent({ type: "text_delta", text: "continued", fromAssistantBlock: true });
         onEvent({ type: "result", usage: { input_tokens: 10, output_tokens: 5 } });
@@ -128,6 +148,42 @@ describe("slash commands & estimator", () => {
     expect(text).toContain("Mode: agent");
     expect(text).toContain("Directory: /tmp/proj");
     expect(text).toContain(`Session: ${sid}`);
+  });
+
+  it("a CLI-native local command (/heapdump) result is surfaced as a commandOutput row", async () => {
+    // /heapdump is a Claude CLI-native `local` command the CLI services itself
+    // with no LLM turn. It is NOT in isReadOnlyCommand, so it is queued and
+    // drained like a normal prompt (not fired mid-turn as a side-channel) and
+    // forwarded to the CLI. The CLI returns its output as the `result` field
+    // of a single `result` event (no stop reason, no usage). The mock runner
+    // is wired to emit exactly that for the /heapdump and /usage prompts. The
+    // adapter must surface the text as a transient commandOutput SNAPSHOT row
+    // — the regression is that the result handler used to drop `event.text`,
+    // so /heapdump and /usage showed nothing in the ACP chat.
+    const sid = await newSession();
+    // First establish a Claude session via a normal prompt, so the
+    // /heapdump turn resumes that session (continueSessionStreaming path).
+    await prompt(sid, "hello");
+    (conn.sessionUpdate as any).mockClear();
+    const res = await prompt(sid, "/heapdump");
+
+    // The turn resolves as a clean end_turn (a native command, not a failure).
+    expect(res.stopReason).toBe("end_turn");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const cmdMsg = calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk"
+        && c[0]?.update?._meta?.commandOutput === true,
+    );
+    expect(cmdMsg).toBeTruthy();
+    expect(cmdMsg[0].update.content.text).toContain("Heap snapshot written to:");
+
+    // No assistant bubble / LLM text should have been emitted for the command
+    // — the only agent_message_chunk is the commandOutput snapshot row.
+    const allMsgTexts = calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk")
+      .map((c: any) => c[0].update.content.text);
+    expect(allMsgTexts.length).toBe(1);
   });
 
   it("/goal with empty arg shows status, not a turn", async () => {

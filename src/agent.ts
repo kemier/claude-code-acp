@@ -1600,6 +1600,39 @@ const GOAL_READ_ONLY_SUBS = new Set([
   "", "clear", "stop", "off", "reset", "none", "cancel", "pause", "resume",
 ]);
 
+/**
+ * Native Claude CLI slash commands that the CLI services itself as a `local`
+ * command — no LLM turn, no API call. The CLI runs the command and returns the
+ * output as the `result` field of a single `result` event with
+ * `stop_reason: null` (see processSlashCommand's `case 'local'` →
+ * `{ shouldQuery: false, resultText }`, then QueryEngine yielding
+ * `{ type: 'result', result: resultText, stop_reason: null }`).
+ *
+ * These reach the adapter through the SAME queued-and-drained path as any
+ * prompt (they are NOT in isReadOnlyCommand, so vscode-acp does not fire them
+ * mid-turn as a side-channel; they run serially and are drained like a normal
+ * turn). The adapter used to DROP their output (the `result` handler ignored
+ * `event.text`), so /usage and /heapdump showed nothing in the ACP chat even
+ * though the CLI had produced a result. This set names the natives whose
+ * result text is surfaced to the client as a transient commandOutput row when
+ * it arrives — giving the CLI's own (precise) data without fabricating it on
+ * the adapter side.
+ *
+ * Kept as an explicit allowlist (not "any result with no stop reason") so a
+ * genuine end_turn that happens to carry no text is never mis-rendered, and a
+ * future native command can be added deliberately.
+ */
+const CLI_LOCAL_COMMAND_NAMES = new Set(["usage", "heapdump", "context", "insights", "recap"]);
+
+/** True when the prompt being forwarded to the CLI is a native `local`
+ *  slash command (e.g. /usage, /heapdump) that the CLI services itself. Used
+ *  to recognize its result event so the CLI's output can be surfaced as a
+ *  commandOutput row instead of being dropped. */
+function isCliLocalCommandPrompt(text: string): boolean {
+  const cmd = parseSlashCommand(text);
+  return !!cmd && CLI_LOCAL_COMMAND_NAMES.has(cmd.name);
+}
+
 /** Check if a slash command is read-only (no LLM turn needed). Used both for
  *  the per-session prompt-lock bypass (read-only commands run concurrently
  *  with an in-flight turn) and for dispatchSlashCommand's fast path. */
@@ -3559,6 +3592,13 @@ export function createClaudeCodeAgent(
       // turn failures to a visible error rather than an empty success.
       let turnErrored = false;
       let turnStopReason: string | undefined;
+      // True when this turn forwards a native Claude CLI `local` slash command
+      // (/usage, /heapdump, /context, /insights, /recap) that the CLI services
+      // itself without an LLM turn. The CLI's output arrives as the `result`
+      // field of the single `result` event (stop_reason null); when this flag
+      // is set we surface that text as a commandOutput row so it is not
+      // silently dropped. See isCliLocalCommandPrompt / CLI_LOCAL_COMMAND_NAMES.
+      const isCliLocalTurn = isCliLocalCommandPrompt(text);
       // Claude CLI emits per-token text deltas only when launched with
       // --include-partial-messages (claude-runner passes it), and wraps them in
       // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
@@ -3851,6 +3891,35 @@ export function createClaudeCodeAgent(
       // swallowed as a plain end_turn.
       turnStopReason = event.stopReason;
       if (event.isError) turnErrored = true;
+      // Surface the CLI's own output for a native `local` command (/usage,
+      // /heapdump, /context, /insights, /recap). These are queued-and-drained
+      // like a normal prompt (NOT bypassed mid-turn) and the CLI services them
+      // itself — no LLM turn, no API call — returning the result as the `text`
+      // of a single `result` event with no stop reason. Without this the text
+      // was dropped here and /usage and /heapdump showed nothing in the ACP
+      // chat. Emit it as a transient commandOutput SNAPSHOT row (like /ps and
+      // /status) so it appears beside the command, not as a persistent
+      // assistant bubble. Only when this turn was actually a CLI local command
+      // (isCliLocalTurn) and the result carries text, so a normal end_turn that
+      // happens to carry no/extra text is never mis-rendered.
+      if (isCliLocalTurn && !event.isError && typeof event.text === "string" && event.text.trim()) {
+        connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: event.text },
+            messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId
+            // above. Without this marker a client cannot tell command output
+            // from the assistant's own text, so vscode-acp's compact mode
+            // folded it into the running turn's collapsed block instead of
+            // showing it beside the command.
+            _meta: { commandOutput: true },
+          } as any,
+        }).catch(() => {
+          // Best effort — a missing command-output row must not fail the turn.
+        });
+      }
       // Record the context window Claude Code resolved for this model, so the
       // usage denominator can fall back to the CLI's own figure instead of a
       // hardcoded 200k when the proxy advertises nothing. NOTE: the CLI's value
