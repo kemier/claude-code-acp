@@ -75,7 +75,7 @@ let running = false;
 // await it before resolving, letting a test fire a steer mid-turn (with
 // running=false to simulate the subprocess-closed-but-prompt-in-flight drain
 // tail window). `streamEntered` resolves once the gated streaming call has
-// begun (so the test can steer only after runPrompt is truly in flight).
+// begun (so the test can steer only after executePrompt is truly in flight).
 // Cleared after each use.
 let streamGate: (() => void) | null = null;
 let streamGatePromise: Promise<void> = new Promise(() => {});
@@ -562,7 +562,7 @@ describe("steering (session/steer)", () => {
 
   it("queues a steer arriving in the drain-tail window (subprocess closed, prompt in flight)", async () => {
     // Regression: handleSteer used to gate on runner.isRunning() alone, which
-    // flips false the moment the Claude subprocess closes — BEFORE runPrompt's
+    // flips false the moment the Claude subprocess closes — BEFORE executePrompt's
     // steer drain runs. A steer typed in the last moments of streaming thus
     // arrived with running=false, was logged "no active turn", and silently
     // dropped instead of queued — so it never showed before the next turn.
@@ -572,9 +572,9 @@ describe("steering (session/steer)", () => {
 
     // Gate the main turn so it stays in flight while we steer.
     setStreamGate();
-    running = false; // subprocess "closed" — but runPrompt is still in flight
+    running = false; // subprocess "closed" — but executePrompt is still in flight
     const inflight = prompt(agent, sid, "main turn");
-    // Wait until runPrompt has actually entered streaming (in-flight flag set).
+    // Wait until executePrompt has actually entered streaming (in-flight flag set).
     await streamEnteredPromise;
     // While the main turn is gated (in flight, runner NOT running), steer.
     await agent.extNotification("session/steer", { sessionId: sid, text: "late steer during drain tail" });

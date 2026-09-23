@@ -6,7 +6,7 @@
  *
  * Mechanism: Claude CLI cannot inject mid-turn, so a steer is queued and
  * drained AFTER the main turn (drainSteerQueue). "Send Now" cancels that turn,
- * and the cancel exits runPrompt BEFORE the drain — leaving the steer in the
+ * and the cancel exits executePrompt BEFORE the drain — leaving the steer in the
  * queue. The next turn (the Send Now message) then answers, and its own
  * post-turn drain delivers the stale steer as a follow-up: two bubbles, and the
  * last thing the model works on is the older message.

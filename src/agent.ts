@@ -32,8 +32,6 @@ import { ClaudeRunner, isProxyBaseUrl, type StreamEvent } from "./claude-runner.
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
-  discoverProxyModels,
-  getAvailableModels,
   getAvailableModelsFromSettings,
   getClaudeEnv,
   getDefaultEffortFromSettings,
@@ -1950,7 +1948,7 @@ export function createClaudeCodeAgent(
   // queue behind the active turn as the user expects.
   const sessionPromptLocks = new Map<string, Promise<unknown>>();
 
-  // True for the entire duration of a runPrompt() call — from entry through
+  // True for the entire duration of a executePrompt() call — from entry through
   // the LLM turn, steer drain, auto-compact, and the end_turn return. Unlike
   // runner.isRunning() (which flips false the moment the Claude subprocess
   // closes, before the drain runs) this spans the whole turn tail. Used by
@@ -1958,7 +1956,7 @@ export function createClaudeCodeAgent(
   // steer typed in the last moments of streaming arrives after the subprocess
   // closes but while a turn is still in flight, and must be queued (then
   // drained at line ~2056) rather than silently dropped. Cleared in a finally
-  // so it can't get stuck true if runPrompt throws.
+  // so it can't get stuck true if executePrompt throws.
   const sessionPromptInFlight = new Set<string>();
 
   // ─── Subagent (Agent tool) lifecycle tracking ─────────────────────────────
@@ -2228,11 +2226,11 @@ export function createClaudeCodeAgent(
       return;
     }
     // A turn is "active" for steering while EITHER the Claude subprocess is
-    // streaming OR a runPrompt() is still in flight. runner.isRunning() flips
+    // streaming OR a executePrompt() is still in flight. runner.isRunning() flips
     // false the moment the subprocess closes (claude-runner.ts proc.on('close'))
-    // — but runPrompt() still runs the steer drain + auto-compact + return
+    // — but executePrompt() still runs the steer drain + auto-compact + return
     // end_turn after that. Without the in-flight check, a steer typed in the
-    // last moments of streaming (subprocess closed, runPrompt in its drain
+    // last moments of streaming (subprocess closed, executePrompt in its drain
     // tail) would hit this guard, log "no active turn", and be silently
     // dropped instead of queued — so it never appeared in the chat before the
     // next turn.
@@ -2964,6 +2962,1496 @@ export function createClaudeCodeAgent(
 
 
 
+
+  /**
+   * The full prompt-turn body (slash dispatch, LLM turn, steer drain,
+   * auto-compact, usage/plan/goal bookkeeping). Hoisted to closure scope so
+   * BOTH prompt() (the normal ACP entry point) AND setSessionConfigOption()
+   * (the plan→exit interrupt, which cancels the running turn and re-prompts
+   * with the fresh <collaboration_mode> block) can chain a turn on the
+   * per-session lock.
+   */
+  const executePrompt = async (sessionId: string, bodyText: string, modelOverride: string | undefined, effectiveEffort: string | undefined, promptImages: import("./claude-runner.js").StdinContentBlock[] = []): Promise<PromptResponse> => {
+    // Mark this session as having a prompt in flight for the entire executePrompt
+    // body (LLM turn + steer drain + auto-compact + return). Cleared when the
+    // lock chain settles (below). See sessionPromptInFlight.
+    sessionPromptInFlight.add(sessionId);
+    // If this prompt was cancelled while waiting in the serialization queue
+    // behind a prior turn, don't start a new turn — drain-and-return.
+    if (cancelledSessions.has(sessionId)) {
+      cancelledSessions.delete(sessionId);
+      logger.info(`Queued prompt cancelled before start for session ${sessionId}`);
+      return { stopReason: "cancelled" };
+    }
+    // ── Slash command handling ──────────────────────────────────
+    // Intercept built-in commands (/ps, /goal, /skills, /status, /clear,
+    // /compact) before starting an LLM turn. Shared dispatch logic lives in
+    // dispatchSlashCommand() so prompt() and the steer-drain loop behave
+    // identically. Read-only commands and /clear|/compact|/goal clear|pause
+    // |resume are fully serviced and return immediately. /goal <objective>
+    // returns a goalPrompt to start an LLM turn with.
+    const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, bodyText);
+    // When /goal sets a new objective, this holds the prompt to send to the
+    // LLM to start working on it immediately.
+    const goalPrompt = dispatchResult.startTurn ?? null;
+    // A fully-serviced command (read-only, /clear, /compact, /goal subcmds)
+    // needs no main LLM turn — but we still drain any steers queued during it
+    // (e.g. steers queued while /compact was summarizing) and run the
+    // auto-compact check, so we skip the main turn rather than returning early.
+    const skipMainTurn = dispatchResult.handled && !goalPrompt;
+    const command = dispatchResult.handled ? parseSlashCommand(bodyText) : null;
+
+    // If there's an active (non-paused) goal, prepend it to the prompt.
+   // goalPrompt is set when /goal just set a new objective — use it directly.
+   // For subsequent prompts, prepend the goal as context.
+   const activeGoal = sessionGoals.get(sessionId);
+   let effectivePrompt = bodyText;
+   if (goalPrompt) {
+     effectivePrompt = goalPrompt;
+   } else if (activeGoal && !activeGoal.paused && !command) {
+     effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${bodyText}`;
+   }
+
+    // Inject collaboration mode (plan mode) instructions
+    const collabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
+    if (collabMode === PLAN_COLLABORATION_MODE) {
+      effectivePrompt = `<collaboration_mode># Collaboration Mode: Plan\n\nYou are now in Plan mode. Any previous instructions for other modes (e.g. Default mode) are no longer active.\n\nYour active mode changes only when new developer instructions with a different \`<collaboration_mode>...</collaboration_mode>\` change it; user requests or tool descriptions do not change mode by themselves.\n\nIn Plan mode, you MUST NOT make any changes to the codebase. Instead, analyze the request, investigate the codebase, and produce a detailed plan. Do not execute commands that modify files. Read-only investigation (searching, reading files, running read-only commands) is allowed.\n</collaboration_mode>\n\n${effectivePrompt}`;
+    } else {
+      // Default mode: tell the model it MAY self-enter Plan mode on complex
+      // tasks (mirrors ericli's auto enter_plan_mode — "USE WHEN: complex
+      // multi-step tasks"). The Claude CLI exposes a native EnterPlanMode tool
+      // for this; the adapter maps it to a live picker update (enterPlanMode)
+      // and the ExitPlanMode tool flips the picker back to Default. This keeps
+      // the user in the loop: they see the picker go to "Plan" when the model
+      // decides to plan, and back to "Default" when it's ready to implement.
+      effectivePrompt = `<collaboration_mode># Collaboration Mode: Default\n\nYou are in Default mode: you may read and edit the codebase and execute commands.\n\nWhen a task requires exploration, architectural decisions, or multi-file changes — i.e. it is complex enough that planning first would avoid rework — call EnterPlanMode to switch to Plan mode, investigate read-only, and present a plan. Once the plan is ready, call ExitPlanMode to return to Default mode and implement it. For simple, well-scoped tasks, proceed directly without planning.\n</collaboration_mode>\n\n${effectivePrompt}`;
+    }
+
+    const claudeSessionId = store.getClaudeSessionId(sessionId);
+    const cwd = store.getCwd(sessionId)!;
+   // Tool-call ids must be unique for the whole SESSION: clients resolve tool
+   // elements by id, so a per-turn counter made a new turn adopt the previous
+   // turn's rows. Kept on the store; the local reset below is gone too, since a
+   // steer drain used to restart numbering mid-turn.
+   const nextToolCallId = () => `call_${store.nextToolCallSeq(sessionId)}`;
+   // Monotonic counter for ACP `messageId` on agent_message_chunk. The ACP
+   // spec (ContentChunk.messageId) groups chunks into one logical message:
+   // "All chunks belonging to the same message share the same messageId. A
+   // change in messageId indicates a new message has started." Without it,
+   // vscode-acp cannot tell that text emitted before and after a tool call
+   // belong to the SAME assistant message, so it renders them as separate
+   // bubbles (text→tool→text = 2 bubbles). We rotate the id at each
+   // `assistant` event (one per LLM API call) so all text_delta chunks in
+   // one API call share it; the next API call (after a tool result) gets a
+   // new id → correctly starts a new bubble.
+   let messageCounter = 0;
+   let currentMessageId: string | null = null;
+
+    // Real-time context estimator — tracks conversation content to estimate
+    // context size during the turn (before the result event arrives).
+    // REUSE the session-persistent estimator across turns: a fresh estimator
+    // each turn would reset to ~overhead-only and the usage ring would DROP
+    // at the start of every new turn (then climb again as content streams),
+    // making the context usage visibly flip down→up non-monotonically. By
+    // persisting accumulated content across turns, the estimate stays
+    // monotonic-growing (as a real context window does). Only /clear,
+    // /compact, and auto-compact reset it (see dispatchSlashCommand /
+    // doCompact).
+    const existing = sessionEstimators.get(sessionId);
+    const ctxEstimator = existing ?? new TurnContextEstimator();
+    sessionEstimators.set(sessionId, ctxEstimator);
+    // Accumulate the user's prompt text (it's part of the conversation).
+    ctxEstimator.addText(effectivePrompt);
+
+    // Get model and effort overrides from session config (set via pickers)
+    const configOverrides = store.getConfigOverrides(sessionId);
+    const runModel = configOverrides["model"] as string | undefined;
+    // Best-effort: trigger a context-window map load (one-shot, idempotent) so
+    // the first usage_update of the turn uses the proxy's real per-model
+    // window instead of falling through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS
+    // override (which is pinned to one model's window and would mis-report
+    // every other model's denominator). This is NON-BLOCKING: a blocking await
+    // here delays prompt() past the point where an early cancel() can be
+    // observed, which loses the cancel signal (the test for cancel-during-prompt
+    // times out). The startup fire-and-forget in index.ts and the refresh-on-miss
+    // in getContextWindowForModel already populate the map; this just nudges an
+    // in-flight load along if the proxy wasn't reachable at spawn.
+    void loadModelContextWindows();
+    void loadProxyPickerModels();
+    // Only pass effort if the selected model actually supports it; otherwise
+    // fall back to the model's default effort. Using resolveEffort() keeps
+    // the actually-sent effort consistent with what the picker shows and
+    // what /compact, steer drains, and auto-compact use (previously normal
+    // turns fell back to undefined for reasoning models, while /compact via
+    // prompt() used the default "high").
+    const runModelResolved = resolveSessionModel(store, sessionId, runModel);
+    const runEffort = resolveEffort(store, sessionId);
+
+    logger.info(`Prompt for session ${sessionId}: ${bodyText.length} chars`);
+    logger.debug(
+      `Prompt content: ${bodyText.slice(0, 100)}${bodyText.length > 100 ? "..." : ""}`
+    );
+
+    const permissionPromises: Promise<void>[] = [];
+
+   let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
+   // Track turn start time for goal budget accounting.
+   const _turnStartTime = Date.now();
+   // Output tokens of the most recent non-sidechain API call. The result
+    // event's output_tokens is summed over every call in the turn, which
+    // over-states how much the conversation actually grew.
+    let lastRealOutputTokens = 0;
+    // Track whether Claude CLI's final result was an error (e.g.
+    // error_max_turns) so we can surface it to the user instead of
+    // returning a silent end_turn. Mirrors codex-acp, which maps upstream
+    // turn failures to a visible error rather than an empty success.
+    let turnErrored = false;
+    let turnStopReason: string | undefined;
+    // True when this turn forwards a native Claude CLI `local` slash command
+    // (/usage, /heapdump, /context, /insights, /recap) that the CLI services
+    // itself without an LLM turn. The CLI's output arrives as the `result`
+    // field of the single `result` event (stop_reason null); when this flag
+    // is set we surface that text as a commandOutput row so it is not
+    // silently dropped. See isCliLocalCommandPrompt / CLI_LOCAL_COMMAND_NAMES.
+    const isCliLocalTurn = isCliLocalCommandPrompt(bodyText);
+    // Claude CLI emits per-token text deltas only when launched with
+    // --include-partial-messages (claude-runner passes it), and wraps them in
+    // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
+    // completed `assistant` message block re-stating the FULL text. Emitting
+    // both would duplicate the reply, so the final block is dropped for the
+    // UI when deltas already delivered it (context estimation still counts
+    // the final block — see below). Before the flag was passed there were no
+    // deltas at all, so the whole reply arrived as one chunk and the client
+    // painted a bubble it immediately superseded: the empty bubble that
+    // flashed and vanished at every text→tool boundary.
+    let streamedTextThisMessage = false;
+    const onEvent = (event: StreamEvent) => {
+      // Handle system/init — extract native Claude CLI slash commands and
+      // surface them to vscode-acp via available_commands_update.
+      if (event.type === "system_init" && event.slashCommands && event.slashCommands.length > 0) {
+        // The CLI's slash_commands list is the UNION of its builtins, skills,
+        // and agents (plus plugin commands). Two of those categories are not
+        // "commands" in the ACP sense, so exclude them before merging:
+        //   - skills: invocable as /<name> but they're skill invocations, not
+        //     session commands; showing them as "Claude Code: /<skill>" is
+        //     misleading and they're already surfaced by /skills.
+        //   - agents: subagent types (Explore, Plan, ...) — you never type
+        //     /Explore as a slash command; the CLI lists them for the Task
+        //     tool. Listing them here made the picker full of bogus entries.
+        const skillSet = new Set(event.skillNames ?? []);
+        const agentSet = new Set(event.agentNames ?? []);
+        const builtinNames = new Set(BUILTIN_COMMANDS.map((b) => b.name));
+        // Native command name → is it read-only/turn-safe? A native is
+        // turn-safe ONLY if it's in the static read-only allowlist. We do NOT
+        // trust the CLI's terminal_slash_commands (doctor/color/reload-plugins)
+        // as a turnSafe signal: that list means "the CLI handles it in the
+        // terminal layer", which is true for cosmetic or state-mutating
+        // commands (color = terminal theme, reload-plugins = re-read config)
+        // that are not read-only introspection useful to fire mid-turn.
+        // Everything not in the allowlist is left unsafe so vscode-acp queues
+        // it behind the running turn.
+        const nativeCommands = event.slashCommands
+          .filter((name) => !builtinNames.has(name) && !skillSet.has(name) && !agentSet.has(name))
+          .map((name) => {
+            const turnSafe = NATIVE_TURN_SAFE_COMMANDS.has(name);
+            return {
+              name,
+              description: `Claude Code: /${name}`,
+              input: null,
+              ...(turnSafe ? { _meta: { turnSafe: true } } : {}),
+            };
+          });
+        const allCommands = [...BUILTIN_COMMANDS, ...nativeCommands];
+        connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "available_commands_update",
+            availableCommands: allCommands,
+          } as any,
+       }).catch(() => {
+         // Best effort
+       });
+     }
+    // Handle assistant event — marks an API call boundary. Each assistant
+    // message in Claude CLI's stream-json output = one LLM API call.
+    // Send a real-time usage_update so the context ring shows during the turn.
+    if (event.type === "assistant") {
+      ctxEstimator.markApiCall();
+      // Rotate the messageId at each API call boundary so all text_delta
+      // chunks in THIS call share one id (→ one bubble in the client), and
+      // the next call (after a tool result) starts a fresh id (→ new bubble).
+      currentMessageId = `msg_${++messageCounter}`;
+      // Secondary source. Through the CCR/proxy path the completed assistant
+      // message reports input_tokens: 0, so this usually contributes nothing;
+      // setRealTokens ignores non-positive values. `message_delta` below is
+      // the reliable source.
+      if (event.usage && !event.isSidechain) {
+        const real =
+          (event.usage.input_tokens ?? 0) +
+          (event.usage.cache_read_input_tokens ?? 0) +
+          (event.usage.cache_creation_input_tokens ?? 0);
+        ctxEstimator.setRealTokens(real);
+        lastRealOutputTokens = event.usage.output_tokens ?? 0;
+      }
+      sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
+      // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`        // event fires at the START of the final assistant block (after the
+      // per-token content_block_delta stream for the same message already
+      // arrived). Resetting here would wipe the flag right before the
+      // final-block text_delta below checks it. The flag is consumed and
+      // cleared by the final-block text_delta itself.
+    }
+    // Handle message_delta — the authoritative per-call context size.
+    //
+    // This is the figure Claude Code and the Anthropic SDK use for their own
+    // context accounting: the exact prompt token count the provider charged
+    // for the API call that just completed. Adopting it verbatim is why the
+    // usage ring no longer needs an estimate. Subagent calls (non-null
+    // parent_tool_use_id on the stream envelope) measure a different
+    // conversation and must not be attributed here.
+    if (event.type === "message_delta" && event.usage && !event.isSidechain) {
+      const realPrompt =
+        (event.usage.input_tokens ?? 0) +
+        (event.usage.cache_read_input_tokens ?? 0) +
+        (event.usage.cache_creation_input_tokens ?? 0);
+      if (realPrompt > 0) {
+        ctxEstimator.setRealTokens(realPrompt);
+        lastRealOutputTokens = event.usage.output_tokens ?? lastRealOutputTokens;
+        sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
+      }
+    }
+    // Handle user event (tool results / injected text) — accumulate for
+    // context estimation.
+    if (event.type === "user" && event.text) {
+      ctxEstimator.addText(event.text);
+    }
+    // Subagent completion detection via <task-notification>.
+    // Claude Code delivers a finished subagent's result as a `user` text
+    // message containing a <task-notification> block — NOT as a tool_result
+    // reusing the tool_use_id (the only tool_result for a subagent is the
+    // immediate launch ack "Async agent launched successfully..."). The
+    // notification carries a task-id (distinct from the tool_use_id) and a
+    // <summary> naming the agent by its description, e.g.:
+    //   Agent "Trace interrupt message wiring" completed
+    //   background agent "Trace interrupt message wiring" ... [stopped]
+    // So we link spawn→completion by DESCRIPTION: if a pending subagent's
+    // description appears inside a <task-notification> in this user message,
+    // flip its tool_call to "completed" and drop it from the pending map.
+    // The post-turn flush then only catches subagents whose notification
+    // never arrived before end_turn (the premature-end_turn case).
+    if (event.type === "user" && event.text) {
+      const text = event.text;
+      const notifIdx = text.indexOf("<task-notification>");
+      if (notifIdx >= 0) {
+        const notif = text.slice(notifIdx);
+        const pending = sessionPendingAgents.get(sessionId);
+        if (pending && pending.size > 0) {
+          // A single user message can carry multiple <task-notification>
+          // blocks (several subagents finishing at once). Match each pending
+          // subagent whose description the notification text references.
+          for (const [tuId, info] of pending) {
+            if (info.description && notif.includes(info.description)) {
+              pending.delete(tuId);
+              connection
+                .sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: info.acpCallId,
+                    status: "completed",
+                  } as any,
+                })
+                .catch(() => {});
+              // Report what the subagent actually FOUND, not just that it
+              // stopped.
+              //
+              // This notification is the only place its result exists on this
+              // side: Claude Code delivers a finished subagent as this user
+              // message, its content never enters the main conversation's
+              // prompt, and the client's own memory capture records tool_call
+              // titles plus the main assistant text — never tool results. So
+              // without this the work is unrecoverable the moment the turn
+              // ends, and could never become memory or a skill.
+              //
+              // Fire-and-forget: a client that does not implement the method,
+              // or does not want the data, must not disturb a subagent that has
+              // already finished.
+              const findings = extractTaskNotificationSummary(notif, info.description);
+              if (findings) {
+                connection
+                  .extNotification(SUBAGENT_FINDINGS_METHOD, {
+                    sessionId,
+                    id: tuId,
+                    type: "subagent",
+                    label: info.description,
+                    task: info.description,
+                    status: findings.stopped ? "stopped" : "completed",
+                    summary: findings.summary,
+                  })
+                  .catch(() => {});
+              }
+              logger.info(
+                `Subagent "${info.description}" (${tuId}) completion ` +
+                  `notified via <task-notification>; marked completed.`,
+              );
+            }
+          }
+          if (pending.size === 0) {
+            sessionPendingAgents.delete(sessionId);
+          }
+        }
+      }
+    }
+    // A subagent's tool results live only in the subagent's own stream —
+    // the main conversation sees the launch ack ("Async agent launched
+    // successfully…") and the eventual <task-notification>, never a
+    // tool_result carrying the subagent's child tool_use_ids. If any
+    // tool_progress heartbeat ever mapped a sidechain id into the parent's
+    // pending-tools map, it could never flip to completed here; drop such
+    // stale entries so they don't sit in_progress until the post-turn flush.
+    if (
+      event.type === "user" &&
+      event.isSidechain &&
+      event.toolResultIds?.length
+    ) {
+      const staleTools = sessionPendingTools.get(sessionId);
+      if (staleTools && staleTools.size > 0) {
+        for (const tuId of event.toolResultIds) {
+          staleTools.delete(tuId);
+        }
+        if (staleTools.size === 0) {
+          sessionPendingTools.delete(sessionId);
+        }
+      }
+    }
+    // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
+    // is resolved by this user message's tool_results to "completed". The
+    // runner emits toolResultIds on the user event (claude-runner.ts). This
+    // is what surfaces the running → completed transition for Bash/Read/Edit.
+    if (event.type === "user" && event.toolResultIds?.length) {
+      const pendingTools = sessionPendingTools.get(sessionId);
+      if (pendingTools && pendingTools.size > 0) {
+        for (const tuId of event.toolResultIds) {
+          const acpCallId = pendingTools.get(tuId);
+          if (acpCallId) {
+            pendingTools.delete(tuId);
+            connection
+              .sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "tool_call_update",
+                  toolCallId: acpCallId,
+                  status: "completed",
+                } as any,
+              })
+              .catch(() => {});
+          }
+        }
+        if (pendingTools.size === 0) {
+          sessionPendingTools.delete(sessionId);
+        }
+      }
+    }
+  // Handle result event — Claude CLI reports CUMULATIVE usage across all
+  // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
+  // single-call turn, input_tokens = real context size (accurate). For a
+   // multi-call turn (tool calls), input_tokens = sum of all calls' input
+   // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
+   // but real context is ~20k).
+   //
+   // Per-call usage comes from each `assistant` message's `message.usage`
+   // (see the assistant handler above), which is exact. The result event's
+   // usage is only a fallback for the pre-first-call window.
+   //
+  // Strategy:
+  // - For the UI: use our real-time estimate (ctxEstimator), which is more
+  //   accurate than the cumulative result value. Cap at contextWindow.
+   // - For auto-compact: use ONLY our estimate. The cumulative result
+   //   value (sum of all API calls) is inflated on multi-call turns and
+   //   triggers compaction way too early (e.g. 340k for a 27k context).
+   //   Our estimate tracks actual conversation growth and is accurate.
+   if (event.type === "result") {
+    // Capture the stop reason / error flag for the prompt return path.
+    // This runs even when the result carries no usage (some error results
+    // omit it), so an error_max_turns / failed turn is never silently
+    // swallowed as a plain end_turn.
+    turnStopReason = event.stopReason;
+    if (event.isError) turnErrored = true;
+    // Surface the CLI's own output for a native `local` command (/usage,
+    // /heapdump, /context, /insights, /recap). These are queued-and-drained
+    // like a normal prompt (NOT bypassed mid-turn) and the CLI services them
+    // itself — no LLM turn, no API call — returning the result as the `text`
+    // of a single `result` event with no stop reason. Without this the text
+    // was dropped here and /usage and /heapdump showed nothing in the ACP
+    // chat. Emit it as a transient commandOutput SNAPSHOT row (like /ps and
+    // /status) so it appears beside the command, not as a persistent
+    // assistant bubble. Only when this turn was actually a CLI local command
+    // (isCliLocalTurn) and the result carries text, so a normal end_turn that
+    // happens to carry no/extra text is never mis-rendered.
+    if (isCliLocalTurn && !event.isError && typeof event.text === "string" && event.text.trim()) {
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: event.text },
+          messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId
+          // above. Without this marker a client cannot tell command output
+          // from the assistant's own text, so vscode-acp's compact mode
+          // folded it into the running turn's collapsed block instead of
+          // showing it beside the command.
+          _meta: { commandOutput: true },
+        } as any,
+      }).catch(() => {
+        // Best effort — a missing command-output row must not fail the turn.
+      });
+    }
+    // Record the context window Claude Code resolved for this model, so the
+    // usage denominator can fall back to the CLI's own figure instead of a
+    // hardcoded 200k when the proxy advertises nothing. NOTE: the CLI's value
+    // is only a FALLBACK — getContextWindowForModel prefers the proxy's
+    // /v1/models figure (authoritative) via `??`. The CLI often reports a
+    // stale/default window for non-Claude models routed via ANTHROPIC_BASE_URL
+    // (e.g. it reports 196608 for deepseek-v4-flash, whose real window is
+    // 262144). If the proxy map doesn't have this model, refresh it — the
+    // proxy may have added the model after our one-shot load.
+    if (event.contextWindow && event.contextWindow > 0) {
+      const cwModel = resolveSessionModel(store, sessionId, runModel);
+      if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
+        cliReportedContextWindows.set(cwModel, event.contextWindow);
+        logger.info(
+          `Claude Code reports contextWindow=${event.contextWindow} for ${cwModel}`
+        );
+      }
+      if (!modelContextWindows.has(cwModel)) {
+        void loadModelContextWindows();
+        void loadProxyPickerModels();
+      }
+    }
+    // Log the stop reason so premature turn termination (end_turn vs
+    // max_turns vs error) is diagnosable from the ACP stderr log.
+    if (event.stopReason || event.isError) {
+      logger.info(
+        `Turn result: stopReason=${event.stopReason ?? "unknown"} isError=${!!event.isError}`,
+      );
+    }
+    if (event.usage) {
+    lastUsage = event.usage;
+    const inputTokens = event.usage.input_tokens ?? 0;
+    const outputTokens = event.usage.output_tokens ?? 0;
+    const runModelResolved = resolveSessionModel(store, sessionId, runModel);
+    const contextWindow = getContextWindowForModel(runModelResolved);
+    // Context size for both the UI and auto-compact. Once a real per-call
+    // prompt count has been seen (message.usage on an assistant event) the
+    // estimator returns that; the result event's own usage is accumulated
+    // across every API call in the turn and would over-report badly on
+    // multi-tool turns, so it is never used for sizing.
+    const estimatedTokens = ctxEstimator.getEstimatedTokens();
+    // The next request's prompt = this prompt + this turn's final output, so
+    // add the LAST call's output rather than the turn-cumulative figure.
+    const trailingOutput = ctxEstimator.hasRealTokens()
+      ? lastRealOutputTokens
+      : outputTokens;
+    sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: trailingOutput });
+    // For the UI: use our real-time estimate (more accurate than cumulative).
+    // Cap at contextWindow so it never shows >100%.
+    const cappedUsed = Math.min(estimatedTokens, contextWindow);
+     connection.sessionUpdate({
+       sessionId,
+       update: {
+         sessionUpdate: "usage_update",
+         used: cappedUsed,
+         size: contextWindow,
+       } as any,
+     }).catch(() => {
+       // Best effort — don't fail the turn if usage_update fails.
+     });
+    }
+   }
+     if ((event as any).type === "thinking" && (event as any).text) {
+       ctxEstimator.addText((event as any).text);
+       connection.sessionUpdate({
+         sessionId,
+         update: {
+           sessionUpdate: "agent_thought_chunk",
+           content: { type: "text", text: (event as any).text },
+         } as any,
+       });
+     } else if (event.type === "text_delta" && event.text) {
+       // In --verbose mode Claude CLI emits BOTH streaming content_block_delta
+       // text AND the final assistant message block's full text. To avoid
+       // double-counting assistant content in the context estimate, we count
+       // only the final-block text (fromAssistantBlock) and ignore the
+       // streaming deltas.
+       if (event.fromAssistantBlock) {
+         ctxEstimator.addText(event.text);
+       } else {
+         // Mark that this message streamed its text via per-token deltas.
+         streamedTextThisMessage = true;
+       }
+       // Emit the chunk to the UI — EXCEPT for the final-block text when the
+       // same message was already streamed token-by-token. The final block's
+       // full text would land ~1ms before the tool_use in the same content
+       // array (claude-runner.ts emits them back-to-back), beating vscode-acp's
+       // 80ms streaming render and leaving an empty bubble at every
+       // text→tool transition. The per-token deltas already delivered this
+       // text; re-emitting it also duplicates it in currentAssistantText.
+       // When there were NO streaming deltas (text only in the final block,
+       // e.g. non-verbose or a non-streaming model), emit it as the sole
+       // source of the text. The final-block text consumes and clears the
+       // flag so it applies per message.
+       const dropAsDuplicate = event.fromAssistantBlock && streamedTextThisMessage;
+       if (event.fromAssistantBlock) streamedTextThisMessage = false;
+       if (!dropAsDuplicate) {
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "agent_message_chunk",
+             content: { type: "text", text: event.text },
+             // Group all chunks of this assistant API call into one logical
+             // message so the client renders one bubble (not one per delta).
+             messageId: currentMessageId ?? undefined,
+           },
+         });
+       }
+     } else if (event.type === "tool_use" && event.toolName) {
+       ctxEstimator.addToolCall(event.toolName, event.toolInput);
+       const toolCallId = nextToolCallId();
+       logger.debug(`Tool call: ${event.toolName}`);
+       // TaskCreate/TaskUpdate/TaskList maintain a todo list — mirror it
+       // into an ACP `plan` update so the chat UI shows a plan bar with
+       // the current task count (like codex-acp's update_plan). The plan
+       // is a full snapshot, so the count reflects the live list size
+       // rather than a running total of updates.
+       handleTaskTool(sessionId, event.toolName, event.toolInput);
+       // Claude Code owns a native ExitPlanMode tool: the model calls it once
+       // the plan is ready and expects the host to leave Plan mode. Without
+       // mapping it the session stayed in Plan forever — the picker still read
+       // "Plan", the injected <collaboration_mode> block kept telling the model
+       // that an execution request is a request to PLAN the execution, and a
+       // follow-up "implement it" came back as code in the chat instead of
+       // edits. Clear the flag and tell the client so the picker follows.
+       if (event.toolName === "ExitPlanMode") {
+         void leavePlanMode(sessionId, connection, store, runner);
+       }
+       // The symmetric enter path: the model calls EnterPlanMode when it decides
+       // a task needs planning before acting. Map it so the picker flips to
+       // "Plan" live (current_mode_update) and the next prompt injects the
+       // read-only <collaboration_mode> Plan block. Without this the picker
+       // only showed "Plan" on a user-initiated switch, so a self-entered plan
+       // was invisible until the user manually flipped the mode.
+       if (event.toolName === "EnterPlanMode") {
+         void enterPlanMode(sessionId, connection, store, runner);
+       }
+       // Build a descriptive title + kind + (for edits) diff content +
+       // locations, mirroring codex-acp, so the chat UI shows the action
+       // verb and a click-to-open diff instead of a bare filename.
+       const isSubagent =
+         event.toolName === "Task" || event.toolName === "Agent";
+       const update = buildToolCallUpdate(
+         toolCallId,
+         event.toolName,
+         event.toolInput,
+         store.getCwd(sessionId),
+       );
+       // Emit every tool as in_progress at its tool_use so the chat UI shows
+       // a running phase (command text + spinner) while the tool executes.
+       // The tool flips to "completed" when its tool_result lands — subagents
+       // via the <task-notification> path below, normal tools via the
+       // tool_result path in the user-event handler. buildToolCallUpdate's
+       // status:"completed" default is overridden here and only resolved on
+       // completion; the post-turn flush is the safety net for tools whose
+       // result never arrived before end_turn.
+       const emitted = { ...update, status: "in_progress" as const };
+       if (isSubagent && event.toolUseId) {
+         const subInput = (event.toolInput ?? {}) as Record<string, unknown>;
+         const subDesc =
+           typeof subInput.description === "string"
+             ? subInput.description
+             : typeof subInput.prompt === "string"
+               ? subInput.prompt
+               : typeof subInput.subagent_type === "string"
+                 ? subInput.subagent_type
+                 : "";
+         let pending = sessionPendingAgents.get(sessionId);
+         if (!pending) {
+           pending = new Map();
+           sessionPendingAgents.set(sessionId, pending);
+         }
+         pending.set(event.toolUseId, {
+           acpCallId: toolCallId,
+           description: subDesc,
+         });
+       } else if (event.toolUseId) {
+         // Non-subagent tool: register so the tool_result user-event can flip
+         // it to completed. Subagents are excluded (their completion comes
+         // through <task-notification>, not the tool_result id match).
+         let pendingTools = sessionPendingTools.get(sessionId);
+         if (!pendingTools) {
+           pendingTools = new Map();
+           sessionPendingTools.set(sessionId, pendingTools);
+         }
+         pendingTools.set(event.toolUseId, toolCallId);
+         // Server-side / network-blocked web tool watchdog. WebSearch
+         // executes on Anthropic's API, so on a proxy route (non-anthropic
+         // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes it
+         // and the tool hangs with no tool_result ever arriving. WebFetch is
+         // fetched client-side by the CLI — normally fine through a proxy —
+         // but on a host whose network blocks it the fetch stalls, so the
+         // operator names it in CLAUDE_ACP_DISALLOWED_WEB_TOOLS and it gets
+         // the same treatment. The CLI is told not to advertise them
+         // (claude-runner buildExtraArgs), but the adapter must never depend
+         // on that alone: flip the row to failed after a bounded wait so the
+         // user sees a named cause instead of a frozen spinner. Cancel is
+         // handled centrally at the prompt return (the cancelled flag +
+         // "Turn ended with N tool(s) still pending" flush), so the timer
+         // only needs to skip when the tool completes normally — hence the
+         // per-session map plus a clear when the turn settles.
+         if (
+           watchedWebTools().has(event.toolName ?? "") &&
+           isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL) &&
+           !/^claude/i.test(resolveSessionModel(store, sessionId, runModel))
+         ) {
+           const tuId = event.toolUseId;
+           const timer = setTimeout(() => {
+             webToolWatchdogs.get(sessionId)?.delete(timer);
+             const pend = sessionPendingTools.get(sessionId);
+             if (!pend?.has(tuId)) return; // completed / flushed already
+             pend.delete(tuId);
+             if (pend.size === 0) sessionPendingTools.delete(sessionId);
+             logger.info(
+               `Web tool ${event.toolName} (${tuId}) timed out after ${WEB_TOOL_TIMEOUT_MS}ms ` +
+                 `on a proxy route — no server-side backend executed it.`,
+             );
+             connection
+               .sessionUpdate({
+                 sessionId,
+                 update: {
+                   sessionUpdate: "tool_call_update",
+                   toolCallId,
+                   status: "failed",
+                   _meta: {
+                     claudeCode: {
+                       error:
+                         "Web tools are executed by the Anthropic API and are not available on this proxy route.",
+                     },
+                   },
+                 } as any,
+               })
+               .catch(() => {});
+           }, WEB_TOOL_TIMEOUT_MS);
+           let timers = webToolWatchdogs.get(sessionId);
+           if (!timers) {
+             timers = new Set();
+             webToolWatchdogs.set(sessionId, timers);
+           }
+           timers.add(timer);
+         }
+       }
+       connection.sessionUpdate({
+         sessionId,
+         update: emitted,
+       });
+     } else if (event.type === "tool_progress" && event.toolUseId) {
+       // Claude CLI's periodic heartbeat while a tool runs. A long-running
+       // tool (a Bash poll with sleep/ssh loops) emits nothing else for
+       // minutes — no deltas, no tool_result — so without forwarding these
+       // heartbeats the chat UI shows a frozen in_progress tool that looks
+       // exactly like a hung session (the "session hangs, Stop fixes it"
+       // symptom). Refresh the existing tool_call with the elapsed time so
+       // the row visibly ticks. Sidechain (subagent) heartbeats are skipped
+       // — subagent tools are tracked via sessionPendingAgents, and their
+       // tool_use_ids are not in this session's pending-tools map.
+       if (!event.toolSidechain) {
+         const pendingTools = sessionPendingTools.get(sessionId);
+         const acpCallId = pendingTools?.get(event.toolUseId);
+         if (acpCallId) {
+           connection
+             .sessionUpdate({
+               sessionId,
+               update: {
+                 sessionUpdate: "tool_call_update",
+                 toolCallId: acpCallId,
+                 status: "in_progress",
+                 _meta: {
+                   claudeCode: {
+                     toolProgress: {
+                       elapsedSeconds: event.toolElapsedSeconds,
+                     },
+                   },
+                 },
+               } as any,
+             })
+             .catch(() => {});
+         }
+       }
+     } else if (event.type === "permission_request" && event.toolName) {
+       ctxEstimator.addToolCall(event.toolName, event.toolInput);
+       const toolCallId = nextToolCallId();
+       const toolName = event.toolName;
+       const toolInput = event.toolInput ?? {};
+       logger.info(`Permission request: ${toolName}`);
+
+        // Build the descriptive title + kind + diff content once, then reuse
+        // across the pending → completed/failed lifecycle.
+        const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput, store.getCwd(sessionId));
+
+        // Send pending tool_call status
+        connection.sessionUpdate({
+          sessionId,
+          update: { ...baseUpdate, status: "pending" },
+        });
+
+        // Request permission from client (track promise for awaiting)
+        const permPromise = connection
+          .requestPermission({
+            sessionId,
+            toolCall: {
+              toolCallId,
+              title: baseUpdate.title,
+              kind: baseUpdate.kind as any,
+              status: "pending",
+              rawInput: toolInput,
+            },
+            options: [
+              { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
+              { optionId: "allow_always", kind: "allow_always", name: "Allow always" },
+              { optionId: "reject_once", kind: "reject_once", name: "Reject once" },
+              { optionId: "reject_always", kind: "reject_always", name: "Reject always" },
+            ],
+          })
+          .then((response) => {
+            const outcome = response.outcome as any;
+            const isSelected =
+              outcome.outcome === "selected" || outcome.type === "selected";
+            const optionId = outcome.optionId;
+            const isApproved =
+              isSelected &&
+              (optionId === "allow_once" ||
+                optionId === "allow_always");
+
+            connection.sessionUpdate({
+              sessionId,
+              update: {
+                ...baseUpdate,
+                // Flip the existing pending row via tool_call_update so the
+                // client updates the row in place instead of adding a second
+                // completed row and leaving the pending one spinning.
+                sessionUpdate: "tool_call_update",
+                status: isApproved ? "completed" : "failed",
+              },
+            });
+          })
+          .catch((err) => {
+            logger.error(
+              `Permission request failed: ${err instanceof Error ? err.message : String(err)}`
+            );
+            connection.sessionUpdate({
+              sessionId,
+              update: {
+                ...baseUpdate,
+                sessionUpdate: "tool_call_update",
+                status: "failed",
+              },
+            });
+          });
+
+        permissionPromises.push(permPromise);
+      }
+    };
+
+/**
+ * Deliver every queued steer message as a follow-up `--resume` prompt.
+ *
+ * Claude CLI cannot inject mid-turn, so steers are queued (handleSteer) and
+ * delivered here. Called at THREE points so delivery order always matches
+ * the order the user typed in:
+ *  1. BEFORE the main turn — a steer that landed in the drain tail of the
+ *     previous turn (after that drain took the queue but before the prompt
+ *     lock cleared) must go out before the newer prompt, not after it.
+ *  2. AFTER the main turn — the normal case.
+ *  3. AFTER compaction — /compact and auto-compact each run extra LLM calls,
+ *     and anything steered during them would otherwise sit in the queue
+ *     until the next user prompt.
+ *
+ * The queue is drained IN PLACE (shift from the live array) instead of being
+ * copied out and deleted. That way a steer arriving mid-drain is picked up by
+ * the same pass, and an early exit leaves the undelivered remainder queued
+ * rather than silently dropping it.
+ */
+const drainSteerQueue = async (): Promise<void> => {
+  const queue = steerQueues.get(sessionId);
+  if (!queue || queue.length === 0) return;
+  // Re-entrancy guard: draining awaits LLM turns, so a nested call (e.g. the
+  // post-compaction drain starting while the post-turn drain is still
+  // awaiting) would interleave two consumers over one queue.
+  if (steerDraining.has(sessionId)) return;
+  steerDraining.add(sessionId);
+  let deliveredAny = false;
+  try {
+    while (queue.length > 0) {
+      const steerText = queue.shift()!;
+      // Cancellation discards the rest — the user asked to stop.
+      if (cancelledSessions.has(sessionId)) {
+        queue.length = 0;
+        break;
+      }
+      const claudeSid = store.getClaudeSessionId(sessionId);
+      // No Claude session to resume into (e.g. straight after /clear). Put it
+      // back so a later drain delivers it once a session exists again.
+      if (!claudeSid) {
+        queue.unshift(steerText);
+        break;
+      }
+      deliveredAny = true;
+      // Echo now that this message is actually going to the model, so the client's
+      // release signal means delivered rather than received.
+      await connection
+        .sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: steerText } } as any,
+        })
+        .catch(() => { /* non-fatal */ });
+     // NOTE: the tool-call counter is deliberately NOT reset here. Restarting
+     // it mid-turn on a steer drain made the steered work reuse the ids of the
+     // tools that ran before it, so the client updated the wrong rows.
+     permissionPromises.length = 0;
+     logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
+
+        // If the steered text is a slash command, dispatch it through the
+        // SAME handler prompt() uses (dispatchSlashCommand) so the two entry
+        // points behave identically. Previously this was a hand-rewritten
+        // copy that silently dropped several cases (/goal with empty/over-
+        // length arg, /goal pause|resume with no goal, and /ps|/status|
+        // /skills fell through to raw text).
+        const steerDispatch = await dispatchSlashCommand(sessionId, connection, runner, store, steerText);
+        if (steerDispatch.handled) {
+          logger.info(`Steer drain: handled slash command for session ${sessionId}`);
+          if (steerDispatch.startTurn) {
+            // /goal <objective> — start an LLM turn pursuing it.
+            try {
+              ctxEstimator.addText(steerDispatch.startTurn);
+              await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, runModel, runEffort);
+              await Promise.all(permissionPromises);
+            } catch (goalErr) {
+              logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
+            }
+          }
+          // /clear wipes the Claude session ID, so there is nothing to resume
+          // into — stop this pass. Anything still queued stays queued (the
+          // drain is non-destructive), and the `!claudeSid` guard puts it back
+          // until a later drain runs against the fresh session.
+          if (parseSlashCommand(steerText)?.name === "clear") break;
+          continue;
+        }
+
+      try {
+        // Steer-drain guard: a steered message is a FOLLOW-UP user
+        // instruction delivered after the previous turn completed — Claude
+        // CLI can't inject mid-turn, so we resume the session here. To stop
+        // the model from misreading the prior turn's (possibly subagent-
+        // produced) output as an interruption it must diagnose, frame the
+        // steer as a fresh instruction. Also, if a subagent is somehow still
+        // marked in_progress (result fired before its tool_result), defer
+        // the drain rather than yanking the session into a new context.
+        const stillPending = sessionPendingAgents.get(sessionId);
+        if (stillPending && stillPending.size > 0) {
+          logger.info(
+            `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
+          );
+          // Put it back at the front so it drains once the subagent resolves.
+          queue.unshift(steerText);
+          break;
+        }
+
+        // Prepend goal to steer messages too
+        const basePrompt = activeGoal && !activeGoal.paused
+          ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
+          : steerText;
+        // Frame as a follow-up so the model treats this as a new user
+        // instruction rather than a description of interrupted state.
+        const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
+        ctxEstimator.addText(steerPrompt);
+        await runner.continueSessionStreaming(
+            claudeSid,
+            steerPrompt,
+            onEvent,
+            sessionId,
+             runModel,
+              runEffort
+            );
+            await Promise.all(permissionPromises);
+          } catch (steerErr) {
+            logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
+          }
+    }
+  } finally {
+    steerDraining.delete(sessionId);
+  }
+  if (deliveredAny) {
+    store.touch(sessionId);
+    await connection.sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        updatedAt: store.getUpdatedAt(sessionId),
+      } as any,
+    }).catch(() => {});
+  }
+};
+
+    try {
+      // Deliver anything still queued from the PREVIOUS turn before starting
+      // this one. A steer can land in the previous turn's drain tail — after
+      // its drain emptied the queue but before the prompt lock cleared —
+      // and handleSteer accepts it because a prompt is still in flight. Left
+      // to the post-turn drain it would arrive AFTER this newer prompt, i.e.
+      // out of the order the user typed.
+      await drainSteerQueue();
+      // Re-read the Claude session id: the drain above can dispatch slash
+      // commands, and /clear wipes it. The id captured before the drain would
+      // then resume a conversation the user just cleared.
+      const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
+      let result;
+      if (!skipMainTurn) {
+      // ─── Pre-turn compaction guard ────────────────────────────────
+      // The post-turn auto-compact check (below, after "Prompt completed")
+      // runs against `sessionLastUsage` — the REAL prompt count from the
+      // previous turn's last API call. By the time THIS turn forwards its
+      // prompt to the CLI, that figure is stale: the new user prompt (added
+      // to ctxEstimator at addText(effectivePrompt) above) has grown the
+      // request by the new prompt's token contribution. The between-turn
+      // check can't see that growth, so a turn that measured 174,239 (under
+      // the 176,947 threshold) arrives at vLLM as 176,609 input + 20,000
+      // maxOutput = 196,609 > 196,608 → HTTP 500 context overflow.
+      //
+      // This guard mirrors the Claude Code CLI's pre-send `isAtBlockingLimit`
+      // check (query.ts): project the about-to-be-sent prompt size using the
+      // estimator's pending-inclusive count, and if it would cross the
+      // threshold, compact BEFORE forwarding. getEstimatedTokensWithPending
+      // adds the new prompt's char-estimated tokens to the last real count,
+      // closing the measurement gap so the 90% threshold actually means 90%.
+      if (isAutoCompactEnabled() && claudeSessionIdAfterDrain) {
+        const projectedInput = ctxEstimator.getEstimatedTokensWithPending();
+        const preTurnThreshold = getAutoCompactThreshold(runModelResolved);
+        if (projectedInput >= preTurnThreshold) {
+          logger.info(
+            `Pre-turn compact for session ${sessionId}: projected ${projectedInput} >= ${preTurnThreshold} ` +
+              `(lastReal=${ctxEstimator.getEstimatedTokens()}, pendingChars added ${ctxEstimator.getPendingChars()} chars, ` +
+              `effectiveWindow=${getEffectiveContextWindowSize(runModelResolved)}, contextWindow=${getContextWindowForModel(runModelResolved)})`,
+          );
+          await doCompact(
+            sessionId,
+            connection,
+            runner,
+            store,
+            runModel,
+            runEffort,
+            false,
+          );
+          // doCompact reset the estimator (conversation replaced by a short
+          // summary). Re-add this turn's prompt so the estimator reflects
+          // the post-compact conversation + the new prompt before the turn.
+          ctxEstimator.addText(effectivePrompt);
+          // Re-read the claude session id: doCompact starts a fresh session.
+          // The variable captured below must point at the compacted session,
+          // not the pre-compact one (which the summary replaced).
+        }
+      }
+      // doCompact above may have replaced the claude session id; re-read so
+      // the resume below targets the compacted conversation when compaction
+      // ran, and the original when it didn't.
+      const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
+      const turnContent: import("./claude-runner.js").StdinContentBlock[] = promptImages.length > 0
+        ? [{ type: "text", text: effectivePrompt }, ...promptImages]
+        : [];
+      if (claudeSessionIdForTurn) {
+        try {
+          result = promptImages.length > 0
+            ? await runner.continueSessionStreamingWithContent(
+                claudeSessionIdForTurn,
+                turnContent,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort
+              )
+            : await runner.continueSessionStreaming(
+                claudeSessionIdForTurn,
+                effectivePrompt,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort
+              );
+        } catch (resumeErr) {
+          const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+          // A dead upstream must NOT cost the conversation. Starting fresh
+          // here clears the persisted Claude session id, and nothing in the UI
+          // can put it back — the user resumes, says "go on", and the agent
+          // has no prior context while the transcript is still on disk.
+          // Only a failure that actually implicates the session id may fall
+          // back; anything transient is surfaced so a retry can resume.
+          if (isTransientTurnFailure(resumeMsg, turnErrored)) {
+            logger.warn(
+              `Resume failed for ${claudeSessionIdForTurn} with a transient failure — ` +
+                `keeping the session id so a retry can resume: ${resumeMsg}`,
+            );
+            throw resumeErr;
+          }
+          // Resume failed (expired session, etc.) — fall back to new session
+          logger.warn(
+            `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeMsg}`
+          );
+          store.clearPersistedSession(cwd);
+          result = promptImages.length > 0
+            ? await runner.startSessionStreamingWithContent(
+                cwd,
+                turnContent,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort
+              )
+            : await runner.startSessionStreaming(
+                cwd,
+                effectivePrompt,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort
+              );
+          store.setClaudeSessionId(sessionId, result.sessionId);
+        }
+      } else {
+        const mcpServers = store.getMcpServers(sessionId);
+        if (promptImages.length > 0) {
+          result = await runner.startSessionStreamingWithContent(
+            cwd,
+            turnContent,
+            onEvent,
+            sessionId,
+            runModel,
+            runEffort
+          );
+        } else if (mcpServers.length > 0) {
+          result = await runner.startSessionWithMcp(
+            cwd,
+            bodyText,
+            mcpServers,
+            onEvent,
+            sessionId
+          );
+        } else {
+          result = await runner.startSessionStreaming(
+            cwd,
+            effectivePrompt,
+            onEvent,
+            sessionId,
+            runModel,
+            runEffort
+          );
+        }
+        // Only persist the Claude session id if the CLI actually emitted one.
+        // On an early cancel (user hit "Send Now" before the CLI's init event
+        // arrived) result.sessionId can be empty — storing "" would overwrite
+        // nothing useful now, but guarding keeps the invariant that a stored
+        // id is always a real one.
+        if (result.sessionId) {
+          store.setClaudeSessionId(sessionId, result.sessionId);
+        }
+      }
+      }
+
+      // Wait for all pending permission requests to resolve
+      await Promise.all(permissionPromises);
+
+      // Bounded wait for pending subagents: the CLI ended the turn before all
+      // subagent <task-notification> messages arrived. Real Claude awaits
+      // subagents before ending the turn; GLM/EricAI does not. Wait up to
+      // `pendingAgentWaitMs` (default 15s) for the remaining notifications —
+      // they often arrive within 1‑5s of the turn end. Only fall back to
+      // marking completed if the wait times out.
+      {
+        const pendingAgentsTmp = sessionPendingAgents.get(sessionId);
+        if (pendingAgentsTmp && pendingAgentsTmp.size > 0) {
+          const waitDeadline = Date.now() + pendingAgentWaitMs;
+          while (Date.now() < waitDeadline) {
+            const stillPending = sessionPendingAgents.get(sessionId);
+            if (!stillPending || stillPending.size === 0) break;
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+      }
+
+      // Post-turn subagent flush. Subagents whose <task-notification>
+      // arrived mid-turn were already flipped to "completed" and removed
+      // from sessionPendingAgents by the user-event handler above. Anything
+      // STILL pending here means the CLI ended the turn (end_turn) before
+      // the subagent's result was injected back into the conversation —
+      // i.e. a premature end_turn (observed with GLM/EricAI; real Claude
+      // awaits subagents before ending the turn). Mark this "completed" as
+      // a fallback so the UI spinner doesn't hang forever, and log the
+      // anomaly so the lost result is visible: the main agent lacks the
+      // subagent's output and may need a follow-up ("go on") to retrieve it
+      // — at which point the <task-notification> lands and is matched there.
+      const pendingAgents = sessionPendingAgents.get(sessionId);
+      if (pendingAgents && pendingAgents.size > 0) {
+        const pendingCount = pendingAgents.size;
+        logger.info(
+          `Turn ended with ${pendingCount} subagent(s) still pending ` +
+            `(no <task-notification> before end_turn) for session ${sessionId} ` +
+            `— marking completed as fallback; result was likely lost.`,
+        );
+        for (const info of pendingAgents.values()) {
+          connection
+            .sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: info.acpCallId,
+                status: "completed",
+              } as any,
+            })
+            .catch(() => {});
+        }
+        pendingAgents.clear();
+        sessionPendingAgents.delete(sessionId);
+
+        // ── Auto follow-up for late subagent results ────────────────────
+        // The turn ended before the subagent(s) reported back. The Claude
+        // CLI only injects a finished subagent's <task-notification> into
+        // the NEXT turn, so enqueue a synthetic steer that starts one — the
+        // main agent then sees the pending results and can incorporate them,
+        // instead of the results being silently lost until the user types
+        // "go on". Bounded by AUTO_FOLLOW_UP_CAP so an auto-follow-up turn
+        // that itself spawns subagents cannot cascade forever.
+        const count = autoFollowUpCount.get(sessionId) ?? 0;
+        if (count < AUTO_FOLLOW_UP_CAP) {
+          autoFollowUpCount.set(sessionId, count + 1);
+          const followUpText =
+            `[Auto] ${pendingCount} background subagent(s) finished after the turn ended. ` +
+            `Please incorporate their results (the <task-notification> blocks) and continue.`;
+
+          // Deliver the synthetic follow-up as its OWN turn, NOT via
+          // drainSteerQueue() on the shared queue. drainSteerQueue() drains
+          // the ENTIRE steer queue — and a user steer typed mid-turn (e.g.
+          // "deploy a2a" while the subagent was still pending) sits in that
+          // same queue, accepted by handleSteer because a prompt was still in
+          // flight. Consuming it here would fold the user's instruction into
+          // the synthetic "[Auto] incorporate results" turn, so the model
+          // answers the follow-up's framing first and the user's steer gets
+          // deprioritized / batched rather than running as its own clean turn.
+          //
+          // Instead: deliver ONLY followUpText directly (resume the session,
+          // the same as drainSteerQueue's non-slash path but scoped to one
+          // message). Any user steers already in the queue are left in place;
+          // the post-turn drain (below, at the end of executePrompt) delivers
+          // them as their own turns.
+          const claudeSidForFollowUp = store.getClaudeSessionId(sessionId);
+          if (claudeSidForFollowUp) {
+            // Echo the synthetic turn as a user chunk so the client shows it.
+            await connection
+              .sessionUpdate({
+                sessionId,
+                update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpText } } as any,
+              })
+              .catch(() => { /* non-fatal */ });
+            logger.info(
+              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} delivering as its own turn ` +
+                `for session ${sessionId} (user steers left for the post-turn drain).`,
+            );
+            permissionPromises.length = 0;
+            try {
+              ctxEstimator.addText(followUpText);
+              await runner.continueSessionStreaming(
+                claudeSidForFollowUp,
+                followUpText,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort,
+              );
+              await Promise.all(permissionPromises);
+            } catch (followUpErr) {
+              logger.error(
+                `Auto follow-up turn failed for session ${sessionId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
+              );
+            }
+          } else {
+            // No Claude session to resume into (e.g. straight after /clear).
+            // Queue it so a later drain delivers it once a session exists.
+            if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
+            steerQueues.get(sessionId)!.push(followUpText);
+            logger.info(
+              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued (no active session yet) for session ${sessionId}.`,
+            );
+          }
+        } else {
+          logger.info(
+            `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
+          );
+        }
+      }
+
+      // Post-turn normal-tool flush. Tools whose tool_result never arrived
+      // before end_turn (e.g. a tool_use emitted in the final assistant
+      // message with no following user/tool_result) would otherwise hang in
+      // in_progress forever. Mark them completed as a fallback.
+      // The turn has settled — its web-tool watchdogs can no longer fire
+      // meaningfully (the pending-tools map is about to be flushed), so
+      // clear them to keep no timer alive past the turn.
+      for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
+      webToolWatchdogs.delete(sessionId);
+      const pendingTools = sessionPendingTools.get(sessionId);
+      if (pendingTools && pendingTools.size > 0) {
+        logger.info(
+          `Turn ended with ${pendingTools.size} tool(s) still pending ` +
+            `(no tool_result before end_turn) for session ${sessionId} ` +
+            `— marking completed as fallback.`,
+        );
+        for (const acpCallId of pendingTools.values()) {
+          connection
+            .sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId: acpCallId,
+                status: "completed",
+              } as any,
+            })
+            .catch(() => {});
+        }
+        pendingTools.clear();
+        sessionPendingTools.delete(sessionId);
+      }
+
+      // Check if this session was cancelled while running
+      if (cancelledSessions.has(sessionId)) {
+        cancelledSessions.delete(sessionId);
+        logger.info(`Prompt cancelled for session ${sessionId}`);
+        return { stopReason: "cancelled" };
+      }
+
+      // Send session_info_update with updatedAt
+      store.touch(sessionId);
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "session_info_update",
+          updatedAt: store.getUpdatedAt(sessionId),
+        } as any,
+      });
+
+     logger.info(`Prompt completed for session ${sessionId}`);
+
+      // Drain any steers queued during this turn (see drainSteerQueue).
+      await drainSteerQueue();
+
+      // ─── Auto-compact check ───────────────────────────────────────────
+      // Uses the same threshold Claude Code CLI computes (context window,
+      // output-token reserve, 13k buffer and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE),
+      // and honors the CLI's DISABLE_AUTO_COMPACT / DISABLE_COMPACT switches,
+      // so enabling or tuning compaction in one place affects both layers.
+      const lastUsageEntry = sessionLastUsage.get(sessionId);
+      if (lastUsageEntry && isAutoCompactEnabled()) {
+        const threshold = getAutoCompactThreshold(runModelResolved);
+        const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
+        if (used >= threshold) {
+          logger.info(
+            `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (effectiveWindow=${getEffectiveContextWindowSize(runModelResolved)}, contextWindow=${getContextWindowForModel(runModelResolved)})`,
+          );
+          // The compaction notice is emitted by doCompact as a dedicated
+          // `_meta.contextCompaction` lifecycle, not as assistant text. An
+          // agent_message_chunk here would be appended to the reply that just
+          // streamed (vscode-acp only treats compaction text as standalone
+          // when nothing is mid-stream), which is exactly the concatenated,
+          // never-dismissed notice this replaces.
+         // skipCompleted=true: emit "start" now, but defer "completed" until
+         // AFTER the continuation finishes. This keeps the client's
+         // isCompacting=true and "Compacting..." spinner visible while the
+         // continuation streams, so the 400ms flush timer doesn't race with
+         // continuation events and the history wipe happens at the right time.
+         const compactResult = await doCompact(
+           sessionId,
+           connection,
+           runner,
+           store,
+           runModel,
+           runEffort,
+           false, // no "No conversation to compact yet." text for auto-compact
+           true,  // skipCompleted — emit "completed" after continuation
+         ) as { compactionId: string; summary: string } | false;
+         // try/finally: the continuation below can throw (Claude CLI error, aborted
+         // turn). The deferred "completed" used to sit after it, so a throw left the
+         // lifecycle stuck at "start" and the client kept a "Compacting
+         // conversation..." banner for the rest of the session.
+         try {
+           // After compaction, re-send the original user prompt so the LLM
+           // continues the task in the fresh (compacted) session. This matches
+           // Codex behavior where compaction is transparent to the user — the
+           // task continues automatically after context is compressed.
+           logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
+           const claudeSid = store.getClaudeSessionId(sessionId);
+           if (claudeSid) {
+             // Frame the continuation prompt so the model knows it is resuming
+             // after a context compaction. Without this framing, the fresh
+             // session (which only has the summary) can hallucinate tool
+             // results as text ("ReadResult(file_path=...placeholder)...")
+             // because it lost the conversation context and tries to simulate
+             // prior tool calls it doesn't actually have results for. Preserve
+             // accompanying images (if any) when re-sending the prompt.
+             const continueFraming = `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
+             const continueContent = [
+               { type: "text" as const, text: continueFraming },
+               ...(promptImages.length > 0 ? promptImages : []),
+             ];
+             const continueResult = promptImages.length > 0
+               ? await runner.continueSessionStreamingWithContent(
+                   claudeSid,
+                   continueContent,
+                   onEvent,
+                   sessionId,
+                   runModel,
+                   runEffort,
+                 )
+               : await runner.continueSessionStreaming(
+                   claudeSid,
+                   continueFraming,
+                   onEvent,
+                   sessionId,
+                   runModel,
+                   runEffort,
+                 );
+             store.setClaudeSessionId(sessionId, continueResult.sessionId);
+             await Promise.all(permissionPromises);
+             // Update usage after continuation
+             const contEstimate = ctxEstimator.getEstimatedTokens();
+             const contContextWindow = getContextWindowForModel(runModelResolved);
+             sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
+             await connection.sessionUpdate({
+               sessionId,
+               update: {
+                 sessionUpdate: "usage_update",
+                 used: Math.min(contEstimate, contContextWindow),
+                 size: contContextWindow,
+               } as any,
+             }).catch(() => {});
+           }
+         } finally {
+           // Emit "completed" now the continuation is over — successfully or
+           // not. On success the client can safely flush (wipe old history,
+           // show the compact notice, drain buffered continuation chunks into
+           // the fresh panel); on failure it at least stops showing
+           // "Compacting conversation..." forever.
+           if (compactResult && typeof compactResult === 'object') {
+             await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
+           }
+         }
+       }
+      }
+
+      // Compaction (manual /compact via dispatchSlashCommand above, or the
+      // auto-compact just run) performs its own LLM calls, during which a
+      // prompt is still in flight — so handleSteer keeps accepting steers.
+      // Drain them now instead of leaving them queued until the next user
+      // prompt. This mirrors the vscode-acp client, which holds its own
+      // message queue while `isCompacting` and drains it once compaction
+      // finishes. No-op when nothing was queued.
+      await drainSteerQueue();
+
+      // If Claude CLI reported an error result (e.g. error_max_turns — the
+      // model hit the turn ceiling mid-task), surface it to the user as an
+      // agent message instead of a silent end_turn. This is what makes a
+      // genuinely premature stop distinguishable from a normal one; codex-acp
+      // does the same by mapping upstream failures to a visible error.
+      if (turnErrored) {
+        const reason = turnStopReason ?? "error";
+        await connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: {
+              type: "text",
+              text:
+                reason === "error_max_turns"
+                  ? `Reached the maximum number of turns (${reason}) before finishing. The task may be incomplete — continue to resume.`
+                  : `Turn ended with status: ${reason}.`,
+            },
+            messageId: nextCommandMessageId(),
+            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+            // Without this marker a client cannot tell command output from the
+            // assistant's own text, so vscode-acp's compact mode folded it into the
+            // running turn's collapsed block instead of showing it beside the command.
+            _meta: { commandOutput: true },
+          },
+       }).catch(() => {});
+     }
+    // Account token usage and elapsed time toward the active goal.
+    const _activeGoal = sessionGoals.get(sessionId);
+    if (_activeGoal && !_activeGoal.paused) {
+      const _lu = lastUsage as any;
+      const _turnTokens = _lu
+        ? (_lu.input_tokens ?? 0) + (_lu.output_tokens ?? 0)
+        : 0;
+      const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
+      _activeGoal.tokensUsed += _turnTokens;
+      _activeGoal.timeUsedSeconds += _turnElapsed;
+      await publishGoalSnapshot(sessionId, connection);
+    }
+    saveSessionSlot(sessionId);
+    return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
+  } catch (err) {
+    // The turn is unwinding (cancel or failure) — no watchdog may fire
+    // against tools the post-turn flush is about to settle.
+    for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
+    webToolWatchdogs.delete(sessionId);
+    // Check if cancelled
+    if (cancelledSessions.has(sessionId)) {
+      cancelledSessions.delete(sessionId);
+      logger.info(`Prompt cancelled for session ${sessionId}`);
+      // Account partial turn usage toward goal budget.
+      const _cancelledGoal = sessionGoals.get(sessionId);
+      const _clu = lastUsage as any;
+      if (_cancelledGoal && !_cancelledGoal.paused && _clu) {
+        const _turnTokens = (_clu.input_tokens ?? 0) + (_clu.output_tokens ?? 0);
+        const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
+        _cancelledGoal.tokensUsed += _turnTokens;
+        _cancelledGoal.timeUsedSeconds += _turnElapsed;
+        void publishGoalSnapshot(sessionId, connection).catch(() => {});
+      }
+      // A cancelled turn still leaves the full prompt prefix in the slot's
+      // KV — persisting it lets the next resume skip the cold prefill even
+      // though this turn never completed.
+      saveSessionSlot(sessionId);
+      return { stopReason: "cancelled" };
+    }
+
+      const message =
+        err instanceof Error ? err.message : String(err);
+      logger.error(`Prompt failed for session ${sessionId}: ${message}`);
+
+      // Send error as agent message so client sees it
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `Error: ${message}`,
+          },
+          messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          // Without this marker a client cannot tell command output from the
+          // assistant's own text, so vscode-acp's compact mode folded it into the
+          // running turn's collapsed block instead of showing it beside the command.
+          _meta: { commandOutput: true },
+        },
+      });
+
+      return { stopReason: "end_turn" };
+    }
+  };
   return {
     async initialize(
       _params: InitializeRequest
@@ -3042,10 +4530,6 @@ export function createClaudeCodeAgent(
       logger.info(
         `Session created: ${sessionId} (cwd: ${resolvedCwd}, mcpServers: ${mcpServers.length})`
       );
-
-      // Discover available models from the proxy so the picker shows
-      // newly-added models without requiring settings.json updates.
-      await discoverProxyModels();
 
       // Send available_commands_update notification so vscode-acp picks up
       // the slash commands. vscode-acp's SessionManager ignores the
@@ -3509,25 +4993,64 @@ export function createClaudeCodeAgent(
               ? DEFAULT_MODE
               : (store.getMode(sessionId) ?? DEFAULT_MODE);
         // Capture the previous collaboration mode BEFORE applyModeChange overwrites
-        // it, so the mid-turn announcement (drained by the running turn) only
-        // fires on a genuine flip.
+        // it, so the mid-turn announcement only fires on a genuine flip.
         const previousCollabMode = sessionCollaborationModes.get(sessionId);
         await applyModeChange(sessionId, connection, store, runner, targetMode);
-        // The <collaboration_mode> block is built when the prompt starts, so a
-        // switch made DURING a turn was invisible to it: the model kept planning
-        // and the user had to open a new turn to say "you are not in plan mode
-        // now". Announce it on the steer queue, which the running turn drains.
-        if (
-          shouldAnnounceModeChange(previousCollabMode, nextCollab) &&
-          (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))
-        ) {
-          if (!steerQueues.has(sessionId)) {
-            steerQueues.set(sessionId, []);
-          }
-          steerQueues
-            .get(sessionId)!
-            .push(buildMidTurnModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE));
-          logger.info(`Session ${sessionId} mode change announced to the running turn`);
+        // The <collaboration_mode> block is built once, at the START of each
+        // turn, from sessionCollaborationModes. A flip made DURING a turn is
+        // therefore invisible to the running turn: the model keeps acting under
+        // the OLD block already in the transcript, and a bare user-level
+        // "you're in Default now" notice cannot override that strong prior.
+        //
+        // On a genuine flip while a turn is in flight, CANCEL the running turn
+        // and re-prompt with the fresh mode's <collaboration_mode> block so the
+        // model immediately perceives the switch and continues in THIS turn.
+        // applyModeChange has already updated sessionCollaborationModes to
+        // `nextCollab`, so executePrompt builds the correct block for the new
+        // mode. We pass buildMidTurnModeChangeNotice(prevWasPlan) as bodyText —
+        // executePrompt prepends the (now-correct) <collaboration_mode> block
+        // on top of it, so the model sees both the authoritative mode
+        // declaration AND an explicit "just switched, do not wait" nudge.
+        //
+        // This mirrors codex-acp's plan-entry interrupt
+        // (CodexAcpServer.applyCollaborationModeChange → interruptSessionTurn):
+        // codex interrupts on plan ENTRY; we interrupt on EITHER genuine flip
+        // (plan→default AND default→plan) so the model always acts on the
+        // current mode without waiting for the user to open a new turn.
+        const inFlight =
+          runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId);
+        if (shouldAnnounceModeChange(previousCollabMode, nextCollab) && inFlight) {
+          const prevWasPlan = previousCollabMode === PLAN_COLLABORATION_MODE;
+          const repromptText = buildMidTurnModeChangeNotice(prevWasPlan);
+          // Resolve the same model/effort overrides the running turn used, so
+          // the re-prompt does not silently change model or effort.
+          const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+          const repromptEffort = resolveEffort(store, sessionId);
+          logger.info(
+            `Session ${sessionId} mode flip ${previousCollabMode ?? "(none)"} → ${nextCollab} ` +
+              `with a turn in flight — cancelling and re-prompting with the fresh ` +
+              `${prevWasPlan ? "Default" : "Plan"} <collaboration_mode> block.`,
+          );
+          // SIGINT the running Claude subprocess (keeps the session id valid).
+          // The current executePrompt settles with stopReason:"cancelled"; the
+          // re-prompt chains after it on the per-session lock.
+          runner.cancel(sessionId);
+          // Chain the re-prompt on the lock: it runs once the cancelled turn
+          // settles. .then(onFulfilled, onRejected) means we start the
+          // re-prompt regardless of how the cancelled turn resolved — a
+          // cancelled turn that threw (rare) must not block the mode switch.
+          const prevLock = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+          const repromptLock = prevLock.then(
+            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort),
+            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort),
+          );
+          // Keep the lock chain alive for any further prompts queued behind.
+          sessionPromptLocks.set(sessionId, repromptLock.catch(() => {}));
+          // Wait for the re-prompt to actually START the LLM turn (not just be
+          // enqueued) before returning, so the client's config_option_update
+          // reflects a turn that is genuinely running in the new mode.
+          await repromptLock;
+          logger.info(`Session ${sessionId} mode-change re-prompt completed`);
         }
       } else {
         store.setConfigOverride(sessionId, configId, value);
@@ -3602,7 +5125,7 @@ export function createClaudeCodeAgent(
       // CRITICAL: when the command is handled we must RETURN here, not fall
       // through to the serialized path. dispatchSlashCommand is NOT idempotent
       // (e.g. /goal clear|pause mutates sessionGoals and the read-only commands
-      // emit a snapshot), and runPrompt re-dispatches the same command a second
+      // emit a snapshot), and executePrompt re-dispatches the same command a second
       // time. Falling through would double-emit the snapshot (and double-mutate
       // goal state) — and the queued second dispatch is what made a mid-turn
       // command "drain and trigger another turn" after end_turn.
@@ -3618,6 +5141,13 @@ export function createClaudeCodeAgent(
         }
       }
 
+      // Compute the model/effort overrides here (closure scope) so the
+      // plan->exit interrupt in setSessionConfigOption can re-prompt with the
+      // same settings.
+      const configOverrides = store.getConfigOverrides(sessionId);
+      const modelOverride = configOverrides["model"] as string | undefined;
+      const effectiveEffort = resolveEffort(store, sessionId);
+
       // Serialize against any in-flight prompt on this session. See
       // sessionPromptLocks above: the SDK runs concurrent prompt() handlers,
       // so without this a mid-turn /skills (or any second prompt) would race
@@ -3626,1526 +5156,17 @@ export function createClaudeCodeAgent(
       // prior prompt finishes. The lock is keyed by session and always
       // replaced, so it never holds a stale promise across /clear (which
       // resolves quickly and clears per-session state under the lock too).
-      const runPrompt = async (): Promise<PromptResponse> => {
-      // Mark this session as having a prompt in flight for the entire runPrompt
-      // body (LLM turn + steer drain + auto-compact + return). Cleared when the
-      // lock chain settles (below). See sessionPromptInFlight.
-      sessionPromptInFlight.add(sessionId);
-      // If this prompt was cancelled while waiting in the serialization queue
-      // behind a prior turn, don't start a new turn — drain-and-return.
-      if (cancelledSessions.has(sessionId)) {
-        cancelledSessions.delete(sessionId);
-        logger.info(`Queued prompt cancelled before start for session ${sessionId}`);
-        return { stopReason: "cancelled" };
-      }
-      // ── Slash command handling ──────────────────────────────────
-      // Intercept built-in commands (/ps, /goal, /skills, /status, /clear,
-      // /compact) before starting an LLM turn. Shared dispatch logic lives in
-      // dispatchSlashCommand() so prompt() and the steer-drain loop behave
-      // identically. Read-only commands and /clear|/compact|/goal clear|pause
-      // |resume are fully serviced and return immediately. /goal <objective>
-      // returns a goalPrompt to start an LLM turn with.
-      const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, text);
-      // When /goal sets a new objective, this holds the prompt to send to the
-      // LLM to start working on it immediately.
-      const goalPrompt = dispatchResult.startTurn ?? null;
-      // A fully-serviced command (read-only, /clear, /compact, /goal subcmds)
-      // needs no main LLM turn — but we still drain any steers queued during it
-      // (e.g. steers queued while /compact was summarizing) and run the
-      // auto-compact check, so we skip the main turn rather than returning early.
-      const skipMainTurn = dispatchResult.handled && !goalPrompt;
-      const command = dispatchResult.handled ? parseSlashCommand(text) : null;
-
-      // If there's an active (non-paused) goal, prepend it to the prompt.
-     // goalPrompt is set when /goal just set a new objective — use it directly.
-     // For subsequent prompts, prepend the goal as context.
-     const activeGoal = sessionGoals.get(sessionId);
-     let effectivePrompt = text;
-     if (goalPrompt) {
-       effectivePrompt = goalPrompt;
-     } else if (activeGoal && !activeGoal.paused && !command) {
-       effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${text}`;
-     }
-
-      // Inject collaboration mode (plan mode) instructions
-      const collabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
-      if (collabMode === PLAN_COLLABORATION_MODE) {
-        effectivePrompt = `<collaboration_mode># Collaboration Mode: Plan\n\nYou are now in Plan mode. Any previous instructions for other modes (e.g. Default mode) are no longer active.\n\nYour active mode changes only when new developer instructions with a different \`<collaboration_mode>...</collaboration_mode>\` change it; user requests or tool descriptions do not change mode by themselves.\n\nIn Plan mode, you MUST NOT make any changes to the codebase. Instead, analyze the request, investigate the codebase, and produce a detailed plan. Do not execute commands that modify files. Read-only investigation (searching, reading files, running read-only commands) is allowed.\n</collaboration_mode>\n\n${effectivePrompt}`;
-      } else {
-        // Default mode: tell the model it MAY self-enter Plan mode on complex
-        // tasks (mirrors ericli's auto enter_plan_mode — "USE WHEN: complex
-        // multi-step tasks"). The Claude CLI exposes a native EnterPlanMode tool
-        // for this; the adapter maps it to a live picker update (enterPlanMode)
-        // and the ExitPlanMode tool flips the picker back to Default. This keeps
-        // the user in the loop: they see the picker go to "Plan" when the model
-        // decides to plan, and back to "Default" when it's ready to implement.
-        effectivePrompt = `<collaboration_mode># Collaboration Mode: Default\n\nYou are in Default mode: you may read and edit the codebase and execute commands.\n\nWhen a task requires exploration, architectural decisions, or multi-file changes — i.e. it is complex enough that planning first would avoid rework — call EnterPlanMode to switch to Plan mode, investigate read-only, and present a plan. Once the plan is ready, call ExitPlanMode to return to Default mode and implement it. For simple, well-scoped tasks, proceed directly without planning.\n</collaboration_mode>\n\n${effectivePrompt}`;
-      }
-
-      const claudeSessionId = store.getClaudeSessionId(sessionId);
-      const cwd = store.getCwd(sessionId)!;
-     // Tool-call ids must be unique for the whole SESSION: clients resolve tool
-     // elements by id, so a per-turn counter made a new turn adopt the previous
-     // turn's rows. Kept on the store; the local reset below is gone too, since a
-     // steer drain used to restart numbering mid-turn.
-     const nextToolCallId = () => `call_${store.nextToolCallSeq(sessionId)}`;
-     // Monotonic counter for ACP `messageId` on agent_message_chunk. The ACP
-     // spec (ContentChunk.messageId) groups chunks into one logical message:
-     // "All chunks belonging to the same message share the same messageId. A
-     // change in messageId indicates a new message has started." Without it,
-     // vscode-acp cannot tell that text emitted before and after a tool call
-     // belong to the SAME assistant message, so it renders them as separate
-     // bubbles (text→tool→text = 2 bubbles). We rotate the id at each
-     // `assistant` event (one per LLM API call) so all text_delta chunks in
-     // one API call share it; the next API call (after a tool result) gets a
-     // new id → correctly starts a new bubble.
-     let messageCounter = 0;
-     let currentMessageId: string | null = null;
-
-      // Real-time context estimator — tracks conversation content to estimate
-      // context size during the turn (before the result event arrives).
-      // REUSE the session-persistent estimator across turns: a fresh estimator
-      // each turn would reset to ~overhead-only and the usage ring would DROP
-      // at the start of every new turn (then climb again as content streams),
-      // making the context usage visibly flip down→up non-monotonically. By
-      // persisting accumulated content across turns, the estimate stays
-      // monotonic-growing (as a real context window does). Only /clear,
-      // /compact, and auto-compact reset it (see dispatchSlashCommand /
-      // doCompact).
-      const existing = sessionEstimators.get(sessionId);
-      const ctxEstimator = existing ?? new TurnContextEstimator();
-      sessionEstimators.set(sessionId, ctxEstimator);
-      // Accumulate the user's prompt text (it's part of the conversation).
-      ctxEstimator.addText(effectivePrompt);
-
-      // Get model and effort overrides from session config (set via pickers)
-      const configOverrides = store.getConfigOverrides(sessionId);
-      const modelOverride = configOverrides["model"] as string | undefined;
-      // Best-effort: trigger a context-window map load (one-shot, idempotent) so
-      // the first usage_update of the turn uses the proxy's real per-model
-      // window instead of falling through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS
-      // override (which is pinned to one model's window and would mis-report
-      // every other model's denominator). This is NON-BLOCKING: a blocking await
-      // here delays prompt() past the point where an early cancel() can be
-      // observed, which loses the cancel signal (the test for cancel-during-prompt
-      // times out). The startup fire-and-forget in index.ts and the refresh-on-miss
-      // in getContextWindowForModel already populate the map; this just nudges an
-      // in-flight load along if the proxy wasn't reachable at spawn.
-      void loadModelContextWindows();
-      void loadProxyPickerModels();
-      // Only pass effort if the selected model actually supports it; otherwise
-      // fall back to the model's default effort. Using resolveEffort() keeps
-      // the actually-sent effort consistent with what the picker shows and
-      // what /compact, steer drains, and auto-compact use (previously normal
-      // turns fell back to undefined for reasoning models, while /compact via
-      // prompt() used the default "high").
-      const effectiveModel = resolveSessionModel(store, sessionId, modelOverride);
-      const effectiveEffort = resolveEffort(store, sessionId);
-
-      logger.info(`Prompt for session ${sessionId}: ${text.length} chars`);
-      logger.debug(
-        `Prompt content: ${text.slice(0, 100)}${text.length > 100 ? "..." : ""}`
-      );
-
-      const permissionPromises: Promise<void>[] = [];
-
-     let lastUsage: { input_tokens?: number; output_tokens?: number } | null = null;
-     // Track turn start time for goal budget accounting.
-     const _turnStartTime = Date.now();
-     // Output tokens of the most recent non-sidechain API call. The result
-      // event's output_tokens is summed over every call in the turn, which
-      // over-states how much the conversation actually grew.
-      let lastRealOutputTokens = 0;
-      // Track whether Claude CLI's final result was an error (e.g.
-      // error_max_turns) so we can surface it to the user instead of
-      // returning a silent end_turn. Mirrors codex-acp, which maps upstream
-      // turn failures to a visible error rather than an empty success.
-      let turnErrored = false;
-      let turnStopReason: string | undefined;
-      // True when this turn forwards a native Claude CLI `local` slash command
-      // (/usage, /heapdump, /context, /insights, /recap) that the CLI services
-      // itself without an LLM turn. The CLI's output arrives as the `result`
-      // field of the single `result` event (stop_reason null); when this flag
-      // is set we surface that text as a commandOutput row so it is not
-      // silently dropped. See isCliLocalCommandPrompt / CLI_LOCAL_COMMAND_NAMES.
-      const isCliLocalTurn = isCliLocalCommandPrompt(text);
-      // Claude CLI emits per-token text deltas only when launched with
-      // --include-partial-messages (claude-runner passes it), and wraps them in
-      // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
-      // completed `assistant` message block re-stating the FULL text. Emitting
-      // both would duplicate the reply, so the final block is dropped for the
-      // UI when deltas already delivered it (context estimation still counts
-      // the final block — see below). Before the flag was passed there were no
-      // deltas at all, so the whole reply arrived as one chunk and the client
-      // painted a bubble it immediately superseded: the empty bubble that
-      // flashed and vanished at every text→tool boundary.
-      let streamedTextThisMessage = false;
-      const onEvent = (event: StreamEvent) => {
-        // Handle system/init — extract native Claude CLI slash commands and
-        // surface them to vscode-acp via available_commands_update.
-        if (event.type === "system_init" && event.slashCommands && event.slashCommands.length > 0) {
-          // The CLI's slash_commands list is the UNION of its builtins, skills,
-          // and agents (plus plugin commands). Two of those categories are not
-          // "commands" in the ACP sense, so exclude them before merging:
-          //   - skills: invocable as /<name> but they're skill invocations, not
-          //     session commands; showing them as "Claude Code: /<skill>" is
-          //     misleading and they're already surfaced by /skills.
-          //   - agents: subagent types (Explore, Plan, ...) — you never type
-          //     /Explore as a slash command; the CLI lists them for the Task
-          //     tool. Listing them here made the picker full of bogus entries.
-          const skillSet = new Set(event.skillNames ?? []);
-          const agentSet = new Set(event.agentNames ?? []);
-          const builtinNames = new Set(BUILTIN_COMMANDS.map((b) => b.name));
-          // Native command name → is it read-only/turn-safe? A native is
-          // turn-safe ONLY if it's in the static read-only allowlist. We do NOT
-          // trust the CLI's terminal_slash_commands (doctor/color/reload-plugins)
-          // as a turnSafe signal: that list means "the CLI handles it in the
-          // terminal layer", which is true for cosmetic or state-mutating
-          // commands (color = terminal theme, reload-plugins = re-read config)
-          // that are not read-only introspection useful to fire mid-turn.
-          // Everything not in the allowlist is left unsafe so vscode-acp queues
-          // it behind the running turn.
-          const nativeCommands = event.slashCommands
-            .filter((name) => !builtinNames.has(name) && !skillSet.has(name) && !agentSet.has(name))
-            .map((name) => {
-              const turnSafe = NATIVE_TURN_SAFE_COMMANDS.has(name);
-              return {
-                name,
-                description: `Claude Code: /${name}`,
-                input: null,
-                ...(turnSafe ? { _meta: { turnSafe: true } } : {}),
-              };
-            });
-          const allCommands = [...BUILTIN_COMMANDS, ...nativeCommands];
-          connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "available_commands_update",
-              availableCommands: allCommands,
-            } as any,
-         }).catch(() => {
-           // Best effort
-         });
-       }
-      // Handle assistant event — marks an API call boundary. Each assistant
-      // message in Claude CLI's stream-json output = one LLM API call.
-      // Send a real-time usage_update so the context ring shows during the turn.
-      if (event.type === "assistant") {
-        ctxEstimator.markApiCall();
-        // Rotate the messageId at each API call boundary so all text_delta
-        // chunks in THIS call share one id (→ one bubble in the client), and
-        // the next call (after a tool result) starts a fresh id (→ new bubble).
-        currentMessageId = `msg_${++messageCounter}`;
-        // Secondary source. Through the CCR/proxy path the completed assistant
-        // message reports input_tokens: 0, so this usually contributes nothing;
-        // setRealTokens ignores non-positive values. `message_delta` below is
-        // the reliable source.
-        if (event.usage && !event.isSidechain) {
-          const real =
-            (event.usage.input_tokens ?? 0) +
-            (event.usage.cache_read_input_tokens ?? 0) +
-            (event.usage.cache_creation_input_tokens ?? 0);
-          ctxEstimator.setRealTokens(real);
-          lastRealOutputTokens = event.usage.output_tokens ?? 0;
-        }
-        sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
-        // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`        // event fires at the START of the final assistant block (after the
-        // per-token content_block_delta stream for the same message already
-        // arrived). Resetting here would wipe the flag right before the
-        // final-block text_delta below checks it. The flag is consumed and
-        // cleared by the final-block text_delta itself.
-      }
-      // Handle message_delta — the authoritative per-call context size.
-      //
-      // This is the figure Claude Code and the Anthropic SDK use for their own
-      // context accounting: the exact prompt token count the provider charged
-      // for the API call that just completed. Adopting it verbatim is why the
-      // usage ring no longer needs an estimate. Subagent calls (non-null
-      // parent_tool_use_id on the stream envelope) measure a different
-      // conversation and must not be attributed here.
-      if (event.type === "message_delta" && event.usage && !event.isSidechain) {
-        const realPrompt =
-          (event.usage.input_tokens ?? 0) +
-          (event.usage.cache_read_input_tokens ?? 0) +
-          (event.usage.cache_creation_input_tokens ?? 0);
-        if (realPrompt > 0) {
-          ctxEstimator.setRealTokens(realPrompt);
-          lastRealOutputTokens = event.usage.output_tokens ?? lastRealOutputTokens;
-          sendEstimatedUsage(ctxEstimator, connection, sessionId, effectiveModel);
-        }
-      }
-      // Handle user event (tool results / injected text) — accumulate for
-      // context estimation.
-      if (event.type === "user" && event.text) {
-        ctxEstimator.addText(event.text);
-      }
-      // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
-      // is resolved by this user message's tool_results to "completed". The
-      // runner emits toolResultIds on the user event (claude-runner.ts). This
-      // is what surfaces the running → completed transition for Bash/Read/Edit.
-      // (Subagents are excluded — their completion is detected via the
-      // <task-notification> path below, not the tool_result id match.)
-      if (event.type === "user" && event.toolResultIds?.length) {
-        const pendingTools = sessionPendingTools.get(sessionId);
-        if (pendingTools && pendingTools.size > 0) {
-          for (const tuId of event.toolResultIds) {
-            const acpCallId = pendingTools.get(tuId);
-            if (acpCallId) {
-              pendingTools.delete(tuId);
-              connection
-                .sessionUpdate({
-                  sessionId,
-                  update: {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId: acpCallId,
-                    status: "completed",
-                  } as any,
-                })
-                .catch(() => {});
-            }
-          }
-          if (pendingTools.size === 0) {
-            sessionPendingTools.delete(sessionId);
-          }
-        }
-      }
-      // Subagent completion detection via <task-notification>.
-      // Claude Code delivers a finished subagent's result as a `user` text
-      // message containing a <task-notification> block — NOT as a tool_result
-      // reusing the tool_use_id (the only tool_result for a subagent is the
-      // immediate launch ack "Async agent launched successfully..."). The
-      // notification carries a task-id (distinct from the tool_use_id) and a
-      // <summary> naming the agent by its description, e.g.:
-      //   Agent "Trace interrupt message wiring" completed
-      //   background agent "Trace interrupt message wiring" ... [stopped]
-      // So we link spawn→completion by DESCRIPTION: if a pending subagent's
-      // description appears inside a <task-notification> in this user message,
-      // flip its tool_call to "completed" and drop it from the pending map.
-      // The post-turn flush then only catches subagents whose notification
-      // never arrived before end_turn (the premature-end_turn case).
-      if (event.type === "user" && event.text) {
-        const text = event.text;
-        const notifIdx = text.indexOf("<task-notification>");
-        if (notifIdx >= 0) {
-          const notif = text.slice(notifIdx);
-          const pending = sessionPendingAgents.get(sessionId);
-          if (pending && pending.size > 0) {
-            // A single user message can carry multiple <task-notification>
-            // blocks (several subagents finishing at once). Match each pending
-            // subagent whose description the notification text references.
-            for (const [tuId, info] of pending) {
-              if (info.description && notif.includes(info.description)) {
-                pending.delete(tuId);
-                connection
-                  .sessionUpdate({
-                    sessionId,
-                    update: {
-                      sessionUpdate: "tool_call_update",
-                      toolCallId: info.acpCallId,
-                      status: "completed",
-                    } as any,
-                  })
-                  .catch(() => {});
-                // Report what the subagent actually FOUND, not just that it
-                // stopped.
-                //
-                // This notification is the only place its result exists on this
-                // side: Claude Code delivers a finished subagent as this user
-                // message, its content never enters the main conversation's
-                // prompt, and the client's own memory capture records tool_call
-                // titles plus the main assistant text — never tool results. So
-                // without this the work is unrecoverable the moment the turn
-                // ends, and could never become memory or a skill.
-                //
-                // Fire-and-forget: a client that does not implement the method,
-                // or does not want the data, must not disturb a subagent that has
-                // already finished.
-                const findings = extractTaskNotificationSummary(notif, info.description);
-                if (findings) {
-                  connection
-                    .extNotification(SUBAGENT_FINDINGS_METHOD, {
-                      sessionId,
-                      id: tuId,
-                      type: "subagent",
-                      label: info.description,
-                      task: info.description,
-                      status: findings.stopped ? "stopped" : "completed",
-                      summary: findings.summary,
-                    })
-                    .catch(() => {});
-                }
-                logger.info(
-                  `Subagent "${info.description}" (${tuId}) completion ` +
-                    `notified via <task-notification>; marked completed.`,
-                );
-              }
-            }
-            if (pending.size === 0) {
-              sessionPendingAgents.delete(sessionId);
-            }
-          }
-        }
-      }
-      // A subagent's tool results live only in the subagent's own stream —
-      // the main conversation sees the launch ack ("Async agent launched
-      // successfully…") and the eventual <task-notification>, never a
-      // tool_result carrying the subagent's child tool_use_ids. If any
-      // tool_progress heartbeat ever mapped a sidechain id into the parent's
-      // pending-tools map, it could never flip to completed here; drop such
-      // stale entries so they don't sit in_progress until the post-turn flush.
-      if (
-        event.type === "user" &&
-        event.isSidechain &&
-        event.toolResultIds?.length
-      ) {
-        const staleTools = sessionPendingTools.get(sessionId);
-        if (staleTools && staleTools.size > 0) {
-          for (const tuId of event.toolResultIds) {
-            staleTools.delete(tuId);
-          }
-          if (staleTools.size === 0) {
-            sessionPendingTools.delete(sessionId);
-          }
-        }
-      }
-      // Non-subagent tools: flip any in_progress tool whose Claude tool_use_id
-      // is resolved by this user message's tool_results to "completed". The
-      // runner emits toolResultIds on the user event (claude-runner.ts). This
-      // is what surfaces the running → completed transition for Bash/Read/Edit.
-      if (event.type === "user" && event.toolResultIds?.length) {
-        const pendingTools = sessionPendingTools.get(sessionId);
-        if (pendingTools && pendingTools.size > 0) {
-          for (const tuId of event.toolResultIds) {
-            const acpCallId = pendingTools.get(tuId);
-            if (acpCallId) {
-              pendingTools.delete(tuId);
-              connection
-                .sessionUpdate({
-                  sessionId,
-                  update: {
-                    sessionUpdate: "tool_call_update",
-                    toolCallId: acpCallId,
-                    status: "completed",
-                  } as any,
-                })
-                .catch(() => {});
-            }
-          }
-          if (pendingTools.size === 0) {
-            sessionPendingTools.delete(sessionId);
-          }
-        }
-      }
-    // Handle result event — Claude CLI reports CUMULATIVE usage across all
-    // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
-    // single-call turn, input_tokens = real context size (accurate). For a
-     // multi-call turn (tool calls), input_tokens = sum of all calls' input
-     // tokens, which inflates the usage UI (e.g. 3 calls × 20k = 60k shown,
-     // but real context is ~20k).
-     //
-     // Per-call usage comes from each `assistant` message's `message.usage`
-     // (see the assistant handler above), which is exact. The result event's
-     // usage is only a fallback for the pre-first-call window.
-     //
-    // Strategy:
-    // - For the UI: use our real-time estimate (ctxEstimator), which is more
-    //   accurate than the cumulative result value. Cap at contextWindow.
-     // - For auto-compact: use ONLY our estimate. The cumulative result
-     //   value (sum of all API calls) is inflated on multi-call turns and
-     //   triggers compaction way too early (e.g. 340k for a 27k context).
-     //   Our estimate tracks actual conversation growth and is accurate.
-     if (event.type === "result") {
-      // Capture the stop reason / error flag for the prompt return path.
-      // This runs even when the result carries no usage (some error results
-      // omit it), so an error_max_turns / failed turn is never silently
-      // swallowed as a plain end_turn.
-      turnStopReason = event.stopReason;
-      if (event.isError) turnErrored = true;
-      // Surface the CLI's own output for a native `local` command (/usage,
-      // /heapdump, /context, /insights, /recap). These are queued-and-drained
-      // like a normal prompt (NOT bypassed mid-turn) and the CLI services them
-      // itself — no LLM turn, no API call — returning the result as the `text`
-      // of a single `result` event with no stop reason. Without this the text
-      // was dropped here and /usage and /heapdump showed nothing in the ACP
-      // chat. Emit it as a transient commandOutput SNAPSHOT row (like /ps and
-      // /status) so it appears beside the command, not as a persistent
-      // assistant bubble. Only when this turn was actually a CLI local command
-      // (isCliLocalTurn) and the result carries text, so a normal end_turn that
-      // happens to carry no/extra text is never mis-rendered.
-      if (isCliLocalTurn && !event.isError && typeof event.text === "string" && event.text.trim()) {
-        connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: event.text },
-            messageId: nextCommandMessageId(),
-            // Transient SNAPSHOT, not conversation — see nextCommandMessageId
-            // above. Without this marker a client cannot tell command output
-            // from the assistant's own text, so vscode-acp's compact mode
-            // folded it into the running turn's collapsed block instead of
-            // showing it beside the command.
-            _meta: { commandOutput: true },
-          } as any,
-        }).catch(() => {
-          // Best effort — a missing command-output row must not fail the turn.
-        });
-      }
-      // Record the context window Claude Code resolved for this model, so the
-      // usage denominator can fall back to the CLI's own figure instead of a
-      // hardcoded 200k when the proxy advertises nothing. NOTE: the CLI's value
-      // is only a FALLBACK — getContextWindowForModel prefers the proxy's
-      // /v1/models figure (authoritative) via `??`. The CLI often reports a
-      // stale/default window for non-Claude models routed via ANTHROPIC_BASE_URL
-      // (e.g. it reports 196608 for deepseek-v4-flash, whose real window is
-      // 262144). If the proxy map doesn't have this model, refresh it — the
-      // proxy may have added the model after our one-shot load.
-      if (event.contextWindow && event.contextWindow > 0) {
-        const cwModel = resolveSessionModel(store, sessionId, modelOverride);
-        if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
-          cliReportedContextWindows.set(cwModel, event.contextWindow);
-          logger.info(
-            `Claude Code reports contextWindow=${event.contextWindow} for ${cwModel}`
-          );
-        }
-        if (!modelContextWindows.has(cwModel)) {
-          void loadModelContextWindows();
-          void loadProxyPickerModels();
-        }
-      }
-      // Log the stop reason so premature turn termination (end_turn vs
-      // max_turns vs error) is diagnosable from the ACP stderr log.
-      if (event.stopReason || event.isError) {
-        logger.info(
-          `Turn result: stopReason=${event.stopReason ?? "unknown"} isError=${!!event.isError}`,
-        );
-      }
-      if (event.usage) {
-      lastUsage = event.usage;
-      const inputTokens = event.usage.input_tokens ?? 0;
-      const outputTokens = event.usage.output_tokens ?? 0;
-      const effectiveModel = resolveSessionModel(store, sessionId, modelOverride);
-      const contextWindow = getContextWindowForModel(effectiveModel);
-      // Context size for both the UI and auto-compact. Once a real per-call
-      // prompt count has been seen (message.usage on an assistant event) the
-      // estimator returns that; the result event's own usage is accumulated
-      // across every API call in the turn and would over-report badly on
-      // multi-tool turns, so it is never used for sizing.
-      const estimatedTokens = ctxEstimator.getEstimatedTokens();
-      // The next request's prompt = this prompt + this turn's final output, so
-      // add the LAST call's output rather than the turn-cumulative figure.
-      const trailingOutput = ctxEstimator.hasRealTokens()
-        ? lastRealOutputTokens
-        : outputTokens;
-      sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: trailingOutput });
-      // For the UI: use our real-time estimate (more accurate than cumulative).
-      // Cap at contextWindow so it never shows >100%.
-      const cappedUsed = Math.min(estimatedTokens, contextWindow);
-       connection.sessionUpdate({
-         sessionId,
-         update: {
-           sessionUpdate: "usage_update",
-           used: cappedUsed,
-           size: contextWindow,
-         } as any,
-       }).catch(() => {
-         // Best effort — don't fail the turn if usage_update fails.
-       });
-      }
-     }
-       if ((event as any).type === "thinking" && (event as any).text) {
-         ctxEstimator.addText((event as any).text);
-         connection.sessionUpdate({
-           sessionId,
-           update: {
-             sessionUpdate: "agent_thought_chunk",
-             content: { type: "text", text: (event as any).text },
-           } as any,
-         });
-       } else if (event.type === "text_delta" && event.text) {
-         // In --verbose mode Claude CLI emits BOTH streaming content_block_delta
-         // text AND the final assistant message block's full text. To avoid
-         // double-counting assistant content in the context estimate, we count
-         // only the final-block text (fromAssistantBlock) and ignore the
-         // streaming deltas.
-         if (event.fromAssistantBlock) {
-           ctxEstimator.addText(event.text);
-         } else {
-           // Mark that this message streamed its text via per-token deltas.
-           streamedTextThisMessage = true;
-         }
-         // Emit the chunk to the UI — EXCEPT for the final-block text when the
-         // same message was already streamed token-by-token. The final block's
-         // full text would land ~1ms before the tool_use in the same content
-         // array (claude-runner.ts emits them back-to-back), beating vscode-acp's
-         // 80ms streaming render and leaving an empty bubble at every
-         // text→tool transition. The per-token deltas already delivered this
-         // text; re-emitting it also duplicates it in currentAssistantText.
-         // When there were NO streaming deltas (text only in the final block,
-         // e.g. non-verbose or a non-streaming model), emit it as the sole
-         // source of the text. The final-block text consumes and clears the
-         // flag so it applies per message.
-         const dropAsDuplicate = event.fromAssistantBlock && streamedTextThisMessage;
-         if (event.fromAssistantBlock) streamedTextThisMessage = false;
-         if (!dropAsDuplicate) {
-           connection.sessionUpdate({
-             sessionId,
-             update: {
-               sessionUpdate: "agent_message_chunk",
-               content: { type: "text", text: event.text },
-               // Group all chunks of this assistant API call into one logical
-               // message so the client renders one bubble (not one per delta).
-               messageId: currentMessageId ?? undefined,
-             },
-           });
-         }
-       } else if (event.type === "tool_use" && event.toolName) {
-         ctxEstimator.addToolCall(event.toolName, event.toolInput);
-         const toolCallId = nextToolCallId();
-         logger.debug(`Tool call: ${event.toolName}`);
-         // TaskCreate/TaskUpdate/TaskList maintain a todo list — mirror it
-         // into an ACP `plan` update so the chat UI shows a plan bar with
-         // the current task count (like codex-acp's update_plan). The plan
-         // is a full snapshot, so the count reflects the live list size
-         // rather than a running total of updates.
-         handleTaskTool(sessionId, event.toolName, event.toolInput);
-         // Claude Code owns a native ExitPlanMode tool: the model calls it once
-         // the plan is ready and expects the host to leave Plan mode. Without
-         // mapping it the session stayed in Plan forever — the picker still read
-         // "Plan", the injected <collaboration_mode> block kept telling the model
-         // that an execution request is a request to PLAN the execution, and a
-         // follow-up "implement it" came back as code in the chat instead of
-         // edits. Clear the flag and tell the client so the picker follows.
-         if (event.toolName === "ExitPlanMode") {
-           void leavePlanMode(sessionId, connection, store, runner);
-         }
-         // The symmetric enter path: the model calls EnterPlanMode when it decides
-         // a task needs planning before acting. Map it so the picker flips to
-         // "Plan" live (current_mode_update) and the next prompt injects the
-         // read-only <collaboration_mode> Plan block. Without this the picker
-         // only showed "Plan" on a user-initiated switch, so a self-entered plan
-         // was invisible until the user manually flipped the mode.
-         if (event.toolName === "EnterPlanMode") {
-           void enterPlanMode(sessionId, connection, store, runner);
-         }
-         // Build a descriptive title + kind + (for edits) diff content +
-         // locations, mirroring codex-acp, so the chat UI shows the action
-         // verb and a click-to-open diff instead of a bare filename.
-         const isSubagent =
-           event.toolName === "Task" || event.toolName === "Agent";
-         const update = buildToolCallUpdate(
-           toolCallId,
-           event.toolName,
-           event.toolInput,
-           store.getCwd(sessionId),
-         );
-         // Emit every tool as in_progress at its tool_use so the chat UI shows
-         // a running phase (command text + spinner) while the tool executes.
-         // The tool flips to "completed" when its tool_result lands — subagents
-         // via the <task-notification> path below, normal tools via the
-         // tool_result path in the user-event handler. buildToolCallUpdate's
-         // status:"completed" default is overridden here and only resolved on
-         // completion; the post-turn flush is the safety net for tools whose
-         // result never arrived before end_turn.
-         const emitted = { ...update, status: "in_progress" as const };
-         if (isSubagent && event.toolUseId) {
-           const subInput = (event.toolInput ?? {}) as Record<string, unknown>;
-           const subDesc =
-             typeof subInput.description === "string"
-               ? subInput.description
-               : typeof subInput.prompt === "string"
-                 ? subInput.prompt
-                 : typeof subInput.subagent_type === "string"
-                   ? subInput.subagent_type
-                   : "";
-           let pending = sessionPendingAgents.get(sessionId);
-           if (!pending) {
-             pending = new Map();
-             sessionPendingAgents.set(sessionId, pending);
-           }
-           pending.set(event.toolUseId, {
-             acpCallId: toolCallId,
-             description: subDesc,
-           });
-         } else if (event.toolUseId) {
-           // Non-subagent tool: register so the tool_result user-event can flip
-           // it to completed. Subagents are excluded (their completion comes
-           // through <task-notification>, not the tool_result id match).
-           let pendingTools = sessionPendingTools.get(sessionId);
-           if (!pendingTools) {
-             pendingTools = new Map();
-             sessionPendingTools.set(sessionId, pendingTools);
-           }
-           pendingTools.set(event.toolUseId, toolCallId);
-           // Server-side / network-blocked web tool watchdog. WebSearch
-           // executes on Anthropic's API, so on a proxy route (non-anthropic
-           // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes it
-           // and the tool hangs with no tool_result ever arriving. WebFetch is
-           // fetched client-side by the CLI — normally fine through a proxy —
-           // but on a host whose network blocks it the fetch stalls, so the
-           // operator names it in CLAUDE_ACP_DISALLOWED_WEB_TOOLS and it gets
-           // the same treatment. The CLI is told not to advertise them
-           // (claude-runner buildExtraArgs), but the adapter must never depend
-           // on that alone: flip the row to failed after a bounded wait so the
-           // user sees a named cause instead of a frozen spinner. Cancel is
-           // handled centrally at the prompt return (the cancelled flag +
-           // "Turn ended with N tool(s) still pending" flush), so the timer
-           // only needs to skip when the tool completes normally — hence the
-           // per-session map plus a clear when the turn settles.
-           if (
-             watchedWebTools().has(event.toolName ?? "") &&
-             isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL) &&
-             !/^claude/i.test(resolveSessionModel(store, sessionId, modelOverride))
-           ) {
-             const tuId = event.toolUseId;
-             const timer = setTimeout(() => {
-               webToolWatchdogs.get(sessionId)?.delete(timer);
-               const pend = sessionPendingTools.get(sessionId);
-               if (!pend?.has(tuId)) return; // completed / flushed already
-               pend.delete(tuId);
-               if (pend.size === 0) sessionPendingTools.delete(sessionId);
-               logger.info(
-                 `Web tool ${event.toolName} (${tuId}) timed out after ${WEB_TOOL_TIMEOUT_MS}ms ` +
-                   `on a proxy route — no server-side backend executed it.`,
-               );
-               connection
-                 .sessionUpdate({
-                   sessionId,
-                   update: {
-                     sessionUpdate: "tool_call_update",
-                     toolCallId,
-                     status: "failed",
-                     _meta: {
-                       claudeCode: {
-                         error:
-                           "Web tools are executed by the Anthropic API and are not available on this proxy route.",
-                       },
-                     },
-                   } as any,
-                 })
-                 .catch(() => {});
-             }, WEB_TOOL_TIMEOUT_MS);
-             let timers = webToolWatchdogs.get(sessionId);
-             if (!timers) {
-               timers = new Set();
-               webToolWatchdogs.set(sessionId, timers);
-             }
-             timers.add(timer);
-           }
-         }
-         connection.sessionUpdate({
-           sessionId,
-           update: emitted,
-         });
-       } else if (event.type === "tool_progress" && event.toolUseId) {
-         // Claude CLI's periodic heartbeat while a tool runs. A long-running
-         // tool (a Bash poll with sleep/ssh loops) emits nothing else for
-         // minutes — no deltas, no tool_result — so without forwarding these
-         // heartbeats the chat UI shows a frozen in_progress tool that looks
-         // exactly like a hung session (the "session hangs, Stop fixes it"
-         // symptom). Refresh the existing tool_call with the elapsed time so
-         // the row visibly ticks. Sidechain (subagent) heartbeats are skipped
-         // — subagent tools are tracked via sessionPendingAgents, and their
-         // tool_use_ids are not in this session's pending-tools map.
-         if (!event.toolSidechain) {
-           const pendingTools = sessionPendingTools.get(sessionId);
-           const acpCallId = pendingTools?.get(event.toolUseId);
-           if (acpCallId) {
-             connection
-               .sessionUpdate({
-                 sessionId,
-                 update: {
-                   sessionUpdate: "tool_call_update",
-                   toolCallId: acpCallId,
-                   status: "in_progress",
-                   _meta: {
-                     claudeCode: {
-                       toolProgress: {
-                         elapsedSeconds: event.toolElapsedSeconds,
-                       },
-                     },
-                   },
-                 } as any,
-               })
-               .catch(() => {});
-           }
-         }
-       } else if (event.type === "permission_request" && event.toolName) {
-         ctxEstimator.addToolCall(event.toolName, event.toolInput);
-         const toolCallId = nextToolCallId();
-         const toolName = event.toolName;
-         const toolInput = event.toolInput ?? {};
-         logger.info(`Permission request: ${toolName}`);
-
-          // Build the descriptive title + kind + diff content once, then reuse
-          // across the pending → completed/failed lifecycle.
-          const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput, store.getCwd(sessionId));
-
-          // Send pending tool_call status
-          connection.sessionUpdate({
-            sessionId,
-            update: { ...baseUpdate, status: "pending" },
-          });
-
-          // Request permission from client (track promise for awaiting)
-          const permPromise = connection
-            .requestPermission({
-              sessionId,
-              toolCall: {
-                toolCallId,
-                title: baseUpdate.title,
-                kind: baseUpdate.kind as any,
-                status: "pending",
-                rawInput: toolInput,
-              },
-              options: [
-                { optionId: "allow_once", kind: "allow_once", name: "Allow once" },
-                { optionId: "allow_always", kind: "allow_always", name: "Allow always" },
-                { optionId: "reject_once", kind: "reject_once", name: "Reject once" },
-                { optionId: "reject_always", kind: "reject_always", name: "Reject always" },
-              ],
-            })
-            .then((response) => {
-              const outcome = response.outcome as any;
-              const isSelected =
-                outcome.outcome === "selected" || outcome.type === "selected";
-              const optionId = outcome.optionId;
-              const isApproved =
-                isSelected &&
-                (optionId === "allow_once" ||
-                  optionId === "allow_always");
-
-              connection.sessionUpdate({
-                sessionId,
-                update: {
-                  ...baseUpdate,
-                  sessionUpdate: "tool_call_update",
-                  status: isApproved ? "completed" : "failed",
-                },
-              });
-            })
-            .catch((err) => {
-              logger.error(
-                `Permission request failed: ${err instanceof Error ? err.message : String(err)}`
-              );
-              connection.sessionUpdate({
-                sessionId,
-                update: {
-                  ...baseUpdate,
-                  sessionUpdate: "tool_call_update",
-                  status: "failed",
-                },
-              });
-            });
-
-          permissionPromises.push(permPromise);
-        }
-      };
-
-  /**
-   * Deliver every queued steer message as a follow-up `--resume` prompt.
-   *
-   * Claude CLI cannot inject mid-turn, so steers are queued (handleSteer) and
-   * delivered here. Called at THREE points so delivery order always matches
-   * the order the user typed in:
-   *  1. BEFORE the main turn — a steer that landed in the drain tail of the
-   *     previous turn (after that drain took the queue but before the prompt
-   *     lock cleared) must go out before the newer prompt, not after it.
-   *  2. AFTER the main turn — the normal case.
-   *  3. AFTER compaction — /compact and auto-compact each run extra LLM calls,
-   *     and anything steered during them would otherwise sit in the queue
-   *     until the next user prompt.
-   *
-   * The queue is drained IN PLACE (shift from the live array) instead of being
-   * copied out and deleted. That way a steer arriving mid-drain is picked up by
-   * the same pass, and an early exit leaves the undelivered remainder queued
-   * rather than silently dropping it.
-   */
-  const drainSteerQueue = async (): Promise<void> => {
-    const queue = steerQueues.get(sessionId);
-    if (!queue || queue.length === 0) return;
-    // Re-entrancy guard: draining awaits LLM turns, so a nested call (e.g. the
-    // post-compaction drain starting while the post-turn drain is still
-    // awaiting) would interleave two consumers over one queue.
-    if (steerDraining.has(sessionId)) return;
-    steerDraining.add(sessionId);
-    let deliveredAny = false;
-    try {
-      while (queue.length > 0) {
-        const steerText = queue.shift()!;
-        // Cancellation discards the rest — the user asked to stop.
-        if (cancelledSessions.has(sessionId)) {
-          queue.length = 0;
-          break;
-        }
-        const claudeSid = store.getClaudeSessionId(sessionId);
-        // No Claude session to resume into (e.g. straight after /clear). Put it
-        // back so a later drain delivers it once a session exists again.
-        if (!claudeSid) {
-          queue.unshift(steerText);
-          break;
-        }
-        deliveredAny = true;
-        // Echo now that this message is actually going to the model, so the client's
-        // release signal means delivered rather than received.
-        await connection
-          .sessionUpdate({
-            sessionId,
-            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: steerText } } as any,
-          })
-          .catch(() => { /* non-fatal */ });
-       // NOTE: the tool-call counter is deliberately NOT reset here. Restarting
-       // it mid-turn on a steer drain made the steered work reuse the ids of the
-       // tools that ran before it, so the client updated the wrong rows.
-       permissionPromises.length = 0;
-       logger.info(`Draining steer message for session ${sessionId}: ${steerText.length} chars`);
-
-          // If the steered text is a slash command, dispatch it through the
-          // SAME handler prompt() uses (dispatchSlashCommand) so the two entry
-          // points behave identically. Previously this was a hand-rewritten
-          // copy that silently dropped several cases (/goal with empty/over-
-          // length arg, /goal pause|resume with no goal, and /ps|/status|
-          // /skills fell through to raw text).
-          const steerDispatch = await dispatchSlashCommand(sessionId, connection, runner, store, steerText);
-          if (steerDispatch.handled) {
-            logger.info(`Steer drain: handled slash command for session ${sessionId}`);
-            if (steerDispatch.startTurn) {
-              // /goal <objective> — start an LLM turn pursuing it.
-              try {
-                ctxEstimator.addText(steerDispatch.startTurn);
-                await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, modelOverride, effectiveEffort);
-                await Promise.all(permissionPromises);
-              } catch (goalErr) {
-                logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
-              }
-            }
-            // /clear wipes the Claude session ID, so there is nothing to resume
-            // into — stop this pass. Anything still queued stays queued (the
-            // drain is non-destructive), and the `!claudeSid` guard puts it back
-            // until a later drain runs against the fresh session.
-            if (parseSlashCommand(steerText)?.name === "clear") break;
-            continue;
-          }
-
-        try {
-          // Steer-drain guard: a steered message is a FOLLOW-UP user
-          // instruction delivered after the previous turn completed — Claude
-          // CLI can't inject mid-turn, so we resume the session here. To stop
-          // the model from misreading the prior turn's (possibly subagent-
-          // produced) output as an interruption it must diagnose, frame the
-          // steer as a fresh instruction. Also, if a subagent is somehow still
-          // marked in_progress (result fired before its tool_result), defer
-          // the drain rather than yanking the session into a new context.
-          const stillPending = sessionPendingAgents.get(sessionId);
-          if (stillPending && stillPending.size > 0) {
-            logger.info(
-              `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
-            );
-            // Put it back at the front so it drains once the subagent resolves.
-            queue.unshift(steerText);
-            break;
-          }
-
-          // Prepend goal to steer messages too
-          const basePrompt = activeGoal && !activeGoal.paused
-            ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
-            : steerText;
-          // Frame as a follow-up so the model treats this as a new user
-          // instruction rather than a description of interrupted state.
-          const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
-          ctxEstimator.addText(steerPrompt);
-          await runner.continueSessionStreaming(
-              claudeSid,
-              steerPrompt,
-              onEvent,
-              sessionId,
-               modelOverride,
-                effectiveEffort
-              );
-              await Promise.all(permissionPromises);
-            } catch (steerErr) {
-              logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
-            }
-      }
-    } finally {
-      steerDraining.delete(sessionId);
-    }
-    if (deliveredAny) {
-      store.touch(sessionId);
-      await connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "session_info_update",
-          updatedAt: store.getUpdatedAt(sessionId),
-        } as any,
-      }).catch(() => {});
-    }
-  };
-
-      try {
-        // Deliver anything still queued from the PREVIOUS turn before starting
-        // this one. A steer can land in the previous turn's drain tail — after
-        // its drain emptied the queue but before the prompt lock cleared —
-        // and handleSteer accepts it because a prompt is still in flight. Left
-        // to the post-turn drain it would arrive AFTER this newer prompt, i.e.
-        // out of the order the user typed.
-        await drainSteerQueue();
-        // Re-read the Claude session id: the drain above can dispatch slash
-        // commands, and /clear wipes it. The id captured before the drain would
-        // then resume a conversation the user just cleared.
-        const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
-        let result;
-        if (!skipMainTurn) {
-        // ─── Pre-turn compaction guard ────────────────────────────────
-        // The post-turn auto-compact check (below, after "Prompt completed")
-        // runs against `sessionLastUsage` — the REAL prompt count from the
-        // previous turn's last API call. By the time THIS turn forwards its
-        // prompt to the CLI, that figure is stale: the new user prompt (added
-        // to ctxEstimator at addText(effectivePrompt) above) has grown the
-        // request by the new prompt's token contribution. The between-turn
-        // check can't see that growth, so a turn that measured 174,239 (under
-        // the 176,947 threshold) arrives at vLLM as 176,609 input + 20,000
-        // maxOutput = 196,609 > 196,608 → HTTP 500 context overflow.
-        //
-        // This guard mirrors the Claude Code CLI's pre-send `isAtBlockingLimit`
-        // check (query.ts): project the about-to-be-sent prompt size using the
-        // estimator's pending-inclusive count, and if it would cross the
-        // threshold, compact BEFORE forwarding. getEstimatedTokensWithPending
-        // adds the new prompt's char-estimated tokens to the last real count,
-        // closing the measurement gap so the 90% threshold actually means 90%.
-        if (isAutoCompactEnabled() && claudeSessionIdAfterDrain) {
-          const projectedInput = ctxEstimator.getEstimatedTokensWithPending();
-          const preTurnThreshold = getAutoCompactThreshold(effectiveModel);
-          if (projectedInput >= preTurnThreshold) {
-            logger.info(
-              `Pre-turn compact for session ${sessionId}: projected ${projectedInput} >= ${preTurnThreshold} ` +
-                `(lastReal=${ctxEstimator.getEstimatedTokens()}, pendingChars added ${ctxEstimator.getPendingChars()} chars, ` +
-                `effectiveWindow=${getEffectiveContextWindowSize(effectiveModel)}, contextWindow=${getContextWindowForModel(effectiveModel)})`,
-            );
-            await doCompact(
-              sessionId,
-              connection,
-              runner,
-              store,
-              modelOverride,
-              effectiveEffort,
-              false,
-            );
-            // doCompact reset the estimator (conversation replaced by a short
-            // summary). Re-add this turn's prompt so the estimator reflects
-            // the post-compact conversation + the new prompt before the turn.
-            ctxEstimator.addText(effectivePrompt);
-            // Re-read the claude session id: doCompact starts a fresh session.
-            // The variable captured below must point at the compacted session,
-            // not the pre-compact one (which the summary replaced).
-          }
-        }
-        // doCompact above may have replaced the claude session id; re-read so
-        // the resume below targets the compacted conversation when compaction
-        // ran, and the original when it didn't.
-        const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
-        const turnContent: import("./claude-runner.js").StdinContentBlock[] = hasImages
-          ? [{ type: "text", text: effectivePrompt }, ...promptImages]
-          : [];
-        if (claudeSessionIdForTurn) {
-          try {
-            result = hasImages
-              ? await runner.continueSessionStreamingWithContent(
-                  claudeSessionIdForTurn,
-                  turnContent,
-                  onEvent,
-                  sessionId,
-                  modelOverride,
-                  effectiveEffort
-                )
-              : await runner.continueSessionStreaming(
-                  claudeSessionIdForTurn,
-                  effectivePrompt,
-                  onEvent,
-                  sessionId,
-                  modelOverride,
-                  effectiveEffort
-                );
-          } catch (resumeErr) {
-            const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
-            // A dead upstream must NOT cost the conversation. Starting fresh
-            // here clears the persisted Claude session id, and nothing in the UI
-            // can put it back — the user resumes, says "go on", and the agent
-            // has no prior context while the transcript is still on disk.
-            // Only a failure that actually implicates the session id may fall
-            // back; anything transient is surfaced so a retry can resume.
-            if (isTransientTurnFailure(resumeMsg, turnErrored)) {
-              logger.warn(
-                `Resume failed for ${claudeSessionIdForTurn} with a transient failure — ` +
-                  `keeping the session id so a retry can resume: ${resumeMsg}`,
-              );
-              throw resumeErr;
-            }
-            // Resume failed (expired session, etc.) — fall back to new session
-            logger.warn(
-              `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeMsg}`
-            );
-            store.clearPersistedSession(cwd);
-            result = hasImages
-              ? await runner.startSessionStreamingWithContent(
-                  cwd,
-                  turnContent,
-                  onEvent,
-                  sessionId,
-                  modelOverride,
-                  effectiveEffort
-                )
-              : await runner.startSessionStreaming(
-                  cwd,
-                  effectivePrompt,
-                  onEvent,
-                  sessionId,
-                  modelOverride,
-                  effectiveEffort
-                );
-            store.setClaudeSessionId(sessionId, result.sessionId);
-          }
-        } else {
-          const mcpServers = store.getMcpServers(sessionId);
-          if (hasImages) {
-            result = await runner.startSessionStreamingWithContent(
-              cwd,
-              turnContent,
-              onEvent,
-              sessionId,
-              modelOverride,
-              effectiveEffort
-            );
-          } else if (mcpServers.length > 0) {
-            result = await runner.startSessionWithMcp(
-              cwd,
-              text,
-              mcpServers,
-              onEvent,
-              sessionId
-            );
-          } else {
-            result = await runner.startSessionStreaming(
-              cwd,
-              effectivePrompt,
-              onEvent,
-              sessionId,
-              modelOverride,
-              effectiveEffort
-            );
-          }
-          // Only persist the Claude session id if the CLI actually emitted one.
-          // On an early cancel (user hit "Send Now" before the CLI's init event
-          // arrived) result.sessionId can be empty — storing "" would overwrite
-          // nothing useful now, but guarding keeps the invariant that a stored
-          // id is always a real one.
-          if (result.sessionId) {
-            store.setClaudeSessionId(sessionId, result.sessionId);
-          }
-        }
-        }
-
-        // Wait for all pending permission requests to resolve
-        await Promise.all(permissionPromises);
-
-        // Bounded wait for pending subagents: the CLI ended the turn before all
-        // subagent <task-notification> messages arrived. Real Claude awaits
-        // subagents before ending the turn; GLM/EricAI does not. Wait up to
-        // `pendingAgentWaitMs` (default 15s) for the remaining notifications —
-        // they often arrive within 1‑5s of the turn end. Only fall back to
-        // marking completed if the wait times out.
-        {
-          const pendingAgentsTmp = sessionPendingAgents.get(sessionId);
-          if (pendingAgentsTmp && pendingAgentsTmp.size > 0) {
-            const waitDeadline = Date.now() + pendingAgentWaitMs;
-            while (Date.now() < waitDeadline) {
-              const stillPending = sessionPendingAgents.get(sessionId);
-              if (!stillPending || stillPending.size === 0) break;
-              // eslint-disable-next-line no-await-in-loop
-              await new Promise(resolve => setTimeout(resolve, 500));
-            }
-          }
-        }
-
-        // Post-turn subagent flush. Subagents whose <task-notification>
-        // arrived mid-turn were already flipped to "completed" and removed
-        // from sessionPendingAgents by the user-event handler above. Anything
-        // STILL pending here means the CLI ended the turn (end_turn) before
-        // the subagent's result was injected back into the conversation —
-        // i.e. a premature end_turn (observed with GLM/EricAI; real Claude
-        // awaits subagents before ending the turn). Mark this "completed" as
-        // a fallback so the UI spinner doesn't hang forever, and log the
-        // anomaly so the lost result is visible: the main agent lacks the
-        // subagent's output and may need a follow-up ("go on") to retrieve it
-        // — at which point the <task-notification> lands and is matched there.
-        const pendingAgents = sessionPendingAgents.get(sessionId);
-        if (pendingAgents && pendingAgents.size > 0) {
-          const pendingCount = pendingAgents.size;
-          logger.info(
-            `Turn ended with ${pendingCount} subagent(s) still pending ` +
-              `(no <task-notification> before end_turn) for session ${sessionId} ` +
-              `— marking completed as fallback; result was likely lost.`,
-          );
-          for (const info of pendingAgents.values()) {
-            connection
-              .sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "tool_call_update",
-                  toolCallId: info.acpCallId,
-                  status: "completed",
-                } as any,
-              })
-              .catch(() => {});
-          }
-          pendingAgents.clear();
-          sessionPendingAgents.delete(sessionId);
-
-          // ── Auto follow-up for late subagent results ────────────────────
-          // The turn ended before the subagent(s) reported back. The Claude
-          // CLI only injects a finished subagent's <task-notification> into
-          // the NEXT turn, so enqueue a synthetic steer that starts one — the
-          // main agent then sees the pending results and can incorporate them,
-          // instead of the results being silently lost until the user types
-          // "go on". Bounded by AUTO_FOLLOW_UP_CAP so an auto-follow-up turn
-          // that itself spawns subagents cannot cascade forever.
-          const count = autoFollowUpCount.get(sessionId) ?? 0;
-          if (count < AUTO_FOLLOW_UP_CAP) {
-            autoFollowUpCount.set(sessionId, count + 1);
-            const followUpText =
-              `[Auto] ${pendingCount} background subagent(s) finished after the turn ended. ` +
-              `Please incorporate their results (the <task-notification> blocks) and continue.`;
-
-            // Deliver the synthetic follow-up as its OWN turn, NOT via
-            // drainSteerQueue() on the shared queue. drainSteerQueue() drains
-            // the ENTIRE steer queue — and a user steer typed mid-turn (e.g.
-            // "deploy a2a" while the subagent was still pending) sits in that
-            // same queue, accepted by handleSteer because a prompt was still in
-            // flight. Consuming it here would fold the user's instruction into
-            // the synthetic "[Auto] incorporate results" turn, so the model
-            // answers the follow-up's framing first and the user's steer gets
-            // deprioritized / batched rather than running as its own clean turn.
-            //
-            // Instead: deliver ONLY followUpText directly (resume the session,
-            // the same as drainSteerQueue's non-slash path but scoped to one
-            // message). Any user steers already in the queue are left in place;
-            // the post-turn drain (below, at the end of runPrompt) delivers
-            // them as their own turns.
-            const claudeSidForFollowUp = store.getClaudeSessionId(sessionId);
-            if (claudeSidForFollowUp) {
-              // Echo the synthetic turn as a user chunk so the client shows it.
-              await connection
-                .sessionUpdate({
-                  sessionId,
-                  update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpText } } as any,
-                })
-                .catch(() => { /* non-fatal */ });
-              logger.info(
-                `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} delivering as its own turn ` +
-                  `for session ${sessionId} (user steers left for the post-turn drain).`,
-              );
-              permissionPromises.length = 0;
-              try {
-                ctxEstimator.addText(followUpText);
-                await runner.continueSessionStreaming(
-                  claudeSidForFollowUp,
-                  followUpText,
-                  onEvent,
-                  sessionId,
-                  modelOverride,
-                  effectiveEffort,
-                );
-                await Promise.all(permissionPromises);
-              } catch (followUpErr) {
-                logger.error(
-                  `Auto follow-up turn failed for session ${sessionId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
-                );
-              }
-            } else {
-              // No Claude session to resume into (e.g. straight after /clear).
-              // Queue it so a later drain delivers it once a session exists.
-              if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
-              steerQueues.get(sessionId)!.push(followUpText);
-              logger.info(
-                `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued (no active session yet) for session ${sessionId}.`,
-              );
-            }
-          } else {
-            logger.info(
-              `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
-            );
-          }
-        }
-
-        // Post-turn normal-tool flush. Tools whose tool_result never arrived
-        // before end_turn (e.g. a tool_use emitted in the final assistant
-        // message with no following user/tool_result) would otherwise hang in
-        // in_progress forever. Mark them completed as a fallback.
-        // The turn has settled — its web-tool watchdogs can no longer fire
-        // meaningfully (the pending-tools map is about to be flushed), so
-        // clear them to keep no timer alive past the turn.
-        for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
-        webToolWatchdogs.delete(sessionId);
-        const pendingTools = sessionPendingTools.get(sessionId);
-        if (pendingTools && pendingTools.size > 0) {
-          logger.info(
-            `Turn ended with ${pendingTools.size} tool(s) still pending ` +
-              `(no tool_result before end_turn) for session ${sessionId} ` +
-              `— marking completed as fallback.`,
-          );
-          for (const acpCallId of pendingTools.values()) {
-            connection
-              .sessionUpdate({
-                sessionId,
-                update: {
-                  sessionUpdate: "tool_call_update",
-                  toolCallId: acpCallId,
-                  status: "completed",
-                } as any,
-              })
-              .catch(() => {});
-          }
-          pendingTools.clear();
-          sessionPendingTools.delete(sessionId);
-        }
-
-        // Check if this session was cancelled while running
-        if (cancelledSessions.has(sessionId)) {
-          cancelledSessions.delete(sessionId);
-          logger.info(`Prompt cancelled for session ${sessionId}`);
-          return { stopReason: "cancelled" };
-        }
-
-        // Send session_info_update with updatedAt
-        store.touch(sessionId);
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "session_info_update",
-            updatedAt: store.getUpdatedAt(sessionId),
-          } as any,
-        });
-
-       logger.info(`Prompt completed for session ${sessionId}`);
-
-        // Drain any steers queued during this turn (see drainSteerQueue).
-        await drainSteerQueue();
-
-        // ─── Auto-compact check ───────────────────────────────────────────
-        // Uses the same threshold Claude Code CLI computes (context window,
-        // output-token reserve, 13k buffer and CLAUDE_AUTOCOMPACT_PCT_OVERRIDE),
-        // and honors the CLI's DISABLE_AUTO_COMPACT / DISABLE_COMPACT switches,
-        // so enabling or tuning compaction in one place affects both layers.
-        const lastUsageEntry = sessionLastUsage.get(sessionId);
-        if (lastUsageEntry && isAutoCompactEnabled()) {
-          const threshold = getAutoCompactThreshold(effectiveModel);
-          const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
-          if (used >= threshold) {
-            logger.info(
-              `Auto-compact triggered for session ${sessionId}: ${used} >= ${threshold} (effectiveWindow=${getEffectiveContextWindowSize(effectiveModel)}, contextWindow=${getContextWindowForModel(effectiveModel)})`,
-            );
-            // The compaction notice is emitted by doCompact as a dedicated
-            // `_meta.contextCompaction` lifecycle, not as assistant text. An
-            // agent_message_chunk here would be appended to the reply that just
-            // streamed (vscode-acp only treats compaction text as standalone
-            // when nothing is mid-stream), which is exactly the concatenated,
-            // never-dismissed notice this replaces.
-           // skipCompleted=true: emit "start" now, but defer "completed" until
-           // AFTER the continuation finishes. This keeps the client's
-           // isCompacting=true and "Compacting..." spinner visible while the
-           // continuation streams, so the 400ms flush timer doesn't race with
-           // continuation events and the history wipe happens at the right time.
-           const compactResult = await doCompact(
-             sessionId,
-             connection,
-             runner,
-             store,
-             modelOverride,
-             effectiveEffort,
-             false, // no "No conversation to compact yet." text for auto-compact
-             true,  // skipCompleted — emit "completed" after continuation
-           ) as { compactionId: string; summary: string } | false;
-           // try/finally: the continuation below can throw (Claude CLI error, aborted
-           // turn). The deferred "completed" used to sit after it, so a throw left the
-           // lifecycle stuck at "start" and the client kept a "Compacting
-           // conversation..." banner for the rest of the session.
-           try {
-             // After compaction, re-send the original user prompt so the LLM
-             // continues the task in the fresh (compacted) session. This matches
-             // Codex behavior where compaction is transparent to the user — the
-             // task continues automatically after context is compressed.
-             logger.info(`Re-sending original prompt after auto-compact for session ${sessionId}`);
-             const claudeSid = store.getClaudeSessionId(sessionId);
-             if (claudeSid) {
-               // Frame the continuation prompt so the model knows it is resuming
-               // after a context compaction. Without this framing, the fresh
-               // session (which only has the summary) can hallucinate tool
-               // results as text ("ReadResult(file_path=...placeholder)...")
-               // because it lost the conversation context and tries to simulate
-               // prior tool calls it doesn't actually have results for. Preserve
-               // accompanying images (if any) when re-sending the prompt.
-               const continueFraming = `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
-               const continueContent = [
-                 { type: "text" as const, text: continueFraming },
-                 ...(hasImages ? promptImages : []),
-               ];
-               const continueResult = hasImages
-                 ? await runner.continueSessionStreamingWithContent(
-                     claudeSid,
-                     continueContent,
-                     onEvent,
-                     sessionId,
-                     modelOverride,
-                     effectiveEffort,
-                   )
-                 : await runner.continueSessionStreaming(
-                     claudeSid,
-                     continueFraming,
-                     onEvent,
-                     sessionId,
-                     modelOverride,
-                     effectiveEffort,
-                   );
-               store.setClaudeSessionId(sessionId, continueResult.sessionId);
-               await Promise.all(permissionPromises);
-               // Update usage after continuation
-               const contEstimate = ctxEstimator.getEstimatedTokens();
-               const contContextWindow = getContextWindowForModel(effectiveModel);
-               sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
-               await connection.sessionUpdate({
-                 sessionId,
-                 update: {
-                   sessionUpdate: "usage_update",
-                   used: Math.min(contEstimate, contContextWindow),
-                   size: contContextWindow,
-                 } as any,
-               }).catch(() => {});
-             }
-           } finally {
-             // Emit "completed" now the continuation is over — successfully or
-             // not. On success the client can safely flush (wipe old history,
-             // show the compact notice, drain buffered continuation chunks into
-             // the fresh panel); on failure it at least stops showing
-             // "Compacting conversation..." forever.
-             if (compactResult && typeof compactResult === 'object') {
-               await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
-             }
-           }
-         }
-        }
-
-        // Compaction (manual /compact via dispatchSlashCommand above, or the
-        // auto-compact just run) performs its own LLM calls, during which a
-        // prompt is still in flight — so handleSteer keeps accepting steers.
-        // Drain them now instead of leaving them queued until the next user
-        // prompt. This mirrors the vscode-acp client, which holds its own
-        // message queue while `isCompacting` and drains it once compaction
-        // finishes. No-op when nothing was queued.
-        await drainSteerQueue();
-
-        // If Claude CLI reported an error result (e.g. error_max_turns — the
-        // model hit the turn ceiling mid-task), surface it to the user as an
-        // agent message instead of a silent end_turn. This is what makes a
-        // genuinely premature stop distinguishable from a normal one; codex-acp
-        // does the same by mapping upstream failures to a visible error.
-        if (turnErrored) {
-          const reason = turnStopReason ?? "error";
-          await connection.sessionUpdate({
-            sessionId,
-            update: {
-              sessionUpdate: "agent_message_chunk",
-              content: {
-                type: "text",
-                text:
-                  reason === "error_max_turns"
-                    ? `Reached the maximum number of turns (${reason}) before finishing. The task may be incomplete — continue to resume.`
-                    : `Turn ended with status: ${reason}.`,
-              },
-              messageId: nextCommandMessageId(),
-              // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
-              // Without this marker a client cannot tell command output from the
-              // assistant's own text, so vscode-acp's compact mode folded it into the
-              // running turn's collapsed block instead of showing it beside the command.
-              _meta: { commandOutput: true },
-            },
-         }).catch(() => {});
-       }
-      // Account token usage and elapsed time toward the active goal.
-      const _activeGoal = sessionGoals.get(sessionId);
-      if (_activeGoal && !_activeGoal.paused) {
-        const _lu = lastUsage as any;
-        const _turnTokens = _lu
-          ? (_lu.input_tokens ?? 0) + (_lu.output_tokens ?? 0)
-          : 0;
-        const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
-        _activeGoal.tokensUsed += _turnTokens;
-        _activeGoal.timeUsedSeconds += _turnElapsed;
-        await publishGoalSnapshot(sessionId, connection);
-      }
-      saveSessionSlot(sessionId);
-      return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
-    } catch (err) {
-      // The turn is unwinding (cancel or failure) — no watchdog may fire
-      // against tools the post-turn flush is about to settle.
-      for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
-      webToolWatchdogs.delete(sessionId);
-      // Check if cancelled
-      if (cancelledSessions.has(sessionId)) {
-        cancelledSessions.delete(sessionId);
-        logger.info(`Prompt cancelled for session ${sessionId}`);
-        // Account partial turn usage toward goal budget.
-        const _cancelledGoal = sessionGoals.get(sessionId);
-        const _clu = lastUsage as any;
-        if (_cancelledGoal && !_cancelledGoal.paused && _clu) {
-          const _turnTokens = (_clu.input_tokens ?? 0) + (_clu.output_tokens ?? 0);
-          const _turnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
-          _cancelledGoal.tokensUsed += _turnTokens;
-          _cancelledGoal.timeUsedSeconds += _turnElapsed;
-          void publishGoalSnapshot(sessionId, connection).catch(() => {});
-        }
-        // A cancelled turn still leaves the full prompt prefix in the slot's
-        // KV — persisting it lets the next resume skip the cold prefill even
-        // though this turn never completed.
-        saveSessionSlot(sessionId);
-        return { stopReason: "cancelled" };
-      }
-
-        const message =
-          err instanceof Error ? err.message : String(err);
-        logger.error(`Prompt failed for session ${sessionId}: ${message}`);
-
-        // Send error as agent message so client sees it
-        await connection.sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: {
-              type: "text",
-              text: `Error: ${message}`,
-            },
-            messageId: nextCommandMessageId(),
-            // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
-            // Without this marker a client cannot tell command output from the
-            // assistant's own text, so vscode-acp's compact mode folded it into the
-            // running turn's collapsed block instead of showing it beside the command.
-            _meta: { commandOutput: true },
-          },
-        });
-
-        return { stopReason: "end_turn" };
-      }
-      }; // end runPrompt
-
-      // Chain on the per-session lock so this prompt waits for any in-flight
-      // one. We always replace the lock with the new chain (success or
-      // failure) so a rejected prior prompt never blocks the next forever.
       const prev = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
-      const next = prev.then(runPrompt, runPrompt);
-      // Clear the in-flight flag once runPrompt settles (success or failure).
+      const next = prev.then(
+        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages),
+        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages)
+      );
+      // Clear the in-flight flag once executePrompt settles (success or failure).
       // If a newer prompt queued behind this one has already re-added the flag
       // by the time this fires, the delete is a harmless no-op on a re-added
       // entry — but ordering (this finally registered before the newer prompt's
-      // runPrompt runs) means this clears first, then the newer runPrompt
-      // re-adds, so the flag stays accurate.
+      // executePrompt runs) means this clears first, then the newer
+      // executePrompt re-adds, so the flag stays accurate.
       next.finally(() => sessionPromptInFlight.delete(sessionId));
       sessionPromptLocks.set(sessionId, next.catch(() => {}));
       return next;
@@ -5157,7 +5178,7 @@ export function createClaudeCodeAgent(
       // Discard steers that never reached the model.
       //
       // Claude CLI cannot inject mid-turn, so a steer waits in this queue until
-      // the main turn ends (drainSteerQueue). A cancel exits runPrompt BEFORE
+      // the main turn ends (drainSteerQueue). A cancel exits executePrompt BEFORE
       // that drain, so the steer used to survive and was delivered at the end of
       // the NEXT turn — reported as: queue two messages, "Send Now" the second,
       // both bubbles appear, and the last thing the model works on is the first
