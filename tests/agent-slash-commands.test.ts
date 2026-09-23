@@ -26,6 +26,19 @@ let capturedOnEvent: ((e: any) => void) | null = null;
 // startSessionStreaming / continueSessionStreaming) so slash-command tests can
 // assert the constructed prompt reaches the model.
 let capturedPrompt: string | null = null;
+// When true, the FIRST startSessionStreaming/continueSessionStreaming call
+// emits a Task (subagent) tool_use with no <task-notification> and ends the
+// turn — the premature-end_turn case (subagent still pending at end_turn).
+// Subsequent calls (the auto-follow-up turn, the post-turn steer drain) emit a
+// normal result. Lets a test drive the auto-follow-up + steer-drain ordering.
+// steerToInject is fired synchronously from within onEvent (guaranteeing a
+// prompt is in flight) so the test doesn't depend on a 0ms timer race.
+let emitPendingSubagentOnce = false;
+let steerToInject: { text: string } | null = null;
+// Set by the test so the fixture's queueMicrotask steer can reach the real
+// agent's extNotification with the right session id.
+let capturedAgentRef: any = null;
+let capturedSessionRef: string | null = null;
 
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
@@ -41,6 +54,29 @@ vi.mock("../src/claude-runner.js", () => {
       async (_cwd: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
         capturedPrompt = _prompt;
+        // Premature-end_turn fixture: emit a subagent (Task) tool_use with no
+        // <task-notification>, so the turn ends with the subagent still
+        // pending. Consumed once, then the auto-follow-up / steer-drain turns
+        // below take the normal path. If steerToInject is set, fire it
+        // synchronously from within onEvent — guaranteeing a prompt is in
+        // flight when handleSteer runs (no 0ms timer race).
+        if (emitPendingSubagentOnce) {
+          emitPendingSubagentOnce = false;
+          onEvent({ type: "tool_use", toolName: "Task", toolInput: { description: "investigate", subagent_type: "general-purpose" }, toolUseId: "tu_subagent" });
+          onEvent({ type: "assistant", apiCallIndex: 0 });
+          if (steerToInject) {
+            const s = steerToInject;
+            steerToInject = null;
+            // Fire the steer on the NEXT microtask so the tool_use handler has
+            // registered the pending subagent, but still during this prompt
+            // (which is in flight).
+            queueMicrotask(() => {
+              (capturedAgentRef as any)?.extNotification("session/steer", { sessionId: capturedSessionRef, text: s.text });
+            });
+          }
+          onEvent({ type: "result", stopReason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } });
+          return { text: "", sessionId: "claude-uuid-abc" };
+        }
         // Sentinel prompt to simulate a Claude CLI error result (e.g. the
         // model hit the turn ceiling). Used by the error-surfacing test.
         if (_prompt === "__error_max_turns__") {
@@ -76,6 +112,16 @@ vi.mock("../src/claude-runner.js", () => {
       async (_sessionId: string, _prompt: string, onEvent: (e: any) => void) => {
         capturedOnEvent = onEvent;
         capturedPrompt = _prompt;
+        // Premature-end_turn fixture (mirrors startSessionStreaming): emit a
+        // subagent tool_use with no <task-notification> so the turn ends with
+        // the subagent still pending. Consumed once.
+        if (emitPendingSubagentOnce) {
+          emitPendingSubagentOnce = false;
+          onEvent({ type: "tool_use", toolName: "Task", toolInput: { description: "investigate", subagent_type: "general-purpose" }, toolUseId: "tu_subagent" });
+          onEvent({ type: "assistant", apiCallIndex: 0 });
+          onEvent({ type: "result", stopReason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } });
+          return { text: "", sessionId: "claude-uuid-abc" };
+        }
         // Sentinel prompt to simulate a Claude CLI `local` command result
         // (/heapdump, /context): the CLI services it itself with no LLM turn,
         // returning the output as the `result` of a single `result` event with
@@ -93,6 +139,10 @@ vi.mock("../src/claude-runner.js", () => {
       }
     );
     this.cancel = vi.fn();
+    // handleSteer checks whether a turn is active; report idle (the agent's
+    // own sessionPromptInFlight set is the authoritative in-flight signal for
+    // the steer-queueing decision, so a false here is fine for the test).
+    this.isRunning = vi.fn().mockReturnValue(false);
   });
   return { ClaudeRunner: MockClaudeRunner };
 });
@@ -104,6 +154,11 @@ function createMockConnection(): AgentSideConnection {
     readTextFile: vi.fn(),
     writeTextFile: vi.fn(),
     createTerminal: vi.fn(),
+    // Custom extension methods. The agent's real extNotification handles
+    // session/steer; these mocks exist only so the AgentSideConnection shape
+    // is complete for the tests that don't drive them.
+    extMethod: vi.fn().mockResolvedValue({}),
+    extNotification: vi.fn().mockResolvedValue(undefined),
     signal: new AbortController().signal,
     closed: new Promise(() => {}),
   } as unknown as AgentSideConnection;
@@ -540,6 +595,62 @@ describe("slash commands & estimator", () => {
     // restore default mocks for other tests
     readdirSync.mockImplementation(() => []);
     readFileSync.mockImplementation(() => "{}");
+  });
+
+  it("a mid-turn user steer is NOT consumed by the premature-end_turn auto-follow-up", async () => {
+    // Regression for the "deploy a2a" collision: a turn ends with a subagent
+    // still pending (premature end_turn). The adapter enqueues a synthetic
+    // "[Auto] …incorporate results…" follow-up. Previously it called
+    // drainSteerQueue() which drained the ENTIRE steer queue — folding any
+    // user steer typed mid-turn (e.g. "deploy a2a") into that synthetic turn
+    // instead of letting it run as its own clean turn.
+    //
+    // Fixture: the first prompt emits a Task (subagent) tool_use with no
+    // <task-notification> and ends the turn (subagent pending). During the
+    // turn we fire a steer (session/steer) that handleSteer queues because a
+    // prompt is in flight. The auto-follow-up must deliver ONLY its own
+    // synthetic message as a turn; the user's steer must be delivered as a
+    // SEPARATE turn by the post-turn drain.
+    // Use a near-zero subagent wait (the production default is 15s, which
+    // would blow the 5s vitest timeout during the bounded end_turn wait).
+    agent = createClaudeCodeAgent(conn, { pendingAgentWaitMs: 1 });
+    const sid = await newSession();
+    capturedAgentRef = agent;
+    capturedSessionRef = sid;
+    emitPendingSubagentOnce = true;
+    // The fixture fires this steer from within onEvent (mid-turn), so a prompt
+    // is in flight when handleSteer queues it — no 0ms timer race.
+    steerToInject = { text: "deploy a2a" };
+    await agent.prompt({ sessionId: sid, prompt: [{ type: "text", text: "research" }] });
+
+    // Let the queueMicrotask'd steer + the post-turn drain settle.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // The prompts forwarded to the runner (2nd arg of the streaming calls),
+    // in order. The auto-follow-up delivers its synthetic message itself; the
+    // post-turn drain delivers the user steer. Both must appear, and the user
+    // steer must be its OWN turn (framed as a follow-up), NOT merged into the
+    // auto-follow-up's synthetic text.
+    const forwarded = ((conn as any).__forwardedPrompts ?? []);
+    // Fallback: capture via the module-level capturedPrompt is not per-call,
+    // so instead assert on the sessionUpdate user_message_chunk echoes, which
+    // the drain + follow-up each emit for the message they send.
+    const userChunks = ((conn as any).sessionUpdate as any).mock.calls
+      .map((c: any) => c[0]?.update)
+      .filter((u: any) => u?.sessionUpdate === "user_message_chunk")
+      .map((u: any) => u.content.text);
+
+    // The auto-follow-up synthetic message was delivered as its own turn.
+    expect(userChunks.some((t: string) => t.startsWith("[Auto] 1 background subagent(s) finished"))).toBe(true);
+    // The user steer was delivered as its OWN turn, framed as a follow-up —
+    // i.e. it was NOT absorbed into the synthetic follow-up's prompt.
+    expect(userChunks.some((t: string) => t.includes("deploy a2a"))).toBe(true);
+
+    // And crucially: the user steer's forwarded prompt is the framed
+    // "[Follow-up instruction from user] …" text, distinct from the synthetic
+    // follow-up — proving two separate turns ran.
+    expect(userChunks.filter((t: string) => t.includes("deploy a2a")).length).toBe(1);
+    void forwarded;
   });
 });
 

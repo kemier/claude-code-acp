@@ -4661,14 +4661,61 @@ export function createClaudeCodeAgent(
             const followUpText =
               `[Auto] ${pendingCount} background subagent(s) finished after the turn ended. ` +
               `Please incorporate their results (the <task-notification> blocks) and continue.`;
-            if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
-            steerQueues.get(sessionId)!.push(followUpText);
-            logger.info(
-              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued for session ${sessionId} ` +
-                `to retrieve ${pendingCount} late subagent result(s).`,
-            );
-            // Deliver it immediately (starts a new turn via continueSessionStreaming).
-            await drainSteerQueue();
+
+            // Deliver the synthetic follow-up as its OWN turn, NOT via
+            // drainSteerQueue() on the shared queue. drainSteerQueue() drains
+            // the ENTIRE steer queue — and a user steer typed mid-turn (e.g.
+            // "deploy a2a" while the subagent was still pending) sits in that
+            // same queue, accepted by handleSteer because a prompt was still in
+            // flight. Consuming it here would fold the user's instruction into
+            // the synthetic "[Auto] incorporate results" turn, so the model
+            // answers the follow-up's framing first and the user's steer gets
+            // deprioritized / batched rather than running as its own clean turn.
+            //
+            // Instead: deliver ONLY followUpText directly (resume the session,
+            // the same as drainSteerQueue's non-slash path but scoped to one
+            // message). Any user steers already in the queue are left in place;
+            // the post-turn drain (below, at the end of runPrompt) delivers
+            // them as their own turns.
+            const claudeSidForFollowUp = store.getClaudeSessionId(sessionId);
+            if (claudeSidForFollowUp) {
+              // Echo the synthetic turn as a user chunk so the client shows it.
+              await connection
+                .sessionUpdate({
+                  sessionId,
+                  update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpText } } as any,
+                })
+                .catch(() => { /* non-fatal */ });
+              logger.info(
+                `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} delivering as its own turn ` +
+                  `for session ${sessionId} (user steers left for the post-turn drain).`,
+              );
+              permissionPromises.length = 0;
+              try {
+                ctxEstimator.addText(followUpText);
+                await runner.continueSessionStreaming(
+                  claudeSidForFollowUp,
+                  followUpText,
+                  onEvent,
+                  sessionId,
+                  modelOverride,
+                  effectiveEffort,
+                );
+                await Promise.all(permissionPromises);
+              } catch (followUpErr) {
+                logger.error(
+                  `Auto follow-up turn failed for session ${sessionId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
+                );
+              }
+            } else {
+              // No Claude session to resume into (e.g. straight after /clear).
+              // Queue it so a later drain delivers it once a session exists.
+              if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
+              steerQueues.get(sessionId)!.push(followUpText);
+              logger.info(
+                `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued (no active session yet) for session ${sessionId}.`,
+              );
+            }
           } else {
             logger.info(
               `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
