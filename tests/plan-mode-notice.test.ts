@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "../src/plan-mode-notice.js";
+import { buildMidTurnModeChangeNotice, shouldAnnounceModeChange } from "../src/plan-mode-notice.js";
 
 /**
  * Switching out of plan mode mid-turn was invisible to the running turn: the
@@ -12,15 +12,20 @@ import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "../src/plan
  */
 describe("collaboration mode change mid-turn", () => {
   it("the leaving notice tells the model to implement in the same turn", () => {
-    const notice = buildPlanModeChangeNotice(false);
-    expect(notice).toContain("Plan mode is now OFF");
+    const notice = buildMidTurnModeChangeNotice(false);
+    // Framed as a fresh <collaboration_mode> developer block (the authoritative
+    // channel) — a bare user-level notice can't override the Plan-mode
+    // instruction already in the running turn's context.
+    expect(notice).toContain("<collaboration_mode># Collaboration Mode: Default");
+    expect(notice).toContain("no longer active");
     expect(notice).toMatch(/THIS turn/);
     expect(notice).toMatch(/do not wait for another turn/);
+    expect(notice).toContain("you may read and edit the codebase and execute commands again");
   });
 
   it("the entering notice stops changes", () => {
-    const notice = buildPlanModeChangeNotice(true);
-    expect(notice).toContain("Plan mode is now ON");
+    const notice = buildMidTurnModeChangeNotice(true);
+    expect(notice).toContain("<collaboration_mode># Collaboration Mode: Plan");
     expect(notice).toContain("no file edits");
   });
 
@@ -37,7 +42,7 @@ describe("collaboration mode change mid-turn", () => {
     const body = src.slice(idx, idx + 2200);
     // Same in-flight test handleSteer uses.
     expect(body).toContain("runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId)");
-    expect(body).toContain("buildPlanModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE)");
+    expect(body).toContain("buildMidTurnModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE)");
     expect(body).toContain("shouldAnnounceModeChange(previousCollabMode, nextCollab)");
   });
 });

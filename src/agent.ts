@@ -27,7 +27,7 @@ import {
   type ToolCallLocation,
 } from "@agentclientprotocol/sdk";
 import { SessionStore, type SessionInfo } from "./session-store.js";
-import { buildPlanModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
+import { buildMidTurnModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
 import { ClaudeRunner, isProxyBaseUrl, type StreamEvent } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
@@ -3526,7 +3526,7 @@ export function createClaudeCodeAgent(
           }
           steerQueues
             .get(sessionId)!
-            .push(buildPlanModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE));
+            .push(buildMidTurnModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE));
           logger.info(`Session ${sessionId} mode change announced to the running turn`);
         }
       } else {
