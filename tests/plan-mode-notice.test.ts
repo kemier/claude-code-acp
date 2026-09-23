@@ -34,11 +34,11 @@ describe("collaboration mode change mid-turn", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
     const idx = src.indexOf("} else if (configId === COLLABORATION_MODE_CONFIG_ID) {");
     expect(idx).toBeGreaterThan(0);
-    const body = src.slice(idx, idx + 1600);
+    const body = src.slice(idx, idx + 2200);
     // Same in-flight test handleSteer uses.
     expect(body).toContain("runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId)");
-    expect(body).toContain("buildPlanModeChangeNotice(value === PLAN_COLLABORATION_MODE)");
-    expect(body).toContain("shouldAnnounceModeChange(previousCollabMode, value)");
+    expect(body).toContain("buildPlanModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE)");
+    expect(body).toContain("shouldAnnounceModeChange(previousCollabMode, nextCollab)");
   });
 });
 

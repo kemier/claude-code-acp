@@ -211,6 +211,54 @@ async function enterPlanMode(
   }
 }
 
+/**
+ * Apply a user-initiated permission-mode change (the Mode picker) and tell the
+ * client, keeping every surface consistent:
+ *
+ *   - store.mode            → persists across restarts + drives buildConfigOptions
+ *   - runner perm mode      → the --permission-mode the next claude -p spawn gets
+ *                              (WITHOUT this the picker flip only took effect on
+ *                              the next turn, and an in-flight turn kept its old
+ *                              flags)
+ *   - collaboration mode    → the two pickers flip in lockstep (read-only ↔ plan)
+ *   - current_mode_update   → legacy `modes` display + permission picker label
+ *   - config_option_update  → fresh configOptions so the config pickers re-render
+ *
+ * The model-initiated path (EnterPlanMode/ExitPlanMode) routes through
+ * enterPlanMode/leavePlanMode, which do the same state writes with their own
+ * no-op guards; this is the USER-initiated path that was previously missing the
+ * runner sync and the current_mode_update — the reason flipping the Mode picker
+ * to "Read-only" appeared to do nothing.
+ */
+async function applyModeChange(
+  sessionId: string,
+  connection: { sessionUpdate: (p: any) => Promise<unknown> },
+  store: SessionStore,
+  runner?: { setSessionPermissionMode: (m: string | null) => void },
+  modeId?: string,
+): Promise<void> {
+  const mode = modeId ?? store.getMode(sessionId) ?? DEFAULT_MODE;
+  // read-only ⇔ plan are the two halves of "plan mode": flipping one flips the
+  // other so the permission and collaboration pickers never disagree.
+  const collab = mode === "read-only" ? PLAN_COLLABORATION_MODE : DEFAULT_COLLABORATION_MODE;
+  sessionCollaborationModes.set(sessionId, collab);
+  store.setMode(sessionId, mode);
+  runner?.setSessionPermissionMode(mode);
+  logger.info(`Session ${sessionId} mode change applied: ${mode} (collab ${collab})`);
+  try {
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "current_mode_update", currentModeId: mode } as any,
+    });
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
+    });
+  } catch {
+    /* non-fatal — the next turn still syncs the runner from store.getMode() */
+  }
+}
+
 function buildModeState(currentModeId: string) {
   return {
     availableModes: AVAILABLE_MODES,
@@ -3415,17 +3463,11 @@ export function createClaudeCodeAgent(
         );
       }
 
-      store.setMode(sessionId, modeId);
-      logger.info(`Session ${sessionId} mode set to ${modeId}`);
-
-      // Send current_mode_update notification
-      await connection.sessionUpdate({
-        sessionId,
-        update: {
-          sessionUpdate: "current_mode_update",
-          currentModeId: modeId,
-        } as any,
-      });
+      // Route through applyModeChange so the legacy set_mode path also syncs the
+      // runner's --permission-mode and flips the collaboration picker in
+      // lockstep — previously it only wrote store.mode + emitted
+      // current_mode_update, leaving the runner on the previous turn's flags.
+      await applyModeChange(sessionId, connection, store, runner, modeId);
 
       return {};
     },
@@ -3443,27 +3485,40 @@ export function createClaudeCodeAgent(
 
       const value = (params as any).value;
 
-      // The mode picker (configId "mode") must write to the canonical
-      // session.mode field — every read site (buildConfigOptions, /status,
-      // loadSession) consults store.getMode(), not configOverrides["mode"].
-      // Routing it through setMode() keeps a single source of truth and makes
-      // the selection persist across agent restarts (setMode persists to disk;
-      // setConfigOverride would write configOverrides["mode"], which nothing
-      // reads back, so the picker would reset to the default after restart).
+      // The mode picker (configId "mode") and the collaboration picker
+      // (configId "collaboration_mode") are the two halves of plan mode and must
+      // flip in lockstep, AND both must harden the runner's spawn flag so the
+      // next claude -p process picks up --permission-mode plan. Routing both
+      // through applyModeChange keeps a single source of truth (store.mode) that
+      // persists across restarts (setMode persists to disk; setConfigOverride
+      // would write configOverrides["mode"], which nothing reads back, so the
+      // picker would reset to the default after restart), syncs the runner
+      // immediately, and emits both current_mode_update + config_option_update.
       if (configId === "mode") {
-        store.setMode(sessionId, String(value));
-        logger.info(`Session ${sessionId} config mode set to ${value}`);
+        await applyModeChange(sessionId, connection, store, runner, String(value));
       } else if (configId === COLLABORATION_MODE_CONFIG_ID) {
-        // Handle collaboration_mode specially (stored in separate map)
+        // Collaboration mode is the prompt-level half of plan mode; map it to
+        // the permission mode the runner enforces (plan → read-only, default →
+        // the session's previous non-read-only mode so we don't silently downgrade
+        // a full-access session to plain agent).
+        const nextCollab = String(value);
+        const targetMode =
+          nextCollab === PLAN_COLLABORATION_MODE
+            ? "read-only"
+            : (store.getMode(sessionId) ?? DEFAULT_MODE) === "read-only"
+              ? DEFAULT_MODE
+              : (store.getMode(sessionId) ?? DEFAULT_MODE);
+        // Capture the previous collaboration mode BEFORE applyModeChange overwrites
+        // it, so the mid-turn announcement (drained by the running turn) only
+        // fires on a genuine flip.
         const previousCollabMode = sessionCollaborationModes.get(sessionId);
-        sessionCollaborationModes.set(sessionId, value);
-        logger.info(`Session ${sessionId} collaboration_mode set to ${value}`);
+        await applyModeChange(sessionId, connection, store, runner, targetMode);
         // The <collaboration_mode> block is built when the prompt starts, so a
         // switch made DURING a turn was invisible to it: the model kept planning
         // and the user had to open a new turn to say "you are not in plan mode
         // now". Announce it on the steer queue, which the running turn drains.
         if (
-          shouldAnnounceModeChange(previousCollabMode, value) &&
+          shouldAnnounceModeChange(previousCollabMode, nextCollab) &&
           (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))
         ) {
           if (!steerQueues.has(sessionId)) {
@@ -3471,7 +3526,7 @@ export function createClaudeCodeAgent(
           }
           steerQueues
             .get(sessionId)!
-            .push(buildPlanModeChangeNotice(value === PLAN_COLLABORATION_MODE));
+            .push(buildPlanModeChangeNotice(nextCollab === PLAN_COLLABORATION_MODE));
           logger.info(`Session ${sessionId} mode change announced to the running turn`);
         }
       } else {

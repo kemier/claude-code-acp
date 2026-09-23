@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+// Load src/agent.ts for source-string assertions through an untransformed
+// .cjs loader (createRequire), because this file applies vi.mock("node:fs")
+// which stubs readFileSync for everything in the transformed module graph —
+// a named node:fs import here would be intercepted too. (See
+// tests/src-file-reader.cjs and agent-enter-plan-mode.test.ts, which avoids
+// the whole issue by not mocking node:fs.)
+import { readTextFile } from "./src-file-reader.cjs";
+import { resolve } from "node:path";
 import { createClaudeCodeAgent } from "../src/agent.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 
@@ -207,6 +215,55 @@ describe("Agent modes and config", () => {
       // ... and loadSession restores it (the field that was being lost).
       const loaded = await agent.loadSession!({ sessionId: session.sessionId });
       expect((loaded as any).modes.currentModeId).toBe("agent-full-access");
+    });
+
+    it("flips the collaboration picker to plan when the Mode picker goes read-only", async () => {
+      // Regression: the Mode picker (configId "mode") only wrote store.mode and
+      // pushed config_option_update — it never touched the collaboration picker or
+      // the runner's spawn flag. The two pickers (permission read-only and
+      // collaboration plan) are the two halves of the same plan mode, so flipping
+      // one must flip the other, or they disagree about whether plan mode is on.
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+      const result = await agent.setSessionConfigOption!({
+        sessionId: session.sessionId,
+        configId: "mode",
+        value: "read-only",
+      } as any);
+
+      const modeOpt = (result as any).configOptions.find((o: any) => o.id === "mode");
+      expect(modeOpt.currentValue).toBe("read-only");
+      const collab = (result as any).configOptions.find(
+        (o: any) => o.id === "collaboration_mode"
+      );
+      expect(collab.currentValue).toBe("plan");
+    });
+
+    it("routes Mode + collaboration flips through applyModeChange (syncs the runner)", () => {
+      // The behavioral test above can't reach the closure-scoped runner to assert
+      // the --permission-mode spawn flag was set; the source assertion below pins
+      // that both picker paths go through applyModeChange, the single site that
+      // calls runner.setSessionPermissionMode. Previously setSessionConfigOption
+      // wrote store.mode only, so the runner kept the previous turn's flags and
+      // the in-flight / next turn ran with acceptEdits + skip-permissions even
+      // though the picker said read-only.
+      const src = readTextFile(resolve(process.cwd(), "src/agent.ts"));
+      const idx = src.indexOf("async setSessionConfigOption(\n");
+      expect(idx).toBeGreaterThan(0);
+      const body = src.slice(idx, idx + 2400);
+      expect(body).toContain('applyModeChange(sessionId, connection, store, runner, String(value))');
+      expect(body).toContain("applyModeChange(sessionId, connection, store, runner, targetMode)");
+      // And applyModeChange itself syncs the runner's permission mode.
+      const helperIdx = src.indexOf("async function applyModeChange(");
+      expect(helperIdx).toBeGreaterThan(0);
+      const helperBody = src.slice(helperIdx, helperIdx + 1100);
+      expect(helperBody).toContain("runner?.setSessionPermissionMode(mode)");
+      expect(helperBody).toContain('sessionUpdate: "current_mode_update"');
     });
   });
 
