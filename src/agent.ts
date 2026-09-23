@@ -112,9 +112,16 @@ const sessionCollaborationModes = new Map<string, string>();
  * Leave Plan mode for `sessionId` and tell the client.
  *
  * Claude Code signals plan completion with its ExitPlanMode tool. `setSessionMode`
- * echoes client-initiated switches, so this is the only agent-initiated path; both
- * the stored mode and the `current_mode_update` / `config_option_update`
- * notifications are needed or the IDE picker keeps showing "Plan".
+ * echoes client-initiated switches, so this is the only agent-initiated path.
+ *
+ * Two independent pickers must both flip back:
+ *   - permission mode (store.mode, "agent"/"read-only") via current_mode_update
+ *   - collaboration mode (sessionCollaborationModes) via config_option_update
+ *
+ * `enterPlanMode` sets the permission mode to "read-only" when the model
+ * self-enters plan mode, so leaving must restore it to "agent" (full access) —
+ * otherwise the permission picker stays stuck on "Read-only" after the plan is
+ * approved and the model starts implementing.
  */
 async function leavePlanMode(
   sessionId: string,
@@ -125,11 +132,14 @@ async function leavePlanMode(
     return;
   }
   sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE);
+  // Plan mode is read-only by design; restoring full access so the model can
+  // implement the approved plan.
+  store.setMode(sessionId, DEFAULT_MODE);
   logger.info(`Session ${sessionId} left plan mode (ExitPlanMode)`);
   try {
     await connection.sessionUpdate({
       sessionId,
-      update: { sessionUpdate: "current_mode_update", currentModeId: DEFAULT_COLLABORATION_MODE } as any,
+      update: { sessionUpdate: "current_mode_update", currentModeId: DEFAULT_MODE } as any,
     });
     await connection.sessionUpdate({
       sessionId,
@@ -148,10 +158,19 @@ async function leavePlanMode(
  * (mirrors ericli's auto enter_plan_mode). Without mapping it the picker kept
  * reading "Default" while the model was actually planning — the user had no way
  * to see that plan mode was active until they flipped the picker themselves.
- * Both the stored collaboration mode and the `current_mode_update` /
- * `config_option_update` notifications are needed so the IDE picker flips to
- * "Plan" the moment the model self-enters, and the next prompt injects the
- * `<collaboration_mode>` Plan block (read-only investigation, no edits).
+ *
+ * Two independent pickers must both flip to "plan":
+ *   - permission mode → "read-only" (current_mode_update with a valid
+ *     AVAILABLE_MODES id + store.setMode so it persists and buildConfigOptions
+ *     reflects it)
+ *   - collaboration mode → "plan" (config_option_update "collaboration_mode")
+ *
+ * The old code sent currentModeId: "plan" here, but "plan" is not an id in
+ * AVAILABLE_MODES (which is read-only/agent/agent-full-access), so vscode-acp's
+ * availableModes.find() missed and the permission picker silently stayed on the
+ * previous mode. Sending "read-only" is the valid id that makes the picker
+ * flip to "Read-only" in lockstep with the collaboration picker flipping to
+ * "Plan".
  */
 async function enterPlanMode(
   sessionId: string,
@@ -164,11 +183,15 @@ async function enterPlanMode(
     return;
   }
   sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE);
+  // Plan mode is read-only: the model investigates and presents a plan but does
+  // not edit files or run commands. Switching the permission mode to "read-only"
+  // makes the IDE's permission picker reflect that (agent → read-only).
+  store.setMode(sessionId, "read-only");
   logger.info(`Session ${sessionId} entered plan mode (EnterPlanMode)`);
   try {
     await connection.sessionUpdate({
       sessionId,
-      update: { sessionUpdate: "current_mode_update", currentModeId: PLAN_COLLABORATION_MODE } as any,
+      update: { sessionUpdate: "current_mode_update", currentModeId: "read-only" } as any,
     });
     await connection.sessionUpdate({
       sessionId,

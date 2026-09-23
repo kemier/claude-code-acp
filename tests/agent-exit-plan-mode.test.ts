@@ -30,10 +30,17 @@ describe("ExitPlanMode", () => {
     expect(body).toContain("!== PLAN_COLLABORATION_MODE");
   });
 
-  it("tells the client so the picker leaves Plan", () => {
+  it("tells the client so both pickers leave Plan", () => {
     const idx = src.indexOf("async function leavePlanMode(");
-    const body = src.slice(idx, idx + 1600);
+    const body = src.slice(idx, idx + 2000);
+    // Permission picker: restore full access ("agent") so the model can
+    // implement the approved plan. current_mode_update carries a valid
+    // AVAILABLE_MODES id.
     expect(body).toContain('sessionUpdate: "current_mode_update"');
+    expect(body).toContain("currentModeId: DEFAULT_MODE");
+    expect(body).toContain("store.setMode(sessionId, DEFAULT_MODE)");
+    // Collaboration picker: flip "collaboration_mode" back to "default".
     expect(body).toContain('sessionUpdate: "config_option_update"');
+    expect(body).toContain("sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE)");
   });
 });

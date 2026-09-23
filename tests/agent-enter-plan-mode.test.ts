@@ -32,12 +32,20 @@ describe("EnterPlanMode", () => {
     expect(body).toContain("=== PLAN_COLLABORATION_MODE");
   });
 
-  it("tells the client so the picker enters Plan", () => {
+  it("tells the client so both pickers enter Plan", () => {
     const idx = src.indexOf("async function enterPlanMode(");
-    const body = src.slice(idx, idx + 1600);
+    const body = src.slice(idx, idx + 2000);
+    // Permission picker: current_mode_update must carry a valid AVAILABLE_MODES
+    // id ("read-only"), not the collaboration id "plan" (which isn't in
+    // AVAILABLE_MODES, so availableModes.find() would miss and the picker would
+    // silently stay on the previous mode). store.setMode persists it.
     expect(body).toContain('sessionUpdate: "current_mode_update"');
-    expect(body).toContain("currentModeId: PLAN_COLLABORATION_MODE");
+    expect(body).toContain('currentModeId: "read-only"');
+    expect(body).toContain('store.setMode(sessionId, "read-only")');
+    // Collaboration picker: config_option_update flips "collaboration_mode"
+    // to "plan".
     expect(body).toContain('sessionUpdate: "config_option_update"');
+    expect(body).toContain("sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE)");
   });
 
   it("default mode prompts the model it may self-enter Plan mode", () => {
