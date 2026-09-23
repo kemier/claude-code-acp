@@ -79,7 +79,9 @@ vi.mock("../src/claude-runner.js", () => {
         }
         // Sentinel prompt to simulate a Claude CLI error result (e.g. the
         // model hit the turn ceiling). Used by the error-surfacing test.
-        if (_prompt === "__error_max_turns__") {
+        // The adapter prepends a <collaboration_mode> block to every default-mode
+        // prompt, so match on the sentinel being a suffix, not an exact match.
+        if (_prompt === "__error_max_turns__" || _prompt.endsWith("__error_max_turns__")) {
           onEvent({
             type: "result",
             usage: { input_tokens: 10, output_tokens: 5 },
@@ -94,7 +96,8 @@ vi.mock("../src/claude-runner.js", () => {
         // no stop reason and no usage (see processSlashCommand case 'local' →
         // { shouldQuery:false, resultText }). The adapter must surface that
         // text as a commandOutput row instead of dropping it.
-        if (_prompt === "/heapdump" || _prompt === "/context") {
+        // (Suffix match: the adapter prepends the <collaboration_mode> block.)
+        if (_prompt === "/heapdump" || _prompt.endsWith("/heapdump") || _prompt === "/context" || _prompt.endsWith("/context")) {
           onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
@@ -128,7 +131,8 @@ vi.mock("../src/claude-runner.js", () => {
         // no stop reason and no usage (see processSlashCommand case 'local' →
         // { shouldQuery:false, resultText }). The adapter must surface that
         // text as a commandOutput row instead of dropping it.
-        if (_prompt === "/heapdump" || _prompt === "/context") {
+        // (Suffix match: the adapter prepends the <collaboration_mode> block.)
+        if (_prompt === "/heapdump" || _prompt.endsWith("/heapdump") || _prompt === "/context" || _prompt.endsWith("/context")) {
           onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
@@ -338,11 +342,14 @@ describe("slash commands & estimator", () => {
       .filter((c: any) => c[0]?.update?.sessionUpdate === "usage_update")
       .map((c: any) => c[0].update.used as number);
     const used: number = usedValues[usedValues.length - 1];
-    // This mock emits no `message.usage`, so the character fallback applies:
-    // ceil((72748 overhead + 5 for "hello" + 9 for " streamed") / 3) = 24254.
-    // Counting " streamed" twice would yield 24257, so an exact match proves
+    // This mock emits no `message.usage`, so the character fallback applies.
+    // The adapter prepends the <collaboration_mode> Default-mode block (182
+    // chars) to every default-mode prompt, so the counted prompt is
+    // block + "hello" + " streamed":
+    // ceil((72748 overhead + 182 block + 5 for "hello" + 9 for " streamed") / 3) = 24436.
+    // Counting " streamed" twice would yield 24437, so an exact match proves
     // the assistant text is counted once.
-    expect(used).toBe(24254);
+    expect(used).toBe(24436);
   });
 
   it("prefers real per-call token usage over the character estimate", async () => {

@@ -140,6 +140,45 @@ async function leavePlanMode(
   }
 }
 
+/**
+ * Enter Plan mode for `sessionId` and tell the client.
+ *
+ * Mirror of {@link leavePlanMode}. The Claude CLI exposes a native EnterPlanMode
+ * tool the model calls when it decides a task needs planning before acting
+ * (mirrors ericli's auto enter_plan_mode). Without mapping it the picker kept
+ * reading "Default" while the model was actually planning — the user had no way
+ * to see that plan mode was active until they flipped the picker themselves.
+ * Both the stored collaboration mode and the `current_mode_update` /
+ * `config_option_update` notifications are needed so the IDE picker flips to
+ * "Plan" the moment the model self-enters, and the next prompt injects the
+ * `<collaboration_mode>` Plan block (read-only investigation, no edits).
+ */
+async function enterPlanMode(
+  sessionId: string,
+  connection: { sessionUpdate: (p: any) => Promise<unknown> },
+  store: SessionStore,
+): Promise<void> {
+  if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) === PLAN_COLLABORATION_MODE) {
+    // Already in plan mode — the model re-called EnterPlanMode (e.g. after a
+    // sub-turn). Nothing to do; re-emitting would be a redundant picker update.
+    return;
+  }
+  sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE);
+  logger.info(`Session ${sessionId} entered plan mode (EnterPlanMode)`);
+  try {
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "current_mode_update", currentModeId: PLAN_COLLABORATION_MODE } as any,
+    });
+    await connection.sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
+    });
+  } catch {
+    /* non-fatal — the next turn still injects the plan-mode preamble */
+  }
+}
+
 function buildModeState(currentModeId: string) {
   return {
     availableModes: AVAILABLE_MODES,
@@ -3536,6 +3575,15 @@ export function createClaudeCodeAgent(
       const collabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
       if (collabMode === PLAN_COLLABORATION_MODE) {
         effectivePrompt = `<collaboration_mode># Collaboration Mode: Plan\n\nYou are now in Plan mode. Any previous instructions for other modes (e.g. Default mode) are no longer active.\n\nYour active mode changes only when new developer instructions with a different \`<collaboration_mode>...</collaboration_mode>\` change it; user requests or tool descriptions do not change mode by themselves.\n\nIn Plan mode, you MUST NOT make any changes to the codebase. Instead, analyze the request, investigate the codebase, and produce a detailed plan. Do not execute commands that modify files. Read-only investigation (searching, reading files, running read-only commands) is allowed.\n</collaboration_mode>\n\n${effectivePrompt}`;
+      } else {
+        // Default mode: tell the model it MAY self-enter Plan mode on complex
+        // tasks (mirrors ericli's auto enter_plan_mode — "USE WHEN: complex
+        // multi-step tasks"). The Claude CLI exposes a native EnterPlanMode tool
+        // for this; the adapter maps it to a live picker update (enterPlanMode)
+        // and the ExitPlanMode tool flips the picker back to Default. This keeps
+        // the user in the loop: they see the picker go to "Plan" when the model
+        // decides to plan, and back to "Default" when it's ready to implement.
+        effectivePrompt = `<collaboration_mode># Collaboration Mode: Default\n\nYou are in Default mode: you may read and edit the codebase and execute commands.\n\nWhen a task requires exploration, architectural decisions, or multi-file changes — i.e. it is complex enough that planning first would avoid rework — call EnterPlanMode to switch to Plan mode, investigate read-only, and present a plan. Once the plan is ready, call ExitPlanMode to return to Default mode and implement it. For simple, well-scoped tasks, proceed directly without planning.\n</collaboration_mode>\n\n${effectivePrompt}`;
       }
 
       const claudeSessionId = store.getClaudeSessionId(sessionId);
@@ -4073,6 +4121,15 @@ export function createClaudeCodeAgent(
          // edits. Clear the flag and tell the client so the picker follows.
          if (event.toolName === "ExitPlanMode") {
            void leavePlanMode(sessionId, connection, store);
+         }
+         // The symmetric enter path: the model calls EnterPlanMode when it decides
+         // a task needs planning before acting. Map it so the picker flips to
+         // "Plan" live (current_mode_update) and the next prompt injects the
+         // read-only <collaboration_mode> Plan block. Without this the picker
+         // only showed "Plan" on a user-initiated switch, so a self-entered plan
+         // was invisible until the user manually flipped the mode.
+         if (event.toolName === "EnterPlanMode") {
+           void enterPlanMode(sessionId, connection, store);
          }
          // Build a descriptive title + kind + (for edits) diff content +
          // locations, mirroring codex-acp, so the chat UI shows the action

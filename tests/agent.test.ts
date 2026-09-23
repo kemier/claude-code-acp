@@ -275,14 +275,19 @@ describe("ClaudeCodeAgent", () => {
       expect(withContentCalls).toHaveLength(1);
       expect(capturedRunnerCalls.some((c) => c.kind === "start")).toBe(false);
 
-      // The image block must be forwarded as an Anthropic image block.
-      expect(withContentCalls[0].content).toEqual([
-        { type: "text", text: "What's in this picture?" },
-        {
-          type: "image",
-          source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
-        },
-      ]);
+      // The image block must be forwarded as an Anthropic image block. The
+      // text block carries the <collaboration_mode> Default-mode preamble the
+      // adapter prepends (so the model knows it may self-enter Plan mode) +
+      // the user's question; assert the question is a suffix and the image
+      // block is intact.
+      const [textBlock, imageBlock] = withContentCalls[0].content;
+      expect(textBlock.type).toBe("text");
+      expect(textBlock.text.endsWith("What's in this picture?")).toBe(true);
+      expect(textBlock.text).toContain("<collaboration_mode>");
+      expect(imageBlock).toEqual({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+      });
     });
 
     it("should keep text-only prompts on startSessionStreaming", async () => {

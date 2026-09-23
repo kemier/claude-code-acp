@@ -442,8 +442,10 @@ describe("pre-turn compaction guard", () => {
     expect(summaryStart).toBeGreaterThanOrEqual(0);
     // The summary start must precede the final continue that runs the actual
     // turn (the bigPrompt), proving compaction happened before forwarding.
+    // Suffix match: the adapter prepends the <collaboration_mode> block to the
+    // default-mode prompt, so the forwarded prompt is block + bigPrompt.
     const finalContinue = recorded.findIndex(
-      (c, i) => i > summaryStart && c.kind === "continue" && c.prompt === bigPrompt,
+      (c, i) => i > summaryStart && c.kind === "continue" && (c.prompt === bigPrompt || c.prompt.endsWith(bigPrompt)),
     );
     expect(finalContinue).toBeGreaterThan(summaryStart);
 
