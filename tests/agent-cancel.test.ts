@@ -36,6 +36,7 @@ vi.mock("../src/claude-runner.js", () => {
         cancelReject = undefined;
       }
     });
+    this.setSessionPermissionMode = vi.fn();
   });
   return { ClaudeRunner: MockClaudeRunner };
 });

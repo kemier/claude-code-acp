@@ -40,6 +40,7 @@ vi.mock("../src/claude-runner.js", async (importOriginal) => {
       sessionId: "uuid-1",
     });
     this.cancel = vi.fn();
+    this.setSessionPermissionMode = vi.fn();
   });
   return { ...actual, ClaudeRunner: MockClaudeRunner };
 });

@@ -40,6 +40,7 @@ vi.mock("../src/claude-runner.js", () => {
       text: "ok", sessionId: "uuid-stream",
     });
     this.cancel = vi.fn();
+    this.setSessionPermissionMode = vi.fn();
   });
   return { ClaudeRunner: MockClaudeRunner };
 });
@@ -155,6 +156,7 @@ describe("Agent --verbose duplicate final-block text dedup", () => {
         text: finalText, sessionId: "uuid-verbose",
       });
       this.cancel = vi.fn();
+    this.setSessionPermissionMode = vi.fn();
     });
     return { ClaudeRunner: MockClaudeRunner };
   }

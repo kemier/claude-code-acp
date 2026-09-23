@@ -19,6 +19,7 @@ vi.mock("../src/claude-runner.js", () => {
       new Error("claude exited with code 1")
     );
     this.cancel = vi.fn();
+    this.setSessionPermissionMode = vi.fn();
   });
   return { ClaudeRunner: MockClaudeRunner };
 });

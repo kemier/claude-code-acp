@@ -188,6 +188,30 @@ export class ClaudeRunner {
   private cancelEscalationTimers = new Map<string, NodeJS.Timeout>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
+  /**
+   * Session permission mode, set by the agent before each prompt spawn.
+   * "read-only" (plan mode) → --permission-mode plan so the Claude CLI
+   * hard-blocks mutating tools at its own layer, not just via the
+   * <collaboration_mode> prompt block. "agent" / "agent-full-access" →
+   * --permission-mode acceptEdits (the CLI's interactive-equivalent of the
+   * default agent mode). When null, no flag is passed (the CLI uses its own
+   * default), preserving prior behavior for callers that don't track mode.
+   */
+  private sessionPermissionMode: string | null = null;
+
+  /**
+   * Set the permission mode for the next spawn. Called by the agent from
+   * enterPlanMode (→ "read-only") and leavePlanMode (→ "agent"). Because the
+   * CLI is spawned per-prompt (--resume <id>), each turn's spawn picks up the
+   * current mode without restarting the session or losing conversation history.
+   */
+  setSessionPermissionMode(mode: string | null): void {
+    this.sessionPermissionMode = mode;
+  }
+
+  constructor(config?: AgentConfig) {
+    this.config = config ?? loadConfig();
+  }
 
   /**
    * Resolve the claude executable to spawn.
@@ -223,15 +247,24 @@ export class ClaudeRunner {
     return candidates.find((p) => existsSync(p)) || "claude";
   }
 
-  constructor(config?: AgentConfig) {
-    this.config = config ?? loadConfig();
-  }
-
   private buildExtraArgs(modelOverride?: string, effortOverride?: string): string[] {
     const extra: string[] = [];
     const model = modelOverride || this.config.model;
     if (model) {
       extra.push("--model", model);
+    }
+    // Thread the session permission mode through as a CLI flag so the Claude
+    // CLI enforces read-only (plan mode) at its own layer, not just via the
+    // <collaboration_mode> prompt block. "read-only" → plan (hard-blocks
+    // mutating tools); everything else → acceptEdits (the CLI's interactive
+    // default for an agent). A null mode (caller didn't track it) passes no
+    // flag — the CLI uses its own default, so this is a no-op for any path
+    // that doesn't call setSessionPermissionMode.
+    if (this.sessionPermissionMode) {
+      extra.push(
+        "--permission-mode",
+        this.sessionPermissionMode === "read-only" ? "plan" : "acceptEdits",
+      );
     }
     // WebSearch is a server-side Anthropic tool: the search is executed by
     // Anthropic's API, not the CLI. With ANTHROPIC_BASE_URL pointed at a proxy

@@ -19,7 +19,7 @@ describe("EnterPlanMode", () => {
 
   it("is mapped to an agent-initiated plan-mode enter", () => {
     expect(src).toContain('event.toolName === "EnterPlanMode"');
-    expect(src).toContain("enterPlanMode(sessionId, connection, store)");
+    expect(src).toContain("enterPlanMode(sessionId, connection, store, runner)");
   });
 
   it("sets the stored collaboration mode to plan", () => {
@@ -42,10 +42,32 @@ describe("EnterPlanMode", () => {
     expect(body).toContain('sessionUpdate: "current_mode_update"');
     expect(body).toContain('currentModeId: "read-only"');
     expect(body).toContain('store.setMode(sessionId, "read-only")');
+    // Runner flag: the next claude -p spawn gets --permission-mode plan (CLI
+    // hard-blocks mutating tools at its own layer, not just via the prompt block).
+    expect(body).toContain('runner?.setSessionPermissionMode("read-only")');
     // Collaboration picker: config_option_update flips "collaboration_mode"
     // to "plan".
     expect(body).toContain('sessionUpdate: "config_option_update"');
     expect(body).toContain("sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE)");
+  });
+
+  it("pass-through: buildExtraArgs emits --permission-mode from the runner field", () => {
+    // Verify claude-runner.ts threads sessionPermissionMode → --permission-mode.
+    const runnerSrc = readFileSync(resolve(process.cwd(), "src/claude-runner.ts"), "utf8");
+    expect(runnerSrc).toContain("setSessionPermissionMode(mode: string | null)");
+    expect(runnerSrc).toContain('this.sessionPermissionMode === "read-only" ? "plan" : "acceptEdits"');
+    expect(runnerSrc).toContain('--permission-mode');
+  });
+
+  it("prompt handler syncs runner permission mode from store before each spawn", () => {
+    // A user-initiated picker flip (setSessionMode) only writes store.mode — it
+    // does NOT call runner.setSessionPermissionMode. The prompt handler must
+    // sync it before any spawn, or a manual "Read-only" flip would not propagate
+    // to the next claude -p process.
+    const idx = src.indexOf("async prompt(params: PromptRequest)");
+    expect(idx).toBeGreaterThan(0);
+    const body = src.slice(idx, idx + 1200);
+    expect(body).toContain("runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE)");
   });
 
   it("default mode prompts the model it may self-enter Plan mode", () => {

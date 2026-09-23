@@ -143,6 +143,7 @@ vi.mock("../src/claude-runner.js", () => {
       }
     );
     this.cancel = vi.fn();
+    this.setSessionPermissionMode = vi.fn();
     // handleSteer checks whether a turn is active; report idle (the agent's
     // own sessionPromptInFlight set is the authoritative in-flight signal for
     // the steer-queueing decision, so a false here is fine for the test).

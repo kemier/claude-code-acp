@@ -127,14 +127,18 @@ async function leavePlanMode(
   sessionId: string,
   connection: { sessionUpdate: (p: any) => Promise<unknown> },
   store: SessionStore,
+  runner?: { setSessionPermissionMode: (m: string | null) => void },
 ): Promise<void> {
   if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) !== PLAN_COLLABORATION_MODE) {
     return;
   }
   sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE);
   // Plan mode is read-only by design; restoring full access so the model can
-  // implement the approved plan.
+  // implement the approved plan. Both the stored mode (persists across
+  // restarts, drives the picker) and the runner's spawn flag (drives the
+  // --permission-mode the next claude -p process receives) are updated.
   store.setMode(sessionId, DEFAULT_MODE);
+  runner?.setSessionPermissionMode(DEFAULT_MODE);
   logger.info(`Session ${sessionId} left plan mode (ExitPlanMode)`);
   try {
     await connection.sessionUpdate({
@@ -176,6 +180,7 @@ async function enterPlanMode(
   sessionId: string,
   connection: { sessionUpdate: (p: any) => Promise<unknown> },
   store: SessionStore,
+  runner?: { setSessionPermissionMode: (m: string | null) => void },
 ): Promise<void> {
   if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) === PLAN_COLLABORATION_MODE) {
     // Already in plan mode — the model re-called EnterPlanMode (e.g. after a
@@ -185,8 +190,12 @@ async function enterPlanMode(
   sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE);
   // Plan mode is read-only: the model investigates and presents a plan but does
   // not edit files or run commands. Switching the permission mode to "read-only"
-  // makes the IDE's permission picker reflect that (agent → read-only).
+  // makes the IDE's permission picker reflect that (agent → read-only) AND sets
+  // the runner's spawn flag so the next claude -p process is launched with
+  // --permission-mode plan — the CLI then hard-blocks mutating tools at its own
+  // layer, not just via the <collaboration_mode> prompt block.
   store.setMode(sessionId, "read-only");
+  runner?.setSessionPermissionMode("read-only");
   logger.info(`Session ${sessionId} entered plan mode (EnterPlanMode)`);
   try {
     await connection.sessionUpdate({
@@ -3499,6 +3508,15 @@ export function createClaudeCodeAgent(
         );
       }
 
+      // Sync the runner's permission mode from the stored session mode BEFORE
+      // any spawn in this prompt. enterPlanMode/leavePlanMode set it during the
+      // previous turn's tool events, but a user-initiated picker switch
+      // (setSessionMode / setSessionConfigOption) only writes store.mode — it
+      // does NOT touch the runner. Without this sync, a manual "Read-only"
+      // picker flip would not propagate to the next claude -p spawn (the CLI
+      // would still run with the previous turn's --permission-mode).
+      runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE);
+
       // Extract text from content blocks
       const text = prompt
         .filter((block): block is { type: "text"; text: string } =>
@@ -4143,7 +4161,7 @@ export function createClaudeCodeAgent(
          // follow-up "implement it" came back as code in the chat instead of
          // edits. Clear the flag and tell the client so the picker follows.
          if (event.toolName === "ExitPlanMode") {
-           void leavePlanMode(sessionId, connection, store);
+           void leavePlanMode(sessionId, connection, store, runner);
          }
          // The symmetric enter path: the model calls EnterPlanMode when it decides
          // a task needs planning before acting. Map it so the picker flips to
@@ -4152,7 +4170,7 @@ export function createClaudeCodeAgent(
          // only showed "Plan" on a user-initiated switch, so a self-entered plan
          // was invisible until the user manually flipped the mode.
          if (event.toolName === "EnterPlanMode") {
-           void enterPlanMode(sessionId, connection, store);
+           void enterPlanMode(sessionId, connection, store, runner);
          }
          // Build a descriptive title + kind + (for edits) diff content +
          // locations, mirroring codex-acp, so the chat UI shows the action

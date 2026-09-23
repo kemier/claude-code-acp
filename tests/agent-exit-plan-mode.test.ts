@@ -17,7 +17,7 @@ describe("ExitPlanMode", () => {
 
   it("is mapped to an agent-initiated plan-mode exit", () => {
     expect(src).toContain('event.toolName === "ExitPlanMode"');
-    expect(src).toContain("leavePlanMode(sessionId, connection, store)");
+    expect(src).toContain("leavePlanMode(sessionId, connection, store, runner)");
   });
 
   it("clears the stored collaboration mode", () => {
@@ -39,6 +39,9 @@ describe("ExitPlanMode", () => {
     expect(body).toContain('sessionUpdate: "current_mode_update"');
     expect(body).toContain("currentModeId: DEFAULT_MODE");
     expect(body).toContain("store.setMode(sessionId, DEFAULT_MODE)");
+    // Runner flag: the next claude -p spawn gets --permission-mode acceptEdits
+    // (full access restored), not plan.
+    expect(body).toContain("runner?.setSessionPermissionMode(DEFAULT_MODE)");
     // Collaboration picker: flip "collaboration_mode" back to "default".
     expect(body).toContain('sessionUpdate: "config_option_update"');
     expect(body).toContain("sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE)");
