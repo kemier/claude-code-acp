@@ -53,12 +53,12 @@ vi.mock("../src/claude-runner.js", () => {
           return { text: "", sessionId: "claude-uuid-abc" };
         }
         // Sentinel prompt to simulate a Claude CLI `local` command result
-        // (/usage, /heapdump, ...): the CLI services it itself with no LLM
-        // turn, returning the output as the `result` of a single `result`
-        // event with no stop reason and no usage (see processSlashCommand
-        // case 'local' → { shouldQuery:false, resultText }). The adapter must
-        // surface that text as a commandOutput row instead of dropping it.
-        if (_prompt === "/heapdump" || _prompt === "/usage") {
+        // (/heapdump, /context): the CLI services it itself with no LLM turn,
+        // returning the output as the `result` of a single `result` event with
+        // no stop reason and no usage (see processSlashCommand case 'local' →
+        // { shouldQuery:false, resultText }). The adapter must surface that
+        // text as a commandOutput row instead of dropping it.
+        if (_prompt === "/heapdump" || _prompt === "/context") {
           onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
@@ -77,12 +77,12 @@ vi.mock("../src/claude-runner.js", () => {
         capturedOnEvent = onEvent;
         capturedPrompt = _prompt;
         // Sentinel prompt to simulate a Claude CLI `local` command result
-        // (/usage, /heapdump, ...): the CLI services it itself with no LLM
-        // turn, returning the output as the `result` of a single `result`
-        // event with no stop reason and no usage (see processSlashCommand
-        // case 'local' → { shouldQuery:false, resultText }). The adapter must
-        // surface that text as a commandOutput row instead of dropping it.
-        if (_prompt === "/heapdump" || _prompt === "/usage") {
+        // (/heapdump, /context): the CLI services it itself with no LLM turn,
+        // returning the output as the `result` of a single `result` event with
+        // no stop reason and no usage (see processSlashCommand case 'local' →
+        // { shouldQuery:false, resultText }). The adapter must surface that
+        // text as a commandOutput row instead of dropping it.
+        if (_prompt === "/heapdump" || _prompt === "/context") {
           onEvent({ type: "result", text: "Heap snapshot written to: /tmp/x.heapsnapshot", stopReason: null, usage: undefined });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
@@ -156,10 +156,10 @@ describe("slash commands & estimator", () => {
     // drained like a normal prompt (not fired mid-turn as a side-channel) and
     // forwarded to the CLI. The CLI returns its output as the `result` field
     // of a single `result` event (no stop reason, no usage). The mock runner
-    // is wired to emit exactly that for the /heapdump and /usage prompts. The
-    // adapter must surface the text as a transient commandOutput SNAPSHOT row
-    // — the regression is that the result handler used to drop `event.text`,
-    // so /heapdump and /usage showed nothing in the ACP chat.
+    // is wired to emit exactly that for the /heapdump and /context prompts.
+    // The adapter must surface the text as a transient commandOutput SNAPSHOT
+    // row — the regression is that the result handler used to drop
+    // `event.text`, so /heapdump and /context showed nothing in the ACP chat.
     const sid = await newSession();
     // First establish a Claude session via a normal prompt, so the
     // /heapdump turn resumes that session (continueSessionStreaming path).

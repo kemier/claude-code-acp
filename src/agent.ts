@@ -1602,17 +1602,43 @@ const GOAL_READ_ONLY_SUBS = new Set([
 
 /**
  * Native Claude CLI slash commands that the CLI services itself as a `local`
- * command — no LLM turn, no API call. The CLI runs the command and returns the
- * output as the `result` field of a single `result` event with
- * `stop_reason: null` (see processSlashCommand's `case 'local'` →
- * `{ shouldQuery: false, resultText }`, then QueryEngine yielding
- * `{ type: 'result', result: resultText, stop_reason: null }`).
+ * command WITH a non-interactive (headless / `claude -p`) text result — no LLM
+ * turn, no API call. The CLI runs the command and returns the output as the
+ * `result` field of a single `result` event with `stop_reason: null` (see
+ * processSlashCommand's `case 'local'` → `{ shouldQuery: false, resultText }`,
+ * then QueryEngine yielding `{ type: 'result', result: resultText,
+ * stop_reason: null }`).
+ *
+ * Verified against CLI v2.1.88 source (claude-code-source-code):
+ *   - /heapdump  — type 'local', supportsNonInteractive: true, isHidden: true.
+ *                  Writes the JS heap to ~/Desktop and returns the path(s) as
+ *                  text. Headless text result → surfaced here.
+ *   - /context   — has TWO definitions: an interactive 'local-jsx' colored-grid
+ *                  modal AND a 'local' non-interactive variant
+ *                  (supportsNonInteractive: true) that returns a markdown token
+ *                  breakdown. In a headless ACP session only the 'local'
+ *                  variant is enabled (isEnabled: getIsNonInteractiveSession),
+ *                  so it produces headless text → surfaced here.
+ *
+ * Deliberately NOT in this set (verified against CLI source):
+ *   - /usage     — type 'local-jsx', availability: ['claude-ai']. It renders a
+ *                  React <Settings> Usage modal — a VISUAL screen, not text. In
+ *                  a non-interactive session processSlashCommand's
+ *                  'local-jsx' case hits `if (isNonInteractiveSession) →
+ *                  resolve({ messages: [], shouldQuery: false })` and emits NO
+ *                  result text. There is nothing to surface, and it is not
+ *                  available to API-key (proxy) users anyway.
+ *   - /insights  — type 'prompt'. It CALLS THE MODEL to analyze sessions and
+ *                  write an HTML report; it is not a 'local' command and does
+ *                  not return via the result field with stop_reason null. It
+ *                  runs as a normal turn.
+ *   - /recap     — not present in CLI 2.1.88.
  *
  * These reach the adapter through the SAME queued-and-drained path as any
  * prompt (they are NOT in isReadOnlyCommand, so vscode-acp does not fire them
  * mid-turn as a side-channel; they run serially and are drained like a normal
  * turn). The adapter used to DROP their output (the `result` handler ignored
- * `event.text`), so /usage and /heapdump showed nothing in the ACP chat even
+ * `event.text`), so /heapdump and /context showed nothing in the ACP chat even
  * though the CLI had produced a result. This set names the natives whose
  * result text is surfaced to the client as a transient commandOutput row when
  * it arrives — giving the CLI's own (precise) data without fabricating it on
@@ -1622,12 +1648,12 @@ const GOAL_READ_ONLY_SUBS = new Set([
  * genuine end_turn that happens to carry no text is never mis-rendered, and a
  * future native command can be added deliberately.
  */
-const CLI_LOCAL_COMMAND_NAMES = new Set(["usage", "heapdump", "context", "insights", "recap"]);
+const CLI_LOCAL_COMMAND_NAMES = new Set(["heapdump", "context"]);
 
 /** True when the prompt being forwarded to the CLI is a native `local`
- *  slash command (e.g. /usage, /heapdump) that the CLI services itself. Used
- *  to recognize its result event so the CLI's output can be surfaced as a
- *  commandOutput row instead of being dropped. */
+ *  slash command (e.g. /heapdump, /context) that the CLI services itself with
+ *  a headless text result. Used to recognize its result event so the CLI's
+ *  output can be surfaced as a commandOutput row instead of being dropped. */
 function isCliLocalCommandPrompt(text: string): boolean {
   const cmd = parseSlashCommand(text);
   return !!cmd && CLI_LOCAL_COMMAND_NAMES.has(cmd.name);
