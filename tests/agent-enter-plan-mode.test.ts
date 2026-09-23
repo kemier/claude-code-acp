@@ -59,6 +59,21 @@ describe("EnterPlanMode", () => {
     expect(runnerSrc).toContain('--permission-mode');
   });
 
+  it("suppresses --dangerously-skip-permissions in read-only mode", () => {
+    // --dangerously-skip-permissions bypasses ALL permission checks, INCLUDING
+    // plan mode's read-only gate. Passing both --permission-mode plan AND
+    // --dangerously-skip-permissions lets the CLI silently re-enable full edit +
+    // Bash access (rm -rf, file writes) even though the picker shows "read-only".
+    // buildExtraArgs MUST omit the skip flag when the session is in read-only.
+    const runnerSrc = readFileSync(resolve(process.cwd(), "src/claude-runner.ts"), "utf8");
+    const idx = runnerSrc.indexOf("--dangerously-skip-permissions");
+    expect(idx).toBeGreaterThan(0);
+    // The push must be gated on the mode NOT being read-only.
+    expect(runnerSrc).toContain(
+      'this.config.dangerouslySkipPermissions && this.sessionPermissionMode !== "read-only"'
+    );
+  });
+
   it("prompt handler syncs runner permission mode from store before each spawn", () => {
     // A user-initiated picker flip (setSessionMode) only writes store.mode — it
     // does NOT call runner.setSessionPermissionMode. The prompt handler must

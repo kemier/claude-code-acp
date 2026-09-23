@@ -295,7 +295,13 @@ export class ClaudeRunner {
     if (this.config.maxTurns) {
       extra.push("--max-turns", String(this.config.maxTurns));
     }
-    if (this.config.dangerouslySkipPermissions) {
+    // --dangerously-skip-permissions bypasses ALL permission checks, which
+    // includes plan mode's read-only gate. It is therefore mutually exclusive
+    // with read-only: when the session is in plan mode we MUST omit it, or the
+    // CLI silently re-enables full edit/Bash access (rm -rf, file writes) even
+    // though --permission-mode plan is also passed. In every other mode ACP
+    // relies on the flag to auto-approve without interactive prompts.
+    if (this.config.dangerouslySkipPermissions && this.sessionPermissionMode !== "read-only") {
       extra.push("--dangerously-skip-permissions");
     }
     for (const tool of this.config.allowedTools) {
