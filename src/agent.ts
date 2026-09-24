@@ -4062,6 +4062,33 @@ const drainSteerQueue = async (): Promise<void> => {
       }
       }
 
+      // Acknowledge a cancel IMMEDIATELY, before the permission-await and the
+      // bounded subagent wait below. The user clicked Stop; those waits are
+      // irrelevant once the turn is abandoned. Returning here promptly is what
+      // keeps the host's 5s cancel-fallback from firing first: without it, a
+      // turn with a settling subagent (wait up to pendingAgentWaitMs, default
+      // 15s) or a slow permission resolve acknowledges cancel well past 5s, the
+      // host force-aborts and posts its own promptEnd(cancelled), and the late
+      // real resolution races a second promptEnd over the queue — the "stop
+      // shows the queued message but the turn never ends" strand.
+      if (cancelledSessions.has(sessionId)) {
+        cancelledSessions.delete(sessionId);
+        logger.info(`Prompt cancelled for session ${sessionId} (early, before post-turn waits)`);
+        const _earlyCancelledGoal = sessionGoals.get(sessionId);
+        const _earlyLu = lastUsage as any;
+        if (_earlyCancelledGoal && !_earlyCancelledGoal.paused && _earlyLu) {
+          const _earlyTurnTokens = (_earlyLu.input_tokens ?? 0) + (_earlyLu.output_tokens ?? 0);
+          const _earlyTurnElapsed = Math.floor((Date.now() - _turnStartTime) / 1000);
+          _earlyCancelledGoal.tokensUsed += _earlyTurnTokens;
+          _earlyCancelledGoal.timeUsedSeconds += _earlyTurnElapsed;
+          void publishGoalSnapshot(sessionId, connection).catch(() => {});
+        }
+        // Persist the partial turn's KV prefix so the next resume skips the
+        // cold prefill (mirrors the cancel path in the catch below).
+        saveSessionSlot(sessionId);
+        return { stopReason: "cancelled" };
+      }
+
       // Wait for all pending permission requests to resolve
       await Promise.all(permissionPromises);
 
