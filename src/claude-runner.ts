@@ -20,6 +20,25 @@ export interface ClaudeResult {
   sessionId: string;
 }
 
+/** One long-lived `claude -p --input-format stream-json` process for an ACP session. */
+interface LiveClaudeSession {
+  proc: ChildProcess;
+  trackingId: string;
+  /** Claude CLI session id, filled from the first result when this process created it. */
+  claudeSessionId: string;
+  /** model + effort + permission mode captured at spawn. A mismatch forces --resume. */
+  spawnKey: string;
+  turn: {
+    resolve: (result: ClaudeResult) => void;
+    reject: (err: Error) => void;
+    onEvent: (event: StreamEvent) => void;
+    resultText: string;
+    sessionId: string;
+  } | null;
+  buffer: string;
+  stderrText: string;
+}
+
 /**
  * A user message content block following the Anthropic Messages API schema,
  * sent to the Claude CLI via `--input-format=stream-json` on stdin.
@@ -342,6 +361,18 @@ export class ClaudeRunner {
     modelOverride?: string,
     effortOverride?: string
   ): Promise<ClaudeResult> {
+    if (trackingId) {
+      return this.runPersistentTurn({
+        trackingId,
+        cwd,
+        resumeId: undefined,
+        replace: true,
+        content: [{ type: "text", text: prompt }],
+        onEvent,
+        modelOverride,
+        effortOverride,
+      });
+    }
     const args = [
       "-p",
       prompt,
@@ -377,6 +408,18 @@ export class ClaudeRunner {
     modelOverride?: string,
     effortOverride?: string
   ): Promise<ClaudeResult> {
+    if (trackingId) {
+      return this.runPersistentTurn({
+        trackingId,
+        cwd,
+        resumeId: undefined,
+        replace: true,
+        content,
+        onEvent,
+        modelOverride,
+        effortOverride,
+      });
+    }
     const args = this.buildStreamJsonArgs(undefined, modelOverride, effortOverride);
     return this.runStreamingJsonLine(args, cwd, content, onEvent, trackingId);
   }
@@ -393,6 +436,18 @@ export class ClaudeRunner {
     modelOverride?: string,
     effortOverride?: string
   ): Promise<ClaudeResult> {
+    if (trackingId) {
+      return this.runPersistentTurn({
+        trackingId,
+        cwd: undefined,
+        resumeId: claudeSessionId,
+        replace: false,
+        content,
+        onEvent,
+        modelOverride,
+        effortOverride,
+      });
+    }
     const args = this.buildStreamJsonArgs(claudeSessionId, modelOverride, effortOverride);
     return this.runStreamingJsonLine(args, undefined, content, onEvent, trackingId);
   }
@@ -434,6 +489,18 @@ export class ClaudeRunner {
     modelOverride?: string,
     effortOverride?: string
   ): Promise<ClaudeResult> {
+    if (trackingId) {
+      return this.runPersistentTurn({
+        trackingId,
+        cwd: undefined,
+        resumeId: claudeSessionId,
+        replace: false,
+        content: [{ type: "text", text: prompt }],
+        onEvent,
+        modelOverride,
+        effortOverride,
+      });
+    }
     const args = [
       "-p",
       prompt,
@@ -601,6 +668,233 @@ export class ClaudeRunner {
 
   isRunning(trackingId: string): boolean {
     return this.runningProcesses.has(trackingId);
+  }
+
+  /**
+   * One Claude CLI process per ACP session. Follow-up prompts (the next user
+   * message, a steer drained at end_turn) are written to its stdin instead of
+   * spawning `claude -p --resume`. A new process re-reads `git status` into
+   * the system prompt, so the llama.cpp prefix diverges and the whole
+   * conversation is prefilled again. The process is built once, so that
+   * snapshot stays byte-identical and only the new turn is prefilled.
+   *
+   * Dropped (and the next prompt falls back to --resume) when the process
+   * exits, the user cancels, or model / effort / permission mode changes —
+   * those are spawn flags and cannot be applied to a live process.
+   */
+  private liveSessions = new Map<string, LiveClaudeSession>();
+
+  private userMessageLine(content: StdinContentBlock[]): string {
+    return (
+      JSON.stringify({
+        type: "user",
+        message: { role: "user", content },
+        parent_tool_use_id: null,
+        session_id: "",
+      }) + "\n"
+    );
+  }
+
+  private liveSpawnKey(modelOverride?: string, effortOverride?: string): string {
+    const model = modelOverride || this.config.model || "";
+    return `${model}\0${effortOverride ?? ""}\0${this.sessionPermissionMode ?? ""}`;
+  }
+
+  private canReuseLive(
+    live: LiveClaudeSession,
+    resumeId: string | undefined,
+  ): boolean {
+    if (live.turn) return false;
+    // exitCode is null while the process is alive; a number once it has exited.
+    if (typeof live.proc.exitCode === "number" || live.proc.stdin?.writable !== true) return false;
+    if (!resumeId || live.claudeSessionId !== resumeId) return false;
+    return true;
+  }
+
+  /** Kill an idle persistent CLI. In-flight turns are cancelled via cancel(). */
+  private dropLiveSession(trackingId: string): void {
+    const live = this.liveSessions.get(trackingId);
+    if (!live) return;
+    this.liveSessions.delete(trackingId);
+    this.runningProcesses.delete(trackingId);
+    try {
+      live.proc.stdin?.end();
+    } catch {
+      // already closed
+    }
+    this.signalProcessTree(live.proc, "SIGTERM");
+  }
+
+  private pushLiveTurn(
+    live: LiveClaudeSession,
+    content: StdinContentBlock[],
+    onEvent: (event: StreamEvent) => void,
+  ): Promise<ClaudeResult> {
+    return new Promise((resolve, reject) => {
+      live.turn = {
+        resolve,
+        reject,
+        onEvent,
+        resultText: "",
+        sessionId: live.claudeSessionId,
+      };
+      this.runningProcesses.set(live.trackingId, live.proc);
+      live.proc.stdin!.write(this.userMessageLine(content));
+    });
+  }
+
+  /**
+   * Run one turn on the session's long-lived CLI. `replace` starts a brand-new
+   * conversation (first prompt, or the post-compact session) and retires
+   * whatever process this tracking id was holding.
+   */
+  private runPersistentTurn(opts: {
+    trackingId: string;
+    cwd: string | undefined;
+    resumeId: string | undefined;
+    replace: boolean;
+    content: StdinContentBlock[];
+    onEvent: (event: StreamEvent) => void;
+    modelOverride?: string;
+    effortOverride?: string;
+  }): Promise<ClaudeResult> {
+    const existing = this.liveSessions.get(opts.trackingId);
+    const spawnKey = this.liveSpawnKey(opts.modelOverride, opts.effortOverride);
+    if (
+      !opts.replace &&
+      existing &&
+      existing.spawnKey === spawnKey &&
+      this.canReuseLive(existing, opts.resumeId)
+    ) {
+      logger.info(
+        `Reusing Claude process for session ${opts.trackingId} (no --resume; prefix stays cached)`,
+      );
+      return this.pushLiveTurn(existing, opts.content, opts.onEvent);
+    }
+    if (existing) this.dropLiveSession(opts.trackingId);
+
+    const args = this.buildStreamJsonArgs(
+      opts.resumeId,
+      opts.modelOverride,
+      opts.effortOverride,
+    );
+    logger.debug(`spawn persistent: claude ${maskArgs(args)}`);
+    const proc = spawn(this.resolveClaudeBin(), args, {
+      cwd: opts.cwd,
+      env: this.sanitizeEnv(),
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    const live: LiveClaudeSession = {
+      proc,
+      trackingId: opts.trackingId,
+      claudeSessionId: opts.resumeId ?? "",
+      spawnKey,
+      turn: null,
+      buffer: "",
+      stderrText: "",
+    };
+    this.liveSessions.set(opts.trackingId, live);
+
+    const finishTurn = (code: number | null): void => {
+      const turn = live.turn;
+      live.turn = null;
+      // The close handler outlives a replacement spawn. Only forget this
+      // process when it is still the one the session is holding.
+      if (this.liveSessions.get(opts.trackingId) === live) {
+        this.liveSessions.delete(opts.trackingId);
+      }
+      if (this.runningProcesses.get(opts.trackingId) === live.proc) {
+        this.runningProcesses.delete(opts.trackingId);
+      }
+      const esc = this.cancelEscalationTimers.get(opts.trackingId);
+      if (esc) {
+        clearTimeout(esc);
+        this.cancelEscalationTimers.delete(opts.trackingId);
+      }
+      if (!turn) return;
+      const wasCancelled = this.cancelledProcesses.delete(opts.trackingId);
+      if (wasCancelled) {
+        turn.resolve({ text: turn.resultText, sessionId: turn.sessionId || live.claudeSessionId });
+        return;
+      }
+      if (code !== 0 && code !== null) {
+        const detail = live.stderrText.trim() || turn.resultText.trim();
+        turn.reject(
+          new Error(`claude exited with code ${code}${detail ? `: ${detail.slice(0, 2000)}` : ""}`),
+        );
+        return;
+      }
+      turn.resolve({ text: turn.resultText, sessionId: turn.sessionId || live.claudeSessionId });
+    };
+
+    proc.stderr!.on("data", (data: Buffer) => {
+      live.stderrText += data.toString();
+    });
+
+    proc.stdout!.on("data", (data: Buffer) => {
+      live.buffer += data.toString();
+      const lines = live.buffer.split("\n");
+      live.buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        this.consumeLiveLine(live, line);
+      }
+    });
+
+    proc.on("close", (code) => {
+      if (live.buffer.trim()) {
+        this.consumeLiveLine(live, live.buffer);
+        live.buffer = "";
+      }
+      finishTurn(code);
+    });
+    proc.on("error", (err) => {
+      const turn = live.turn;
+      live.turn = null;
+      if (this.liveSessions.get(opts.trackingId) === live) {
+        this.liveSessions.delete(opts.trackingId);
+      }
+      if (this.runningProcesses.get(opts.trackingId) === live.proc) {
+        this.runningProcesses.delete(opts.trackingId);
+      }
+      turn?.reject(err);
+    });
+
+    return this.pushLiveTurn(live, opts.content, opts.onEvent);
+  }
+
+  /** Parse one stdout line from a persistent CLI. A `result` ends the turn; the process stays up. */
+  private consumeLiveLine(live: LiveClaudeSession, line: string): void {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const turn = live.turn;
+    if (turn) this.processStreamLine(parsed, turn.onEvent);
+    if (parsed.session_id) {
+      live.claudeSessionId = parsed.session_id;
+      if (turn) turn.sessionId = parsed.session_id;
+    }
+    if (parsed.result !== undefined && turn) {
+      turn.resultText = parsed.result;
+    }
+    if (parsed.type === "result" && turn) {
+      turn.sessionId = parsed.session_id ?? turn.sessionId;
+      turn.resultText = parsed.result ?? turn.resultText;
+      // Clear the turn BEFORE resolving so a follow-up prompt queued on the
+      // same tick can push the next user message into this same process.
+      live.turn = null;
+      this.runningProcesses.delete(live.trackingId);
+      const esc = this.cancelEscalationTimers.get(live.trackingId);
+      if (esc) {
+        clearTimeout(esc);
+        this.cancelEscalationTimers.delete(live.trackingId);
+      }
+      turn.resolve({ text: turn.resultText, sessionId: turn.sessionId || live.claudeSessionId });
+    }
   }
 
   private runJson(

@@ -24,7 +24,9 @@ vi.mock("node:child_process", () => {
       const proc = new EventEmitter();
       proc.stdout = new EventEmitter();
       proc.stderr = new EventEmitter();
+      proc.stdin = { write: vi.fn(), end: vi.fn(), writable: true };
       proc.pid = 99999;
+      proc.exitCode = null;
       proc.kill = vi.fn();
 
       const outputFormat = args.includes("stream-json")
