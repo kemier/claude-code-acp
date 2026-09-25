@@ -21,13 +21,19 @@ import * as fs from "fs";
 
 const src = fs.readFileSync(new URL("../src/agent.ts", import.meta.url), "utf8");
 
-/** The body of buildPlanSnapshot's delivery call. */
+/**
+ * The body of the plan snapshot — the single object literal built in
+ * handleTaskTool and delivered either inline (live) or buffered on `out`
+ * (replay / post-compaction re-push). Anchored on the `out.snapshot = snapshot`
+ * branch, not on the object construction, so the assertions below cover the
+ * _meta hint that travels with whichever path delivers it.
+ */
 function deliverCall(): string {
   const at = src.indexOf('sessionUpdate: "plan"');
   expect(at).toBeGreaterThan(0);
-  const start = src.lastIndexOf("deliver({", at);
+  const start = src.lastIndexOf("const snapshot = {", at);
   expect(start).toBeGreaterThan(0);
-  return src.slice(start, src.indexOf("});", at) + 3);
+  return src.slice(start, src.indexOf("} as any;", at) + 9);
 }
 
 describe("the task list declares itself a todo list", () => {

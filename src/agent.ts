@@ -2221,7 +2221,7 @@ export function createClaudeCodeAgent(
       priority: "medium" as const,
       status: t.status as "pending" | "in_progress" | "completed",
     }));
-    deliver({
+    const snapshot = {
       sessionUpdate: "plan",
       entries,
       // These come from Claude Code's TaskCreate/TaskUpdate/TaskList tools — a
@@ -2232,7 +2232,15 @@ export function createClaudeCodeAgent(
       // Adapter-neutral hint, shared with the other adapters: a client that ignores
       // _meta renders exactly as before.
       _meta: { acp: { plan: { kind: "todo", title: "Todos" } } },
-    } as any);
+    } as any;
+    // When the caller supplies a receiver (session/load replay, or the
+    // post-compaction re-push below), buffer the snapshot there instead of
+    // emitting inline — the caller decides delivery timing.
+    if (out) {
+      out.snapshot = snapshot;
+    } else {
+      deliver(snapshot);
+    }
     return true;
   }
 
@@ -2923,9 +2931,27 @@ export function createClaudeCodeAgent(
     // apart by whether it already set `isCompacting` from the user's command.
     const compactionId = `compaction_${++compactionCounter}`;
     await emitCompactionLifecycle(connection, sessionId, compactionId, "start");
-    // Ask the LLM to produce a concise summary of the conversation.
+    // Ask the LLM to produce a concise summary of the conversation. The summary
+    // seeds a FRESH session (see startSessionStreaming below), so anything the
+    // ongoing work depends on that is NOT in the compacted transcript must be
+    // named here — most importantly the current task board, which the model
+    // manages with the TaskCreate/TaskUpdate tools. We inject the LIVE board
+    // (sessionTodos, maintained from every TaskCreate/TaskUpdate — it survives
+    // compaction on purpose, see the note after the success block) so the
+    // summary reproduces it exactly (ids + statuses) rather than re-deriving
+    // it from prose. Without this the fresh session starts with a board the
+    // model has to rebuild from the summary's free-text "pending tasks", and
+    // the client's plan bar (wiped by the compaction flush) is never re-pushed.
+    const preCompactTodos = sessionTodos.get(sessionId);
+    const todoBlock =
+      preCompactTodos && preCompactTodos.size > 0
+        ? `\n\nCurrent task board (preserve it verbatim in your summary — every task with its status):\n${Array.from(preCompactTodos.entries())
+            .map(([_id, t]) => `- [${t.status}] ${t.content}`)
+            .join("\n")}`
+        : "";
     const compactPrompt =
-      "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context.";
+      "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context." +
+      todoBlock;
     try {
       const result = await runner.continueSessionStreaming(
         claudeSid,
@@ -2974,6 +3000,30 @@ export function createClaudeCodeAgent(
       // text (which is what previously got concatenated onto the prior reply).
       if (!skipCompleted) {
         await emitCompactionLifecycle(connection, sessionId, compactionId, "completed");
+      }
+      // Re-push the plan snapshot. The client wipes its plan bar when it
+      // processes the compaction "completed" lifecycle frame (its history
+      // flush), so without this the board the model still tracks — and that we
+      // deliberately keep in sessionTodos — vanishes from the IDE until the
+      // model happens to call TaskCreate/TaskUpdate again (which it usually
+      // doesn't, since the surviving entries are accurate). Passing `out`
+      // makes handleTaskTool buffer the snapshot instead of emitting inline;
+      // we then emit it on the connection now that "completed" has flushed.
+      // Only on the non-deferred path: with skipCompleted the client is still
+      // mid-flush, so a plan frame here would race the wipe (the auto-compact
+      // continuation re-pushes from the "completed" it defers to).
+      if (!skipCompleted) {
+        const out: { snapshot?: any } = {};
+        handleTaskTool(sessionId, "TaskList", {}, out);
+        if (out.snapshot) {
+          connection
+            .sessionUpdate({ sessionId, update: out.snapshot } as any)
+            .catch(() => {
+              // Best effort — a dropped re-push just means the bar stays
+              // empty until the next task update, not a failure.
+            });
+          logger.debug(`Re-pushed plan snapshot after compaction for session ${sessionId}`);
+        }
       }
       logger.info(`Compaction succeeded for session ${sessionId}`);
       return { compactionId, summary: result.text };
@@ -4400,6 +4450,22 @@ const drainSteerQueue = async (): Promise<void> => {
            // "Compacting conversation..." forever.
            if (compactResult && typeof compactResult === 'object') {
              await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
+             // Re-push the plan snapshot right after the "completed" frame —
+             // that frame is what makes the client wipe its plan bar (history
+             // flush), so emitting here is the moment the bar is cleared and
+             // ready to repopulate. doCompact's own re-push is skipped on the
+             // auto-compact path (skipCompleted=true) precisely so it doesn't
+             // race this flush. Same handleTaskTool(out) pattern: buffer the
+             // snapshot, then emit it now.
+             const out: { snapshot?: any } = {};
+             handleTaskTool(sessionId, "TaskList", {}, out);
+             if (out.snapshot) {
+               connection
+                 .sessionUpdate({ sessionId, update: out.snapshot } as any)
+                 .catch(() => {
+                   // Best effort.
+                 });
+             }
            }
          }
        }
