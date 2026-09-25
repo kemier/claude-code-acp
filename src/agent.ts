@@ -381,6 +381,13 @@ const MODEL_EFFORTS: Record<string, string[]> = {
   "glm-5.1": ["low", "medium", "high"],
   "Qwen3-Coder": ["low", "medium", "high"],
   "deepseek-v4-pro": ["low", "medium", "high", "xhigh"],
+  // DeepSeek-Flash family (V4-Flash, V4.1-Flash, …): supports the full ladder
+  // including xhigh — an EricAI-specific extension these deployments honour
+  // (verified via ericli's supportedReasoningEffortsForModel). Matched by the
+  // case-insensitive deepseek.*flash regex below, NOT this literal key, so a
+  // version bump in the /v1/models id (e.g. "deepseek-v4-flash" →
+  // "DeepSeek-V4.1-Flash") does not silently drop xhigh and fall back to
+  // DEFAULT_EFFORTS. The literal is retained as documentation of the family.
   "deepseek-v4-flash": ["low", "medium", "high", "xhigh"],
   "kimi-k2.7-code": ["low", "high"],
   "kimi-k2.6": ["low", "high"],
@@ -406,9 +413,29 @@ const MODEL_EFFORTS: Record<string, string[]> = {
 
 const DEFAULT_EFFORTS = ["low", "medium", "high"];
 
+// Case-insensitive lookup key: lowercases both the table keys (lazily, once)
+// and the incoming model id. The /v1/models id is passed through verbatim by
+// the picker (e.g. "DeepSeek-V4.1-Flash", "Qwen3.8-27B"), and the table above
+// mixes cases, so a raw hasOwnProperty lookup is case-fragile.
+const MODEL_EFFORTS_LOWER: Record<string, string[]> = (() => {
+  const out: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(MODEL_EFFORTS)) out[k.toLowerCase()] = v;
+  return out;
+})();
+
 function getEffortsForModel(modelId: string): string[] {
-  if (Object.prototype.hasOwnProperty.call(MODEL_EFFORTS, modelId)) {
-    return MODEL_EFFORTS[modelId];
+  const lower = modelId.toLowerCase();
+  // DeepSeek-Flash family: version-tolerant match mirroring ericli's
+  // supportedReasoningEffortsForModel (/deepseek.*flash/i). The backend was
+  // upgraded from "deepseek-v4-flash" (alias) to "DeepSeek-V4.1-Flash"
+  // (/v1/models id); a literal table key would miss the new slug and silently
+  // drop xhigh. Any deepseek+flash id — current or future — gets the full
+  // ladder. (deepseek-v4-pro is NOT a flash model and stays on its table entry.)
+  if (/deepseek.*flash/.test(lower)) {
+    return ["low", "medium", "high", "xhigh"];
+  }
+  if (Object.prototype.hasOwnProperty.call(MODEL_EFFORTS_LOWER, lower)) {
+    return MODEL_EFFORTS_LOWER[lower];
   }
   return DEFAULT_EFFORTS;
 }
