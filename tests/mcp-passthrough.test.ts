@@ -80,4 +80,48 @@ describe("MCP config passthrough", () => {
     const configPath = args[mcpConfigIdx + 1];
     expect(configPath).toBeDefined();
   });
+
+  it("should pass --model/--effort overrides on the MCP path (regression: picker override was dropped)", async () => {
+    // Regression: startSessionWithMcp previously called buildExtraArgs() with
+    // no modelOverride, so a session's per-session picker override never
+    // reached the CLI. The CLI then fell back to the settings default
+    // (ANTHROPIC_MODEL, e.g. GLM-5.2) even though the picker showed the
+    // override (e.g. Qwen3.8). The fix threads runModel/runEffort through.
+    runner = new ClaudeRunner({
+      model: undefined, // no global default, so the override is the only source
+      allowedTools: [],
+      maxTurns: undefined,
+      timeout: 300000,
+      dangerouslySkipPermissions: false,
+    });
+
+    mockSpawn.mockReturnValue(
+      createMockProcess(JSON.stringify({ result: "ok", session_id: "s1" }) + "\n", 0)
+    );
+
+    const mcpServers = [
+      {
+        name: "test-server",
+        transport: { type: "stdio" as const, command: "node", args: ["server.js"] },
+      },
+    ];
+
+    await runner.startSessionWithMcp(
+      "/tmp",
+      "hello",
+      mcpServers,
+      () => {},
+      "tracking",
+      "Qwen3.8-27B",
+      "high"
+    );
+
+    const args = mockSpawn.mock.calls[0][1] as string[];
+    const modelIdx = args.indexOf("--model");
+    expect(modelIdx).toBeGreaterThan(-1);
+    expect(args[modelIdx + 1]).toBe("Qwen3.8-27B");
+    const effortIdx = args.indexOf("--effort");
+    expect(effortIdx).toBeGreaterThan(-1);
+    expect(args[effortIdx + 1]).toBe("high");
+  });
 });

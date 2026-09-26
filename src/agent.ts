@@ -4158,7 +4158,9 @@ const drainSteerQueue = async (): Promise<void> => {
             bodyText,
             mcpServers,
             onEvent,
-            sessionId
+            sessionId,
+            runModel,
+            runEffort
           );
         } else {
           result = await runner.startSessionStreaming(

@@ -525,7 +525,9 @@ export class ClaudeRunner {
     prompt: string,
     mcpServers: McpServerConfig[],
     onEvent?: (event: StreamEvent) => void,
-    trackingId?: string
+    trackingId?: string,
+    modelOverride?: string,
+    effortOverride?: string
   ): Promise<ClaudeResult> {
     const mcpArgs = this.buildMcpArgs(mcpServers);
     if (onEvent) {
@@ -536,7 +538,7 @@ export class ClaudeRunner {
         "stream-json",
         "--verbose",
         "--include-partial-messages",
-        ...this.buildExtraArgs(),
+        ...this.buildExtraArgs(modelOverride, effortOverride),
         ...mcpArgs,
       ];
       return this.runStreaming(args, cwd, onEvent, trackingId);
@@ -546,7 +548,7 @@ export class ClaudeRunner {
         prompt,
         "--output-format",
         "json",
-        ...this.buildExtraArgs(),
+        ...this.buildExtraArgs(modelOverride, effortOverride),
         ...mcpArgs,
       ];
       return this.runJson(args, cwd);
