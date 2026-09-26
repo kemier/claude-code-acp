@@ -1113,6 +1113,51 @@ export function isAutoCompactEnabled(): boolean {
 // can run after the turn finishes.
 const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
 
+/**
+ * Re-emit a usage_update when the session's model is switched mid-conversation.
+ *
+ * The context ring's `size` (denominator) is only ever set by a usage_update
+ * frame, and those fire inside the per-turn result-event handler. A model
+ * switch (setSessionConfigOption with configId "model") does NOT start a turn,
+ * so without this the ring keeps the OLD model's window — e.g. the user picks
+ * Qwen3.8-27B-FP8-1M but the ring still reads 262144 (Qwen3.8-27B's window)
+ * until the next prompt completes.
+ *
+ * Carries over the last known used tokens (sessionLastUsage) so the ring does
+ * not falsely reset to 0%; when no turn has run yet there is nothing to show,
+ * so we emit nothing (the ring stays hidden until the first real usage).
+ * The new size comes from getContextWindowForModel (proxy-authoritative), not
+ * a re-estimate from the model name.
+ */
+export function reEmitUsageOnModelSwitch(
+  sessionId: string,
+  connection: {
+    sessionUpdate: (p: {
+      sessionId: string;
+      update: { sessionUpdate: "usage_update"; used: number; size: number };
+    }) => Promise<unknown>;
+  },
+  _store: SessionStore,
+  prevModel: string | undefined,
+  newModel: string,
+): void {
+  const newWindow = getContextWindowForModel(newModel);
+  const last = sessionLastUsage.get(sessionId);
+  const used = last ? Math.min(last.input_tokens, newWindow) : 0;
+  if (used <= 0) return;
+  void connection
+    .sessionUpdate({
+      sessionId,
+      update: { sessionUpdate: "usage_update" as const, used, size: newWindow },
+    })
+    .catch(() => {
+      // Best effort — a failed usage_update must not break the model switch.
+    });
+  logger.info(
+    `Session ${sessionId} model ${prevModel} → ${newModel}: re-emitted usage_update size=${newWindow} used=${used}`,
+  );
+}
+
 // Monotonic id source for compaction lifecycle tool calls.
 let compactionCounter = 0;
 
@@ -5229,8 +5274,20 @@ const drainSteerQueue = async (): Promise<void> => {
           logger.info(`Session ${sessionId} mode-change re-prompt completed`);
         }
       } else {
+        // Capture the previous model BEFORE the override is set, so a model
+        // switch can re-emit a usage_update with the NEW window. Without this,
+        // the webview's context ring keeps showing the old model's size
+        // (e.g. 262144 for Qwen3.8-27B) until the next LLM turn fires a fresh
+        // usage_update — the user switches to the 1M variant and the ring
+        // still reads 262k. usage_update is only sent inside the result-event
+        // handler (per turn), so a config change that doesn't start a turn
+        // leaves the ring stale.
+        const prevModel = store.getConfigOverrides(sessionId)[configId] as string | undefined;
         store.setConfigOverride(sessionId, configId, value);
         logger.info(`Session ${sessionId} config ${configId} set to ${value}`);
+        if (configId === "model" && prevModel !== value) {
+          reEmitUsageOnModelSwitch(sessionId, connection, store, prevModel, String(value));
+        }
       }
 
      // Send config_option_update notification
