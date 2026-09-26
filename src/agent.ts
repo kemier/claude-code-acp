@@ -46,6 +46,7 @@ import {
   validateMcpArgs,
 } from "./validation.js";
 import { isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath } from "node:path";
+import { randomUUID } from "node:crypto";
 
 function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -5065,19 +5066,39 @@ const drainSteerQueue = async (): Promise<void> => {
       // nothing to branch from, but we still produce a valid empty fork so the
       // client gets a new session id rather than an error — matching how a
       // fresh session/new behaves.
-      const forkClaudeId = generateSessionId();
+      const forkClaudeId = randomUUID();
       if (sourceClaudeId) {
         const { homedir } = await import("node:os");
         const projectDir = `${homedir()}/.claude/projects/${sourceCwd.replace(/\//g, "-")}`;
         const sourcePath = `${projectDir}/${sourceClaudeId}.jsonl`;
         const forkPath = `${projectDir}/${forkClaudeId}.jsonl`;
         try {
-          const { copyFileSync, existsSync, mkdirSync } = await import("node:fs");
+          const { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } = await import("node:fs");
           if (existsSync(sourcePath)) {
             if (!existsSync(projectDir)) {
               mkdirSync(projectDir, { recursive: true });
             }
+            // Copy and rewrite the internal session_id so the CLI accepts
+            // --resume <forkClaudeId> (it cross-checks the file name against
+            // the session_id field in each line). Without this, the forked
+            // transcript still carries the source's UUID internally and the
+            // CLI rejects the resume: "not a UUID and does not match any
+            // session title" (32-hex forkClaudeId) or "session not found"
+            // (dashed UUID mismatch).
             copyFileSync(sourcePath, forkPath);
+            const raw = readFileSync(forkPath, "utf-8");
+            const lines = raw.split("\n").filter((l) => l.trim());
+            const rewritten = lines.map((line) => {
+              try {
+                const d = JSON.parse(line);
+                if (d.session_id === sourceClaudeId) d.session_id = forkClaudeId;
+                if (d.sessionId === sourceClaudeId) d.sessionId = forkClaudeId;
+                return JSON.stringify(d);
+              } catch {
+                return line;
+              }
+            });
+            writeFileSync(forkPath, rewritten.join("\n"));
             logger.info(
               `Forked transcript: ${sourceClaudeId}.jsonl → ${forkClaudeId}.jsonl (${sourceCwd})`
             );
