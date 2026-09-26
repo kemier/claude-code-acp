@@ -50,7 +50,9 @@ describe("collaboration mode change mid-turn", () => {
     // The interrupt: SIGINT the running turn…
     expect(body).toContain("runner.cancel(sessionId)");
     // …and chain a fresh executePrompt on the per-session lock with the notice.
-    expect(body).toContain("executePrompt(sessionId, repromptText, repromptModel, repromptEffort)");
+    // (Passes its own generation so the cancel-latch scoping tracks it; an
+    // empty promptImages array since a mode-change re-prompt has no images.)
+    expect(body).toContain("executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen)");
     expect(body).toContain("sessionPromptLocks.get(sessionId)");
     // It no longer pushes onto the steer queue for this path.
     expect(body).not.toContain("steerQueues");

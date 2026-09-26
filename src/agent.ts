@@ -1946,6 +1946,36 @@ export function createClaudeCodeAgent(
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
+  // Per-session prompt serialization + cancel scoping.
+  //
+  // The bug: cancel() latches cancelledSessions for the in-flight prompt, but
+  // prompts serialize per session (sessionPromptLocks), so a NEW prompt queued
+  // behind the cancelled one reaches executePrompt right after the in-flight one
+  // settles — while the latch is still set — and was wrongly cancelled before it
+  // started ("stop mid-stream, then the queued 'Send Now' message vanishes
+  // instead of running as its own turn").
+  //
+  // Fix: tag each prompt with a monotonically-increasing generation
+  // (promptGenCounter, assigned at queue time). executePrompt records the
+  // generation it's running as the in-flight one (inFlightGen). cancel() latches
+  // the session AND records the in-flight generation as the cancel's target
+  // (cancelledGen). A prompt is treated as "cancelled before start" only if the
+  // cancel's target generation matches its OWN, so a fresh post-cancel prompt
+  // (a later generation) is not hit by the stale latch.
+  const promptGenCounter = new Map<string, number>();
+  // sessionId -> generation of the prompt currently executing.
+  const inFlightGen = new Map<string, number>();
+  // sessionId -> the generation a cancel was aimed at (the in-flight prompt).
+  const cancelledGen = new Map<string, number>();
+  /**
+   * True if the session's current cancel latch targets `gen` — i.e., a cancel()
+   * was aimed at the prompt with this generation AND the session is still
+   * latched. A prompt should only treat itself as cancelled when the cancel
+   * was aimed at ITS generation; a stale latch from an earlier (already-settled)
+   * prompt must not cancel a fresh prompt that merely shares the session.
+   */
+  const isCancelledForGen = (sessionId: string, gen: number): boolean =>
+    cancelledSessions.has(sessionId) && cancelledGen.get(sessionId) === gen;
   // Per-session auto-follow-up counter. When a turn ends with subagent(s)
   // still pending (premature end_turn), we enqueue a synthetic steer that
   // starts a new turn so the Claude CLI injects the pending
@@ -3048,16 +3078,28 @@ export function createClaudeCodeAgent(
    * with the fresh <collaboration_mode> block) can chain a turn on the
    * per-session lock.
    */
-  const executePrompt = async (sessionId: string, bodyText: string, modelOverride: string | undefined, effectiveEffort: string | undefined, promptImages: import("./claude-runner.js").StdinContentBlock[] = []): Promise<PromptResponse> => {
+  const executePrompt = async (sessionId: string, bodyText: string, modelOverride: string | undefined, effectiveEffort: string | undefined, promptImages: import("./claude-runner.js").StdinContentBlock[] = [], promptGen: number = 0): Promise<PromptResponse> => {
     // Mark this session as having a prompt in flight for the entire executePrompt
     // body (LLM turn + steer drain + auto-compact + return). Cleared when the
     // lock chain settles (below). See sessionPromptInFlight.
     sessionPromptInFlight.add(sessionId);
-    // If this prompt was cancelled while waiting in the serialization queue
+    // Record which generation is now the in-flight one, so a concurrent cancel()
+    // targets precisely this prompt (not a later queued one).
+    inFlightGen.set(sessionId, promptGen);
+    // If THIS prompt was cancelled while waiting in the serialization queue
     // behind a prior turn, don't start a new turn — drain-and-return.
-    if (cancelledSessions.has(sessionId)) {
+    //
+    // The latch is generation-scoped: cancel() records the generation of the
+    // prompt that was in flight at cancel time (cancelledGen). Only a prompt
+    // whose OWN generation matches that recorded cancel is treated as
+    // cancelled-before-start. A fresh prompt queued behind a cancelled turn has
+    // a LATER generation, so it is NOT hit by the stale latch — this is the
+    // fix for "stop mid-stream, then the queued 'Send Now' message vanishes
+    // instead of running as its own turn."
+    if (isCancelledForGen(sessionId, promptGen)) {
       cancelledSessions.delete(sessionId);
-      logger.info(`Queued prompt cancelled before start for session ${sessionId}`);
+      cancelledGen.delete(sessionId);
+      logger.info(`Queued prompt (gen ${promptGen}) cancelled before start for session ${sessionId}`);
       return { stopReason: "cancelled" };
     }
     // ── Slash command handling ──────────────────────────────────
@@ -4148,8 +4190,10 @@ const drainSteerQueue = async (): Promise<void> => {
       // host force-aborts and posts its own promptEnd(cancelled), and the late
       // real resolution races a second promptEnd over the queue — the "stop
       // shows the queued message but the turn never ends" strand.
-      if (cancelledSessions.has(sessionId)) {
+      if (isCancelledForGen(sessionId, promptGen)) {
         cancelledSessions.delete(sessionId);
+        cancelledGen.delete(sessionId);
+        if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);
         logger.info(`Prompt cancelled for session ${sessionId} (early, before post-turn waits)`);
         const _earlyCancelledGoal = sessionGoals.get(sessionId);
         const _earlyLu = lastUsage as any;
@@ -4331,8 +4375,10 @@ const drainSteerQueue = async (): Promise<void> => {
       }
 
       // Check if this session was cancelled while running
-      if (cancelledSessions.has(sessionId)) {
+      if (isCancelledForGen(sessionId, promptGen)) {
         cancelledSessions.delete(sessionId);
+        cancelledGen.delete(sessionId);
+        if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);
         logger.info(`Prompt cancelled for session ${sessionId}`);
         return { stopReason: "cancelled" };
       }
@@ -4527,8 +4573,10 @@ const drainSteerQueue = async (): Promise<void> => {
     for (const t of webToolWatchdogs.get(sessionId) ?? []) clearTimeout(t);
     webToolWatchdogs.delete(sessionId);
     // Check if cancelled
-    if (cancelledSessions.has(sessionId)) {
+    if (isCancelledForGen(sessionId, promptGen)) {
       cancelledSessions.delete(sessionId);
+      cancelledGen.delete(sessionId);
+      if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);
       logger.info(`Prompt cancelled for session ${sessionId}`);
       // Account partial turn usage toward goal budget.
       const _cancelledGoal = sessionGoals.get(sessionId);
@@ -5160,9 +5208,15 @@ const drainSteerQueue = async (): Promise<void> => {
           // re-prompt regardless of how the cancelled turn resolved — a
           // cancelled turn that threw (rare) must not block the mode switch.
           const prevLock = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+          // The re-prompt is a fresh prompt — give it its own generation so
+          // inFlightGen / the cancel before-start check track it correctly.
+          // (runner.cancel above does not latch cancelledSessions, so this
+          // reprompt is not treated as a cancelled-before-start prompt.)
+          const repromptGen = (promptGenCounter.get(sessionId) ?? 0) + 1;
+          promptGenCounter.set(sessionId, repromptGen);
           const repromptLock = prevLock.then(
-            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort),
-            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort),
+            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
+            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
           );
           // Keep the lock chain alive for any further prompts queued behind.
           sessionPromptLocks.set(sessionId, repromptLock.catch(() => {}));
@@ -5277,17 +5331,43 @@ const drainSteerQueue = async (): Promise<void> => {
       // replaced, so it never holds a stale promise across /clear (which
       // resolves quickly and clears per-session state under the lock too).
       const prev = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+      // Assign this prompt a monotonically-increasing generation for the
+      // session. A cancel() latches by generation (the one in flight at cancel
+      // time), so a NEW prompt queued behind a cancelled one (a later
+      // generation) is not hit by the stale latch in executePrompt's
+      // before-start check. See `cancelledGen`.
+      const myGen = (promptGenCounter.get(sessionId) ?? 0) + 1;
+      promptGenCounter.set(sessionId, myGen);
       const next = prev.then(
-        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages),
-        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages)
+        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages, myGen),
+        () => executePrompt(sessionId, text, modelOverride, effectiveEffort, promptImages, myGen)
       );
       // Clear the in-flight flag once executePrompt settles (success or failure).
       // If a newer prompt queued behind this one has already re-added the flag
       // by the time this fires, the delete is a harmless no-op on a re-added
       // entry — but ordering (this finally registered before the newer prompt's
       // executePrompt runs) means this clears first, then the newer
-      // executePrompt re-adds, so the flag stays accurate.
-      next.finally(() => sessionPromptInFlight.delete(sessionId));
+      // executePrompt re-adds, so the flag stays accurate. Same guard for
+      // inFlightGen: only clear it if it still points at THIS prompt's
+      // generation (a newer prompt will have overwritten it).
+      next.finally(() => {
+        sessionPromptInFlight.delete(sessionId);
+        if (inFlightGen.get(sessionId) === myGen) {
+          inFlightGen.delete(sessionId);
+          // A cancel() that arrived AFTER this prompt's turn already ended
+          // (end_turn) latches cancelledSessions/cancelledGen but this prompt
+          // never cleared them (it took the normal path, not a cancel site).
+          // Clear them now if no newer prompt is in flight, so a stale latch
+          // doesn't linger and wrongly ignore a later steer or cancel a much
+          // later prompt. The generation-scoped before-start check already
+          // prevents the stale latch from cancelling a fresh queued prompt;
+          // this just prevents the Set/Map entries from sticking around.
+          if (!sessionPromptInFlight.has(sessionId)) {
+            cancelledSessions.delete(sessionId);
+            cancelledGen.delete(sessionId);
+          }
+        }
+      });
       sessionPromptLocks.set(sessionId, next.catch(() => {}));
       return next;
     },
@@ -5295,6 +5375,15 @@ const drainSteerQueue = async (): Promise<void> => {
     async cancel(params: CancelNotification): Promise<void> {
       logger.info(`Cancel request for session ${params.sessionId}`);
       cancelledSessions.add(params.sessionId);
+      // Record which prompt generation this cancel targets — the one currently
+      // executing (inFlightGen). A fresh prompt queued behind the cancelled one
+      // has a LATER generation, so executePrompt's before-start check (which
+      // matches the cancel's target generation against the prompt's own) will
+      // not cancel it.
+      const targetGen = inFlightGen.get(params.sessionId);
+      if (targetGen !== undefined) {
+        cancelledGen.set(params.sessionId, targetGen);
+      }
       // Discard steers that never reached the model.
       //
       // Claude CLI cannot inject mid-turn, so a steer waits in this queue until
@@ -5322,11 +5411,23 @@ const drainSteerQueue = async (): Promise<void> => {
     /**
      * Handle custom (non-standard) ACP notifications.
      * The SDK's AgentSideConnection dispatches unknown notification methods here.
-     * Used for session/steer.
+     * Used for session/steer and session/stop.
      */
     async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
       if (method === "session/steer") {
         return handleSteer(params as { sessionId: string; text: string });
+      }
+      // `session/stop`: the host's "kill background processes" notification
+      // (Codex/Codex-ACP handle it to terminate spawned long-running processes
+      // WITHOUT interrupting the active turn). The Claude CLI has no separate
+      // background-process pool — its subprocess IS the turn, and stopping the
+      // turn is `session/cancel`'s job. Acknowledge as a no-op so the host's
+      // Stop path (which sends session/stop + session/cancel) doesn't log a
+      // spurious "Unknown notification method: session/stop" warning.
+      if (method === "session/stop") {
+        const sessionId = (params as { sessionId?: string })?.sessionId;
+        logger.info(`session/stop for session ${sessionId ?? "(none)"} — no separate background processes to stop (Claude CLI subprocess is the turn); no-op`);
+        return;
       }
       logger.warn(`Unknown notification method: ${method}`);
     },
