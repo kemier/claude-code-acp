@@ -28,7 +28,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { SessionStore, type SessionInfo } from "./session-store.js";
 import { buildMidTurnModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
-import { ClaudeRunner, isProxyBaseUrl, type StreamEvent } from "./claude-runner.js";
+import { ClaudeRunner, isProxyBaseUrl, type StreamEvent, type McpServerConfig } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
@@ -52,6 +52,61 @@ function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
+}
+
+/**
+ * Normalize the ACP `mcpServers` request param into internal
+ * `McpServerConfig[]` (the shape `claude-runner.buildMcpArgs` consumes).
+ *
+ * Accepts the ACP *wire* shape (`McpServerStdio`: flat
+ * `{name, command, args, env: EnvVariable[]}` — what vscode-acp sends in
+ * newSession/loadSession/resumeSession) as well as the legacy nested
+ * `{transport: {type, command, args, env}}` form, and normalizes `env` to a
+ * `Record<string,string>`. Non-stdio entries are dropped.
+ */
+function normalizeMcpServers(servers: any[]): McpServerConfig[] {
+  return servers
+    .filter(
+      (s: any) =>
+        (s && s.transport && s.transport.type === "stdio") ||
+        (s && s.command && typeof s.command === "string")
+    )
+    .map((s: any) => {
+      const t = s.transport && s.transport.type === "stdio" ? s.transport : s;
+      const command = t.command;
+      const args = t.args ?? [];
+      // env may be the ACP wire form (Array<{name,value}>) or a plain object.
+      const rawEnv = t.env;
+      const env: Record<string, string> = {};
+      if (Array.isArray(rawEnv)) {
+        for (const v of rawEnv) {
+          if (v && typeof v.name === "string" && typeof v.value === "string") {
+            env[v.name] = v.value;
+          }
+        }
+      } else if (rawEnv && typeof rawEnv === "object") {
+        for (const [k, val] of Object.entries(rawEnv)) {
+          env[k] = String(val);
+        }
+      }
+      try {
+        validateMcpCommand(command);
+        validateMcpArgs(args);
+      } catch (err) {
+        throw RequestError.invalidParams(
+          `Invalid MCP server config: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return {
+        name: s.name ?? s.id ?? "unknown",
+        transport: {
+          type: "stdio" as const,
+          command,
+          args,
+          env,
+        },
+      };
+    });
 }
 
 // Monotonic id for one-shot agent_message_chunk emits (slash-command
@@ -4718,30 +4773,7 @@ const drainSteerQueue = async (): Promise<void> => {
       }
 
       const sessionId = generateSessionId();
-      // Convert and validate ACP MCP server format
-      const mcpServers = (params.mcpServers ?? [])
-        .filter((s: any) => s.transport?.type === "stdio")
-        .map((s: any) => {
-          const command = s.transport.command;
-          const args = s.transport.args ?? [];
-          try {
-            validateMcpCommand(command);
-            validateMcpArgs(args);
-          } catch (err) {
-            throw RequestError.invalidParams(
-              `Invalid MCP server config: ${err instanceof Error ? err.message : String(err)}`
-            );
-          }
-          return {
-            name: s.name ?? s.id ?? "unknown",
-            transport: {
-              type: "stdio" as const,
-              command,
-              args,
-              env: s.transport.env,
-            },
-          };
-        });
+      const mcpServers = normalizeMcpServers(params.mcpServers ?? []);
       store.create(sessionId, resolvedCwd, mcpServers);
       logger.info(
         `Session created: ${sessionId} (cwd: ${resolvedCwd}, mcpServers: ${mcpServers.length})`
@@ -4789,7 +4821,7 @@ const drainSteerQueue = async (): Promise<void> => {
          logger.info(
            `Load session ${sessionId} unknown to this process — rehydrating from cwd ${params.cwd}`
          );
-         store.ensure(sessionId, params.cwd, (params as any).mcpServers ?? []);
+         store.ensure(sessionId, params.cwd, normalizeMcpServers((params as any).mcpServers ?? []));
        } else {
          throw RequestError.resourceNotFound(
            `Session ${sessionId} not found`
@@ -5051,7 +5083,7 @@ const drainSteerQueue = async (): Promise<void> => {
           logger.info(
             `Fork source ${sourceSessionId} unknown to this process — rehydrating from cwd ${params.cwd}`
           );
-          store.ensure(sourceSessionId, params.cwd, (params as any).mcpServers ?? []);
+          store.ensure(sourceSessionId, params.cwd, normalizeMcpServers((params as any).mcpServers ?? []));
         } else {
           throw RequestError.resourceNotFound(
             `Session ${sourceSessionId} not found`
@@ -5122,7 +5154,7 @@ const drainSteerQueue = async (): Promise<void> => {
       const forkCwd =
         typeof params.cwd === "string" && params.cwd ? params.cwd : sourceCwd;
       const forkAcpId = generateSessionId();
-      store.create(forkAcpId, forkCwd, (params as any).mcpServers ?? []);
+      store.create(forkAcpId, forkCwd, normalizeMcpServers((params as any).mcpServers ?? []));
       store.setClaudeSessionId(forkAcpId, forkClaudeId);
 
       logger.info(
