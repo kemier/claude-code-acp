@@ -951,12 +951,36 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
 const REPLAY_PROMPT_FRAMING_RE =
   /^(?:\[Follow-up instruction from user\]\n|\[Goal:[^\]]*\]\n\n|Please start working toward this goal now:\n\n)+/;
 
+// The <collaboration_mode> developer block is prepended to effectivePrompt in
+// executePrompt (plan-mode instruction injection) and is therefore SENT to the
+// Claude CLI, which persists the wrapped text into the JSONL transcript as a
+// `type:"user"` entry. On resume/loadSession that block would otherwise replay
+// into the chat panel as a user bubble — the user's own message arrives with a
+// wall of "Collaboration Mode: Default/Plan … EnterPlanMode …" instructions
+// they never typed. It is authoritative for the CLI's context, so it must NOT
+// be stripped from what is sent to the model — only from the REPLAYED display.
+// Same wrap-sent-to-CLI / strip-on-replay pattern as the framing above.
+//
+// Non-greedy up to the FIRST closing tag: the user's text (and the memory /
+// persona / skill blocks that follow it in the transcript) never contains a
+// well-formed <collaboration_mode>…</collaboration_mode> pair, so the first
+// closer delimits the injected block. Written with escaped angle brackets
+// (backslash + angle) so the tag is a plain regex literal — not a character
+// class.
+const REPLAY_COLLAB_MODE_BLOCK_RE =
+  /^\<collaboration_mode>[\s\S]*?\<\/collaboration_mode>\n*/i;
+
 export function stripReplayPromptFraming(text: string): string {
   let prev: string;
   let cur = text;
   do {
     prev = cur;
     cur = cur.replace(REPLAY_PROMPT_FRAMING_RE, "");
+    // Strip a leading <collaboration_mode> block, then re-apply the framing
+    // strip — the mode block and the steer/goal framing can nest (a steered
+    // prompt carries BOTH: <collaboration_mode>…</collaboration_mode>\n\n
+    // [Follow-up instruction from user]…). Iterate both to a fixed point.
+    cur = cur.replace(REPLAY_COLLAB_MODE_BLOCK_RE, "");
   } while (cur !== prev);
   return cur;
 }

@@ -106,6 +106,38 @@ describe("stripReplayPromptFraming (unit)", () => {
     const plain = "a user message that merely mentions [Goal: x] inline";
     expect(stripReplayPromptFraming(plain)).toBe(plain);
   });
+
+  // A leading <collaboration_mode> block (prepended to effectivePrompt and sent
+  // to the CLI) must be stripped on replay so the user's own message comes back
+  // clean. Interior blocks are preserved (the user may legitimately discuss the
+  // tag in their text).
+  const MODE_BLOCK =
+    "<collaboration_mode># Collaboration Mode: Default\n\n" +
+    "You are in Default mode: you may read and edit the codebase and execute commands.\n\n" +
+    "</collaboration_mode>\n\n";
+
+  it("strips a leading <collaboration_mode> block", () => {
+    expect(stripReplayPromptFraming(MODE_BLOCK + "fix the bug")).toBe("fix the bug");
+  });
+
+  it("strips a nested <collaboration_mode> + steer framing to a fixed point", () => {
+    expect(
+      stripReplayPromptFraming(MODE_BLOCK + "[Follow-up instruction from user]\ngo on"),
+    ).toBe("go on");
+    // Steer framing outside the block (the order the CLI may persist).
+    expect(
+      stripReplayPromptFraming("[Follow-up instruction from user]\n" + MODE_BLOCK + "ship it"),
+    ).toBe("ship it");
+  });
+
+  it("keeps an interior <collaboration_mode> block in user prose", () => {
+    const mid = "before <collaboration_mode>x</collaboration_mode> after";
+    expect(stripReplayPromptFraming(mid)).toBe(mid);
+  });
+
+  it("leaves messages without a mode block untouched", () => {
+    expect(stripReplayPromptFraming("just a plain message")).toBe("just a plain message");
+  });
 });
 
 describe("loadSession replay strips steer/goal framing", () => {
