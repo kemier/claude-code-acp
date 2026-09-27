@@ -4212,6 +4212,18 @@ const drainSteerQueue = async (): Promise<void> => {
       const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
       let result;
       if (!skipMainTurn) {
+      // Ensure the proxy /v1/models fetch has settled before the first
+      // getContextWindowForModel call. startAgent() fires it as a
+      // fire-and-forget; if the first prompt arrives before the ~200ms
+      // fetch resolves, the map is empty and the lookup falls through to
+      // CLAUDE_CODE_MAX_CONTEXT_TOKENS (pinned to one model's window),
+      // mis-computing the compaction threshold for every other model.
+      // After the first await the map is populated for the rest of the
+      // process lifetime — subsequent prompts skip this (the promise is
+      // already resolved).
+      if (modelContextWindowsLoadPromise) {
+        await modelContextWindowsLoadPromise;
+      }
       // ─── Pre-turn compaction guard ────────────────────────────────
       // The post-turn auto-compact check (below, after "Prompt completed")
       // runs against `sessionLastUsage` — the REAL prompt count from the
