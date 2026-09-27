@@ -2470,6 +2470,61 @@ export function createClaudeCodeAgent(
   }
 
   /**
+   * Collapse all whitespace runs to a single space and trim, for robust steer
+   * matching. The client (vscode-acp) sends and echoes steer text through the
+   * same collapsed rule (its `collapseWhitespaceChars` / `steerEchoMatchesEntry`),
+   * so comparing collapsed forms tolerates the line-wrap / trailing-space drift
+   * between what the user typed, what was queued, and what is echoed back.
+   */
+  const collapseSteerText = (s: string): string => s.replace(/\s+/g, " ").trim();
+
+  /**
+   * Retract a steer that the client queued (via `session/steer`) but then removed
+   * from its own queue (the user deleted the queue chip). `session/steer` is a
+   * notification with no retract, so without this the message would sit in
+   * `steerQueues` and be delivered as a follow-up turn at the end of the current
+   * one — i.e. the model would answer a message the user deleted.
+   *
+   * Symmetric with `handleSteer`: match on collapsed text, remove the first
+   * queued entry that matches, and emit a `user_message_removed` sessionUpdate so
+   * the client can drop the bubble it showed at stage-1 accept. If the matching
+   * steer was already delivered to the model (drainSteerQueue ran), there is
+   * nothing left in the queue to remove and this is a documented no-op — a steer
+   * the model already saw cannot be unsent.
+   */
+  async function handleSteerRemove(params: { sessionId: string; text: string }): Promise<void> {
+    const { sessionId, text } = params;
+    if (!store.has(sessionId)) {
+      logger.warn(`Steer-remove for unknown session ${sessionId}`);
+      return;
+    }
+    const queue = steerQueues.get(sessionId);
+    const target = collapseSteerText(text);
+    if (!queue || !target) {
+      // Nothing queued (or empty text) — the steer was either already drained
+      // into the model or never accepted. No-op.
+      logger.info(`Steer-remove for session ${sessionId}: no queued steer to retract (queueLen=${queue?.length ?? 0})`);
+      return;
+    }
+    const idx = queue.findIndex((q) => collapseSteerText(q) === target);
+    if (idx === -1) {
+      logger.info(`Steer-remove for session ${sessionId}: no matching queued steer (already delivered or never queued)`);
+      return;
+    }
+    queue.splice(idx, 1);
+    logger.info(`Steer removed for session ${sessionId}: ${text.length} chars (remaining=${queue.length})`);
+    await connection
+      .sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "user_message_removed",
+          content: { type: "text", text },
+        } as any,
+      })
+      .catch(() => { /* non-fatal: visual-only retract ack */ });
+  }
+
+  /**
    * Reusable compaction flow — used by both the /compact slash command
    * and the auto-compact trigger. Asks the LLM to summarize the current
    * conversation, then replaces the old Claude session with a fresh one
@@ -5552,6 +5607,9 @@ const drainSteerQueue = async (): Promise<void> => {
     async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
       if (method === "session/steer") {
         return handleSteer(params as { sessionId: string; text: string });
+      }
+      if (method === "session/steer-remove") {
+        return handleSteerRemove(params as { sessionId: string; text: string });
       }
       // `session/stop`: the host's "kill background processes" notification
       // (Codex/Codex-ACP handle it to terminate spawned long-running processes
