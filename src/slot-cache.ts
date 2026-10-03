@@ -58,6 +58,19 @@ export function getLlamaServerUrl(): string | null {
 }
 
 /**
+ * Auth header for the slot endpoint. llama.cpp's /slots is unauthenticated, but
+ * Strata gates it behind the same API key as the chat API. Read the key from
+ * CLAUDE_SLOT_CACHE_API_KEY, falling back to the token Claude Code already uses.
+ */
+function slotAuthHeaders(): Record<string, string> {
+  const key =
+    process.env.CLAUDE_SLOT_CACHE_API_KEY ||
+    process.env.ANTHROPIC_AUTH_TOKEN ||
+    process.env.ANTHROPIC_API_KEY;
+  return key ? { Authorization: `Bearer ${key}` } : {};
+}
+
+/**
  * Save the KV cache for a llama-server slot to a file.
  */
 export async function saveSlotCache(
@@ -81,7 +94,7 @@ export async function saveSlotCache(
   try {
     const res = await fetch(`${base}/slots/${slotId}?action=save`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...slotAuthHeaders() },
       body: JSON.stringify({ filename }),
       signal: AbortSignal.timeout(SAVE_TIMEOUT_MS),
     });
@@ -143,7 +156,7 @@ export async function restoreSlotCache(
   try {
     const res = await fetch(`${base}/slots/${slotId}?action=restore`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...slotAuthHeaders() },
       body: JSON.stringify({ filename }),
       signal: AbortSignal.timeout(RESTORE_TIMEOUT_MS),
     });
@@ -200,6 +213,7 @@ export async function getAllSlots(): Promise<Array<{
   try {
     const res = await fetch(`${base}/slots`, {
       method: "GET",
+      headers: { ...slotAuthHeaders() },
       signal: AbortSignal.timeout(SLOT_INFO_TIMEOUT_MS),
     });
     if (!res.ok) {
