@@ -45,8 +45,10 @@ import {
   validateMcpCommand,
   validateMcpArgs,
 } from "./validation.js";
-import { isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath } from "node:path";
+import { isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath, join as joinPath } from "node:path";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
 
 function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -671,6 +673,13 @@ const DEFAULT_CONTEXT_WINDOW = 200_000;
 // Cached map of model-id → context_length, fetched from the proxy's
 // /v1/models endpoint. Falls back to DEFAULT_CONTEXT_WINDOW.
 const modelContextWindows = new Map<string, number>();
+// Cached map of model-id → vision-capable, derived from the proxy's
+// /v1/models `tags` (the `multimodal` tag, matching ericli's
+// hasMultimodalTag). Populated alongside modelContextWindows. When the proxy
+// is not in use (no base-url override) the map stays empty and the
+// name-pattern fallback in modelSupportsVision() decides — Claude's own
+// models are vision-capable, so the default is true for a bare Claude session.
+const modelVisionCapable = new Map<string, boolean>();
 // Once a fetch has SUCCEEDED this is set so we don't re-fetch on every lookup.
 // A FAILED fetch (proxy unreachable, non-200) deliberately leaves this false so
 // the next caller retries — otherwise a transiently-unreachable proxy at
@@ -716,11 +725,17 @@ export async function loadModelContextWindows(): Promise<void> {
         logger.warn(`Failed to fetch /v1/models from proxy (${resp.status}): ${url}`);
         return;
       }
-      const body = await resp.json() as { data?: Array<{ id: string; context_length?: number }> };
+      const body = await resp.json() as { data?: Array<{ id: string; context_length?: number; tags?: string[] }> };
       if (body.data) {
         for (const m of body.data) {
           if (typeof m.context_length === "number" && m.context_length > 0) {
             modelContextWindows.set(m.id, m.context_length);
+          }
+          // Capture the multimodal tag so image prompts can be gated on the
+          // backend's actual vision capability (a proxy base-url override can
+          // serve a text-only model behind the "Claude" wire format).
+          if (Array.isArray(m.tags)) {
+            modelVisionCapable.set(m.id, m.tags.some((t) => String(t).toLowerCase() === "multimodal"));
           }
         }
         logger.info(`Loaded ${modelContextWindows.size} model context windows from proxy`);
@@ -735,6 +750,91 @@ export async function loadModelContextWindows(): Promise<void> {
     }
   })();
   return modelContextWindowsLoadPromise;
+}
+
+/**
+ * Name-pattern fallback for vision capability, used when the proxy tag map has
+ * no entry for the model (proxy not in use, tag fetch failed, or a model the
+ * catalog didn't advertise). Mirrors pi-acp's modelSupportsImage: the common
+ * multimodal families. A bare Claude session (no base-url override) is
+ * vision-capable by default, so an unknown id on the native Claude path
+ * defaults to true — only a PROXY-served model with a known text-only name
+ * defaults to false.
+ */
+const VISION_MODEL_NAME_PATTERN =
+  /(^|[^a-z])(claude|gpt-4o|gpt-4\.1|gpt-5|gemini|qwen.*vl|qwen3\.8-27b|llava|glm-4v|glm-4\.5v|phi-3-vision|o1|o3|o4|deepseek-vl|kimi-vl)/i;
+
+/**
+ * True when the model serving this session can accept image inputs.
+ *
+ * Priority:
+ *  1. Proxy tag map (authoritative — the backend curator's `multimodal` tag).
+ *  2. Name-pattern fallback when the map has no entry.
+ *
+ * When no proxy base-url is configured (native Claude), the map is empty and
+ * the name pattern matches "claude" → true, so image prompts pass through
+ * unchanged (zero behavior change for the common case).
+ */
+export function modelSupportsVision(modelId: string | undefined): boolean {
+  const id = String(modelId ?? "").toLowerCase();
+  if (!id) return true; // unknown model on native Claude → assume vision-capable
+  if (modelVisionCapable.has(id)) return modelVisionCapable.get(id)!;
+  // Map miss: only a proxy base-url override makes the tag map non-empty in
+  // practice. For a proxy-served model we couldn't look up, fall back to the
+  // name pattern. For native Claude (no proxy), "claude" matches → true.
+  return VISION_MODEL_NAME_PATTERN.test(id);
+}
+
+const MIME_TO_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+  "image/svg+xml": "svg",
+};
+
+/**
+ * Graceful degradation for image prompts when the serving model is text-only
+ * (e.g. a proxy base-url override routes "Claude" to a non-multimodal backend).
+ * Instead of letting the upstream error on the image blocks, persist each image
+ * to a temp file and return a text note describing what was attached and where
+ * it lives on disk. The prompt proceeds text-only; the model/user can switch to
+ * a vision model and re-attach, or use a tool that routes to one.
+ *
+ * Mirrors codex-acp's degradeImagePromptForTextOnlyModel and ericli's
+ * writePromptImagesToTemp + buildNonVisionImageReminder: never lose the user's
+ * input, degrade instead of fail.
+ */
+export function degradeImageBlocksForTextOnlyModel(
+  images: Array<{ source: { media_type: string; data: string } }>,
+  sessionId: string,
+): { note: string; tempPaths: string[] } {
+  const tempPaths: string[] = [];
+  const notes: string[] = [];
+  for (let i = 0; i < images.length; i++) {
+    const img = images[i];
+    const mimeType = img.source?.media_type;
+    const data = img.source?.data;
+    let tempPath: string | null = null;
+    if (data) {
+      try {
+        const dir = fs.mkdtempSync(joinPath(os.tmpdir(), `claude-acp-img-${sessionId.slice(0, 8)}-`));
+        const ext = MIME_TO_EXT[mimeType] ?? (mimeType?.split("/")[1] || "png");
+        tempPath = joinPath(dir, `image-${i + 1}.${ext}`);
+        fs.writeFileSync(tempPath, Buffer.from(data, "base64"));
+        tempPaths.push(tempPath);
+      } catch (err) {
+        logger.warn(`Failed to persist attached image to temp file: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    const pathNote = tempPath ? `Saved to: ${tempPath}` : "(could not persist to disk)";
+    notes.push(
+      `[Attached image #${i + 1} (${mimeType || "unknown"}). The current model does NOT support image input, so you cannot see it. ${pathNote}. If you need to analyze it, ask the user to switch to a vision-capable model and re-attach, or use a tool that routes to one.]`,
+    );
+  }
+  return { note: notes.join("\n"), tempPaths };
 }
 
 // ─── Dynamic proxy model picker list ──────────────────────────────────────
@@ -5497,7 +5597,7 @@ const drainSteerQueue = async (): Promise<void> => {
       runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE);
 
       // Extract text from content blocks
-      const text = prompt
+      let text = prompt
         .filter((block): block is { type: "text"; text: string } =>
           block.type === "text"
         )
@@ -5515,6 +5615,32 @@ const drainSteerQueue = async (): Promise<void> => {
       // `-p <string>` path unchanged (zero behavior change).
       const promptImages = acpImageBlocksToStdinBlocks(prompt);
       const hasImages = promptImages.length > 0;
+
+      // Graceful degradation: if the serving model is text-only (e.g. a proxy
+      // base-url override routes "Claude" to a non-multimodal backend), persist
+      // the images to temp files and replace them with a text note instead of
+      // forwarding image blocks the upstream will reject. Native Claude (no
+      // proxy) is vision-capable, so this is a no-op there — zero behavior
+      // change for the common case. Mirrors codex-acp / pi-acp / ericli.
+      if (hasImages) {
+        const currentModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+        if (!modelSupportsVision(currentModel)) {
+          logger.info(
+            `Image prompt on text-only model (${currentModel || "unknown"}): degrading ${promptImages.length} image(s) to text notes`,
+          );
+          const { note, tempPaths } = degradeImageBlocksForTextOnlyModel(
+            promptImages.filter((b): b is { type: "image"; source: { media_type: string; data: string } } => b.type === "image"),
+            sessionId,
+          );
+          if (tempPaths.length > 0) {
+            logger.info(`Persisted attached images to temp files: ${tempPaths.join(", ")}`);
+          }
+          // Append the note to the prompt text so the model sees it; clear the
+          // image blocks so the turn uses the text-only `-p <string>` path.
+          promptImages.length = 0;
+          text = text + "\n" + note;
+        }
+      }
 
       // Read-only slash commands (/ps, /status, /skills, /list-agents, and
       // the no-turn subcommands of /goal) are fully serviced by
