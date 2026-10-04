@@ -158,7 +158,6 @@ describe("steer echo timing", () => {
 describe("immediate compaction completion", () => {
   it("auto-compact calls doCompact with skipCompleted=false (emit completed now)", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
-    // The auto-compact call site passes false for skipCompleted (8th arg).
     const at = src.indexOf("Emit \"completed\" IMMEDIATELY");
     expect(at).toBeGreaterThan(0);
     const body = src.slice(at, at + 1200);
@@ -167,9 +166,6 @@ describe("immediate compaction completion", () => {
 
   it("does NOT re-emit completed from the finally block (would double-fire)", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
-    // The auto-compact finally block must not call
-    // emitCompactionLifecycle(..., "completed") — that would double-fire the
-    // lifecycle and re-wipe the panel. doCompact already emitted it.
     const finallyIdx = src.indexOf("No \"completed\" re-emit here");
     expect(finallyIdx).toBeGreaterThan(0);
     const finallyBlock = src.slice(finallyIdx, finallyIdx + 600);

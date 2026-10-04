@@ -4907,11 +4907,6 @@ const drainSteerQueue = async (): Promise<void> => {
           // streamed (vscode-acp only treats compaction text as standalone
           // when nothing is mid-stream), which is exactly the concatenated,
           // never-dismissed notice this replaces.
-         // skipCompleted=true: emit "start" now, but defer "completed" until
-         // AFTER the continuation finishes. This keeps the client's
-         // isCompacting=true and "Compacting..." spinner visible while the
-         // continuation streams, so the 400ms flush timer doesn't race with
-         // continuation events and the history wipe happens at the right time.
          // Emit "completed" IMMEDIATELY once the CLI backend finishes
          // compacting (skipCompleted=false), so the client clears the panel
          // and shows the "Context compacted" notice right away — not after
