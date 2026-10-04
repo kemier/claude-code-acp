@@ -101,24 +101,46 @@ describe("steer echo timing", () => {
 });
 
 /**
- * The auto-compact lifecycle defers "completed" until the post-compaction
- * continuation finishes (so the client flushes history only once the fresh panel
- * has content). That deferred emit used to sit AFTER the continuation await, so a
- * throw — Claude CLI error, aborted turn — left the lifecycle stuck at "start" and
- * the client kept a "Compacting conversation..." banner for the rest of the
- * session. Same stranding class as ericli's compaction row, which span forever
- * because only the in_progress frame was ever sent.
+ * The auto-compact lifecycle emits "completed" IMMEDIATELY once the CLI backend
+ * finishes compacting (doCompact with skipCompleted=false), so the client clears
+ * the panel and shows the "Context compacted" notice right away. The continuation
+ * (re-sent original prompt) then streams into the fresh panel; the client's
+ * pendingPostCompactChunks buffer absorbs any continuation chunks that arrive
+ * inside the 400ms flush window.
+ *
+ * Because "completed" fires BEFORE the continuation starts, a failing
+ * continuation (Claude CLI error, aborted turn) can no longer leave the
+ * lifecycle stuck at "start" — the client already flushed. The finally block
+ * only re-pushes the plan snapshot to the continuation's final board state.
  */
-describe("deferred compaction completion", () => {
-  it("is emitted from a finally block, so a failing continuation still closes it", () => {
+describe("immediate compaction completion", () => {
+  it("auto-compact calls doCompact with skipCompleted=false (emit completed now)", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
-    const emit = src.indexOf('compactResult.compactionId, "completed"');
-    expect(emit).toBeGreaterThan(0);
-    // Walk back to the nearest block opener and require it to be a finally.
-    const before = src.slice(0, emit);
-    expect(before.lastIndexOf("} finally {")).toBeGreaterThan(before.lastIndexOf("try {"));
-    // The comment must say why, for whoever reads this next.
-    expect(src).toContain("on failure it at least stops showing");
+    // The auto-compact call site passes false for skipCompleted (8th arg).
+    const at = src.indexOf("Emit \"completed\" IMMEDIATELY");
+    expect(at).toBeGreaterThan(0);
+    const body = src.slice(at, at + 1200);
+    expect(body).toContain("false, // skipCompleted=false");
+  });
+
+  it("does NOT re-emit completed from the finally block (would double-fire)", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
+    // The auto-compact finally block must not call
+    // emitCompactionLifecycle(..., "completed") — that would double-fire the
+    // lifecycle and re-wipe the panel. doCompact already emitted it.
+    const finallyIdx = src.indexOf("No \"completed\" re-emit here");
+    expect(finallyIdx).toBeGreaterThan(0);
+    const finallyBlock = src.slice(finallyIdx, finallyIdx + 600);
+    expect(finallyBlock).not.toContain('emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed")');
+  });
+
+  it("emits a post-compaction usage_update so the ring drops immediately", () => {
+    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
+    const at = src.indexOf("Drop the pre-compaction usage");
+    expect(at).toBeGreaterThan(0);
+    const body = src.slice(at, at + 700);
+    expect(body).toContain('sessionUpdate: "usage_update"');
+    expect(body).toContain("sessionLastUsage.delete(sessionId)");
   });
 
   it("keeps the failure path for the non-deferred case", () => {

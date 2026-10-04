@@ -4616,6 +4616,14 @@ const drainSteerQueue = async (): Promise<void> => {
          // isCompacting=true and "Compacting..." spinner visible while the
          // continuation streams, so the 400ms flush timer doesn't race with
          // continuation events and the history wipe happens at the right time.
+         // Emit "completed" IMMEDIATELY once the CLI backend finishes
+         // compacting (skipCompleted=false), so the client clears the panel
+         // and shows the "Context compacted" notice right away — not after
+         // the continuation turn finishes. The continuation (re-sent original
+         // prompt) then streams into the fresh panel as a new first line.
+         // The client's pendingPostCompactChunks buffer absorbs any
+         // continuation chunks that arrive inside the 400ms flush window, so
+         // the immediate "completed" does not race the continuation.
          const compactResult = await doCompact(
            sessionId,
            connection,
@@ -4624,12 +4632,34 @@ const drainSteerQueue = async (): Promise<void> => {
            runModel,
            runEffort,
            false, // no "No conversation to compact yet." text for auto-compact
-           true,  // skipCompleted — emit "completed" after continuation
+           false, // skipCompleted=false — emit "completed" now, not after continuation
          ) as { compactionId: string; summary: string } | false;
-         // try/finally: the continuation below can throw (Claude CLI error, aborted
-         // turn). The deferred "completed" used to sit after it, so a throw left the
-         // lifecycle stuck at "start" and the client kept a "Compacting
-         // conversation..." banner for the rest of the session.
+         // doCompact already emitted "completed" + re-pushed the plan snapshot
+         // (skipCompleted=false path). Drop the pre-compaction usage so the
+         // ring doesn't show the stale count; the continuation's own
+         // usage_update (below) repaints it with the fresh session's size.
+         if (compactResult && typeof compactResult === 'object') {
+           sessionLastUsage.delete(sessionId);
+           const _postCompactEstimate = ctxEstimator.getEstimatedTokens();
+           const _postCompactWindow = getContextWindowForModel(runModelResolved);
+           await connection
+             .sessionUpdate({
+               sessionId,
+               update: {
+                 sessionUpdate: "usage_update",
+                 used: Math.min(_postCompactEstimate, _postCompactWindow),
+                 size: _postCompactWindow,
+               } as any,
+             })
+             .catch(() => {});
+         }
+         // try/finally: the continuation below can throw (Claude CLI error,
+         // aborted turn). "completed" was already emitted by doCompact, so a
+         // throw here no longer leaves the lifecycle stuck at "start" — the
+         // client already flushed. The finally block only re-pushes the plan
+         // snapshot if the continuation succeeded (doCompact's re-push ran
+         // before the continuation; a successful continuation may have
+         // updated the board, so refresh it).
          try {
            // After compaction, re-send the original user prompt so the LLM
            // continues the task in the fresh (compacted) session. This matches
@@ -4683,20 +4713,14 @@ const drainSteerQueue = async (): Promise<void> => {
              }).catch(() => {});
            }
          } finally {
-           // Emit "completed" now the continuation is over — successfully or
-           // not. On success the client can safely flush (wipe old history,
-           // show the compact notice, drain buffered continuation chunks into
-           // the fresh panel); on failure it at least stops showing
-           // "Compacting conversation..." forever.
+           // "completed" was already emitted by doCompact (skipCompleted=false),
+           // so the client has already flushed the panel and shown the notice.
+           // The continuation has now finished (successfully or not). Re-push
+           // the plan snapshot: the continuation's TaskCreate/TaskUpdate calls
+           // may have changed the board since doCompact's initial re-push, so
+           // refresh it to the final state. (No "completed" re-emit here —
+           // that would double-fire the lifecycle and re-wipe the panel.)
            if (compactResult && typeof compactResult === 'object') {
-             await emitCompactionLifecycle(connection, sessionId, compactResult.compactionId, "completed");
-             // Re-push the plan snapshot right after the "completed" frame —
-             // that frame is what makes the client wipe its plan bar (history
-             // flush), so emitting here is the moment the bar is cleared and
-             // ready to repopulate. doCompact's own re-push is skipped on the
-             // auto-compact path (skipCompleted=true) precisely so it doesn't
-             // race this flush. Same handleTaskTool(out) pattern: buffer the
-             // snapshot, then emit it now.
              const out: { snapshot?: any } = {};
              handleTaskTool(sessionId, "TaskList", {}, out);
              if (out.snapshot) {
