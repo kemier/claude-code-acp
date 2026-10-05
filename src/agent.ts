@@ -2277,6 +2277,17 @@ export function createClaudeCodeAgent(
   // Maps sessionId → (Claude tool_use_id → ACP toolCallId).
   const sessionPendingTools = new Map<string, Map<string, string>>();
 
+  // Parallel to sessionPendingTools: maps toolUseId → toolName so the
+  // permission_request handler can correlate by name (the permission event
+  // carries toolName but NOT the original tool_use's toolUseId).
+  const sessionPendingToolNames = new Map<string, Map<string, string>>();
+
+  // Background post-turn drain promises. executePrompt returns its JSON-RPC
+  // response immediately after the LLM turn; the drain's follow-up turns run
+  // in the background. The next prompt() chains on this so it waits for the
+  // drain's LLM turns before starting.
+  const pendingDrainPromises = new Map<string, Promise<void>>();
+
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
   // We mirror them into ACP `session/update` with sessionUpdate:"plan" +
@@ -4079,6 +4090,14 @@ export function createClaudeCodeAgent(
            sessionPendingTools.set(sessionId, pendingTools);
          }
          pendingTools.set(event.toolUseId, toolCallId);
+         // Track toolName in parallel so the permission_request handler can
+         // correlate by name (the permission event lacks toolUseId).
+         let pendingNames = sessionPendingToolNames.get(sessionId);
+         if (!pendingNames) {
+           pendingNames = new Map();
+           sessionPendingToolNames.set(sessionId, pendingNames);
+         }
+         pendingNames.set(event.toolUseId, event.toolName);
          // Server-side / network-blocked web tool watchdog. WebSearch
          // executes on Anthropic's API, so on a proxy route (non-anthropic
          // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes it
@@ -4179,6 +4198,22 @@ export function createClaudeCodeAgent(
        const toolInput = event.toolInput ?? {};
        logger.info(`Permission request: ${toolName}`);
 
+        // Correlate the permission event back to the original in-progress
+        // tool_use row by toolName (the permission event lacks toolUseId).
+        // On approval, flip the original row to completed so it doesn't keep
+        // spinning while the separate permission row is the one that resolves.
+        const _matchNames = sessionPendingToolNames.get(sessionId);
+        const _matchTools = sessionPendingTools.get(sessionId);
+        let _matchedToolUseId: string | null = null;
+        if (_matchNames && _matchTools) {
+          for (const [tuId, name] of _matchNames) {
+            if (name === toolName && _matchTools.has(tuId)) {
+              _matchedToolUseId = tuId;
+              break;
+            }
+          }
+        }
+
         // Build the descriptive title + kind + diff content once, then reuse
         // across the pending → completed/failed lifecycle.
         const baseUpdate = buildToolCallUpdate(toolCallId, toolName, toolInput, store.getCwd(sessionId));
@@ -4221,13 +4256,31 @@ export function createClaudeCodeAgent(
               sessionId,
               update: {
                 ...baseUpdate,
-                // Flip the existing pending row via tool_call_update so the
-                // client updates the row in place instead of adding a second
-                // completed row and leaving the pending one spinning.
                 sessionUpdate: "tool_call_update",
                 status: isApproved ? "completed" : "failed",
               },
             });
+
+            // Flip the original in-progress tool_use row to completed and
+            // clean up both pending maps so the tool_result handler doesn't
+            // double-flip.
+            if (isApproved && _matchedToolUseId && _matchTools && _matchNames) {
+              const acpId = _matchTools.get(_matchedToolUseId);
+              if (acpId) {
+                connection.sessionUpdate({
+                  sessionId,
+                  update: {
+                    sessionUpdate: "tool_call_update",
+                    toolCallId: acpId,
+                    status: "completed",
+                  },
+                }).catch(() => {});
+                _matchTools.delete(_matchedToolUseId);
+                _matchNames.delete(_matchedToolUseId);
+                if (_matchTools.size === 0) sessionPendingTools.delete(sessionId);
+                if (_matchNames.size === 0) sessionPendingToolNames.delete(sessionId);
+              }
+            }
           })
           .catch((err) => {
             logger.error(
@@ -4793,7 +4846,15 @@ const drainSteerQueue = async (): Promise<void> => {
      logger.info(`Prompt completed for session ${sessionId}`);
 
       // Drain any steers queued during this turn (see drainSteerQueue).
-      await drainSteerQueue();
+      // Non-blocking: the drain's follow-up turns run in the background so
+      // executePrompt can return its JSON-RPC response immediately. A new
+      // session/prompt chains on sessionPromptLocks + pendingDrainPromises
+      // and waits for the drain's turn to finish before starting.
+      const drainPromise = drainSteerQueue().catch((e) => {
+        logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      pendingDrainPromises.set(sessionId, drainPromise);
+      void drainPromise.finally(() => pendingDrainPromises.delete(sessionId));
 
       // ─── Auto-compact check ───────────────────────────────────────────
       // Uses the same threshold Claude Code CLI computes (context window,
@@ -4945,7 +5006,17 @@ const drainSteerQueue = async (): Promise<void> => {
       // prompt. This mirrors the vscode-acp client, which holds its own
       // message queue while `isCompacting` and drains it once compaction
       // finishes. No-op when nothing was queued.
-      await drainSteerQueue();
+      //
+      // Non-blocking: same rationale as the post-turn drain above —
+      // executePrompt must return so the session/prompt JSON-RPC response
+      // is sent. The next prompt chains on pendingDrainPromises.
+      {
+        const dp = drainSteerQueue().catch((e) => {
+          logger.error(`Post-compact drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+        });
+        pendingDrainPromises.set(sessionId, dp);
+        void dp.finally(() => pendingDrainPromises.delete(sessionId));
+      }
 
       // If Claude CLI reported an error result (e.g. error_max_turns — the
       // model hit the turn ceiling mid-task), surface it to the user as an
@@ -5773,7 +5844,10 @@ const drainSteerQueue = async (): Promise<void> => {
       // prior prompt finishes. The lock is keyed by session and always
       // replaced, so it never holds a stale promise across /clear (which
       // resolves quickly and clears per-session state under the lock too).
-      const prev = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+      const prev = (sessionPromptLocks.get(sessionId) ?? Promise.resolve()).then(
+        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve(),
+        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve(),
+      );
       // Assign this prompt a monotonically-increasing generation for the
       // session. A cancel() latches by generation (the one in flight at cancel
       // time), so a NEW prompt queued behind a cancelled one (a later
