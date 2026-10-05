@@ -120,22 +120,42 @@ describe("ClaudeRunner with config", () => {
     expect(args).toContain("Read");
   });
 
-  it("should strip ANTHROPIC_API_KEY from env", async () => {
-    const runner = new ClaudeRunner({
-      model: undefined,
-      allowedTools: [],
-      maxTurns: undefined,
-      timeout: 300000,
-      dangerouslySkipPermissions: false,
-    });
+  it("keeps ANTHROPIC_API_KEY but strips nested-session vars", async () => {
+    // sanitizeEnv intentionally KEEPS ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+    // so the spawned claude CLI routes through the CCR gateway → ericai-proxy
+    // → EricAI vLLM (API-key auth, not subscription auth). It strips the
+    // CLAUDECODE* vars that would make claude refuse a nested session.
+    const origKey = process.env.ANTHROPIC_API_KEY;
+    const origClaudecode = process.env.CLAUDECODE;
+    process.env.ANTHROPIC_API_KEY = "test-proxy-key";
+    process.env.CLAUDECODE = "1";
+    try {
+      const runner = new ClaudeRunner({
+        model: undefined,
+        allowedTools: [],
+        maxTurns: undefined,
+        timeout: 300000,
+        dangerouslySkipPermissions: false,
+      });
 
-    mockSpawn.mockReturnValue(
-      createMockProcess(JSON.stringify({ result: "ok", session_id: "s1" }))
-    );
+      mockSpawn.mockReturnValue(
+        createMockProcess(JSON.stringify({ result: "ok", session_id: "s1" }))
+      );
 
-    await runner.startSession("/tmp", "test");
+      await runner.startSession("/tmp", "test");
 
-    const spawnOptions = mockSpawn.mock.calls[0][2] as any;
-    expect(spawnOptions.env.ANTHROPIC_API_KEY).toBeUndefined();
+      const spawnOptions = mockSpawn.mock.calls[0][2] as any;
+      // The proxy API key is preserved for the gateway chain.
+      expect(spawnOptions.env.ANTHROPIC_API_KEY).toBe("test-proxy-key");
+      // Nested-session markers are stripped so claude doesn't refuse to run.
+      expect(spawnOptions.env.CLAUDECODE).toBeUndefined();
+      expect(spawnOptions.env.CLAUDE_CODE_SESSION_ID).toBeUndefined();
+    } finally {
+      // Restore the test process's real env so sibling tests are unaffected.
+      if (origKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = origKey;
+      if (origClaudecode === undefined) delete process.env.CLAUDECODE;
+      else process.env.CLAUDECODE = origClaudecode;
+    }
   });
 });

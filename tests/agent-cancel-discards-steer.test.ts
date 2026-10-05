@@ -42,14 +42,17 @@ let runnerPrompts: string[] = [];
 
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
-    let startCalls = 0;
     this.startSessionStreaming = vi
       .fn()
       .mockImplementation(async (_cwd: string, prompt: string) => {
         runnerPrompts.push(prompt);
-        startCalls++;
-        if (startCalls === 1) {
-          // Turn 1 hangs until cancel() rejects it — the turn the user interrupts.
+        // Key the hang on the prompt text, not the call index. agent.ts re-checks
+        // for a cancel right before the spawn (the fix for the cancel-before-spawn
+        // hang), so if turn 1 (TURN-ONE) is cancelled during setup it never reaches
+        // this mock — and MESSAGE-B would otherwise become "startCalls === 1" and
+        // be hung, wedging the test. Keying on text keeps the intent stable.
+        if (prompt.includes("TURN-ONE")) {
+          // The long turn the user interrupts. Hangs until cancel() rejects it.
           return new Promise((_resolve, reject) => {
             cancelReject = reject;
           });

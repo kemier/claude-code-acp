@@ -4460,6 +4460,20 @@ const drainSteerQueue = async (): Promise<void> => {
       // doCompact above may have replaced the claude session id; re-read so
       // the resume below targets the compacted conversation when compaction
       // ran, and the original when it didn't.
+      //
+      // Cancel re-check right before the spawn. The entry check (isCancelledForGen
+      // above) runs once at executePrompt start, but the setup between that check
+      // and the CLI spawn is full of blocking awaits (model-context-window load,
+      // pre-turn compaction guard). A cancel landing in that window makes
+      // runner.cancel a no-op — there is no process to SIGINT yet — and without
+      // this re-check the spawn proceeds to a CLI that will never be cancelled,
+      // so the prompt hangs until the client's fallback timer fires.
+      if (isCancelledForGen(sessionId, promptGen)) {
+        cancelledSessions.delete(sessionId);
+        cancelledGen.delete(sessionId);
+        logger.info(`Prompt (gen ${promptGen}) cancelled during setup for session ${sessionId} — not spawning the CLI`);
+        return { stopReason: "cancelled" };
+      }
       const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
       const turnContent: import("./claude-runner.js").StdinContentBlock[] = promptImages.length > 0
         ? [{ type: "text", text: effectivePrompt }, ...promptImages]
