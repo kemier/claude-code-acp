@@ -3522,14 +3522,12 @@ export function createClaudeCodeAgent(
     if (collabMode === PLAN_COLLABORATION_MODE) {
       effectivePrompt = `<collaboration_mode># Collaboration Mode: Plan\n\nYou are now in Plan mode. Any previous instructions for other modes (e.g. Default mode) are no longer active.\n\nYour active mode changes only when new developer instructions with a different \`<collaboration_mode>...</collaboration_mode>\` change it; user requests or tool descriptions do not change mode by themselves.\n\nIn Plan mode, you MUST NOT make any changes to the codebase. Instead, analyze the request, investigate the codebase, and produce a detailed plan. Do not execute commands that modify files. Read-only investigation (searching, reading files, running read-only commands) is allowed.\n</collaboration_mode>\n\n${effectivePrompt}`;
     } else {
-      // Default mode: tell the model it MAY self-enter Plan mode on complex
-      // tasks (mirrors ericli's auto enter_plan_mode — "USE WHEN: complex
-      // multi-step tasks"). The Claude CLI exposes a native EnterPlanMode tool
-      // for this; the adapter maps it to a live picker update (enterPlanMode)
-      // and the ExitPlanMode tool flips the picker back to Default. This keeps
-      // the user in the loop: they see the picker go to "Plan" when the model
-      // decides to plan, and back to "Default" when it's ready to implement.
-      effectivePrompt = `<collaboration_mode># Collaboration Mode: Default\n\nYou are in Default mode: you may read and edit the codebase and execute commands.\n\nWhen a task requires exploration, architectural decisions, or multi-file changes — i.e. it is complex enough that planning first would avoid rework — call EnterPlanMode to switch to Plan mode, investigate read-only, and present a plan. Once the plan is ready, call ExitPlanMode to return to Default mode and implement it. For simple, well-scoped tasks, proceed directly without planning.\n</collaboration_mode>\n\n${effectivePrompt}`;
+      // Default mode. The Claude CLI does NOT expose EnterPlanMode/ExitPlanMode
+      // in headless -p mode (verified 2026-09-23: tools are interactive-only),
+      // so the model cannot self-enter Plan mode. Plan mode is entered by the
+      // user flipping the Collaboration Mode picker in the webview, which
+      // triggers applyModeChange → --permission-mode plan on the next spawn.
+      effectivePrompt = `<collaboration_mode># Collaboration Mode: Default\n\nYou are in Default mode: you may read and edit the codebase and execute commands.\n\nWhen a task requires exploration, architectural decisions, or multi-file changes — i.e. it is complex enough that planning first would avoid rework — present a plan and ask the user to switch to Plan mode via the Collaboration Mode picker before making changes. For simple, well-scoped tasks, proceed directly without planning.\n</collaboration_mode>\n\n${effectivePrompt}`;
     }
 
     const claudeSessionId = store.getClaudeSessionId(sessionId);

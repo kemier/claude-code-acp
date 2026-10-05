@@ -85,12 +85,11 @@ describe("EnterPlanMode", () => {
     expect(body).toContain("runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE)");
   });
 
-  it("default mode prompts the model it may self-enter Plan mode", () => {
-    // The Default-mode <collaboration_mode> block tells the model to call
-    // EnterPlanMode on complex tasks — the auto-entry trigger (mirrors ericli's
-    // "USE WHEN: complex multi-step tasks").
+  it("default mode prompts the model to use the picker for Plan mode", () => {
+    // The Default-mode <collaboration_mode> block tells the model to ask the
+    // user to switch to Plan mode via the picker — EnterPlanMode/ExitPlanMode
+    // are NOT available in headless -p mode, so the model cannot self-enter.
     expect(src).toContain("# Collaboration Mode: Default");
-    expect(src).toContain("call EnterPlanMode to switch to Plan mode");
-    expect(src).toContain("call ExitPlanMode to return to Default mode");
+    expect(src).toContain("switch to Plan mode via the Collaboration Mode picker");
   });
 });
