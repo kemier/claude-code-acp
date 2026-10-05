@@ -2283,6 +2283,11 @@ export function createClaudeCodeAgent(
   // shows a running phase — the command text appears only after the tool ends.
   // Maps sessionId → (Claude tool_use_id → ACP toolCallId).
   const sessionPendingTools = new Map<string, Map<string, string>>();
+  // Parallel to sessionPendingTools: maps toolUseId → toolName so the
+  // permission_request handler can correlate a permission event (which
+  // carries toolName but NOT toolUseId) back to the in-progress tool row
+  // that was emitted for the same tool_use.
+  const sessionPendingToolNames = new Map<string, Map<string, string>>();
 
   // Parallel to sessionPendingTools: maps toolUseId → toolName so the
   // permission_request handler can correlate by name (the permission event
@@ -4262,6 +4267,27 @@ export function createClaudeCodeAgent(
           sessionId,
           update: { ...baseUpdate, status: "pending" },
         });
+
+        // In Plan mode the tool_use event fires BEFORE the permission_request.
+        // The in-progress tool row was emitted as a separate DOM row with a
+        // different toolCallId (assigned at the tool_use site). When the
+        // user approves, the CLI executes the tool and emits a tool_result —
+        // but the in-progress row has been sitting in "in_progress" the whole
+        // time, so the spinner keeps going until the tool_result lands.
+        // Correlate the permission event back to the in-progress row via
+        // sessionPendingToolNames (toolUseId → toolName) and flip it to
+        // completed on approval so the spinner stops immediately.
+        const _matchNames = sessionPendingToolNames.get(sessionId);
+        const _matchTools = sessionPendingTools.get(sessionId);
+        let _matchedToolUseId: string | null = null;
+        if (_matchNames && _matchTools) {
+          for (const [tuId, name] of _matchNames) {
+            if (name === toolName && _matchTools.has(tuId)) {
+              _matchedToolUseId = tuId;
+              break;
+            }
+          }
+        }
 
         // Request permission from client (track promise for awaiting)
         const permPromise = connection
