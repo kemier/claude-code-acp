@@ -311,7 +311,7 @@ describe("ClaudeRunner", () => {
     });
   });
 
-  describe("mid-turn steer (open main-turn stdin)", () => {
+  describe("mid-turn steer (persistent process stdin)", () => {
     // A stdin mock that keeps its process OPEN (no close) so the main turn's
     // stdin handle stays registered, and captures both write() and end().
     function createOpenStdinMockProcess() {
@@ -320,6 +320,7 @@ describe("ClaudeRunner", () => {
       const stderr = new EventEmitter();
       const stdin = new EventEmitter() as any;
       stdin.destroyed = false;
+      stdin.writable = true;
       const written: string[] = [];
       stdin.write = (s: string) => { if (s) written.push(s); return true; };
       stdin.end = (s?: string) => { if (s) written.push(s); };
@@ -329,9 +330,9 @@ describe("ClaudeRunner", () => {
       (proc as any).pid = 12345;
       (proc as any).kill = vi.fn(() => true);
       // Emit ONLY the init line immediately — NOT a `result` — so the turn
-      // stays in flight (the promise does not resolve) and the open-stdin
-      // handle stays registered. The test emits `result` + close when it is
-      // ready to end the turn.
+      // stays in flight (the promise does not resolve) and the live session
+      // stays registered. The test emits `result` + close when it is ready
+      // to end the turn.
       setTimeout(() => {
         stdout.emit("data", Buffer.from(
           JSON.stringify({ type: "system", subtype: "init", session_id: "sess-open" }) + "\n"
@@ -340,14 +341,14 @@ describe("ClaudeRunner", () => {
       return { proc, written, stdout };
     }
 
-    it("writes a mid-turn steer into the in-flight turn's open stdin", async () => {
+    it("writes a mid-turn steer into the in-flight turn's stdin", async () => {
       const { proc, written, stdout } = createOpenStdinMockProcess();
       mockSpawn.mockReturnValue(proc as any);
 
       // Start the main turn. The mock emits only init (no result), so the
-      // turn is still in flight and the open-stdin handle stays registered.
-      // The 4th arg (trackingId) is the key under which the open-stdin
-      // handle is registered — in agent.ts this is the ACP sessionId.
+      // turn is still in flight and the live session stays registered.
+      // The 4th arg (trackingId) is the key under which the live session is
+      // registered — in agent.ts this is the ACP sessionId.
       const turnPromise = runner.continueSessionStreamingWithContent(
         "sess-open",
         [{ type: "text", text: "original prompt" }],
@@ -358,10 +359,8 @@ describe("ClaudeRunner", () => {
       // Let the spawn + init + initial prompt write land.
       await new Promise((r) => setTimeout(r, 10));
 
-      expect(runner.hasOpenMainTurnStdin("sess-open")).toBe(true);
-
       // Mid-turn steer: the first line was the prompt; this must be a second
-      // line written to the SAME open stdin while the turn is still in flight.
+      // line written to the SAME stdin while the turn is still in flight.
       const ok = runner.writeSteerToMainTurn("sess-open", "stop and do X instead");
       expect(ok).toBe(true);
       expect(written).toHaveLength(2);
@@ -369,7 +368,7 @@ describe("ClaudeRunner", () => {
       expect(steerLine.type).toBe("user");
       expect(steerLine.message?.content).toEqual([{ type: "text", text: "stop and do X instead" }]);
 
-      // A steer for a session with no open stdin falls back (returns false).
+      // A steer for a session with no live process falls back (returns false).
       expect(runner.writeSteerToMainTurn("no-such-session", "x")).toBe(false);
 
       // End the turn: emit the result line (turn boundary) then close.
@@ -379,8 +378,8 @@ describe("ClaudeRunner", () => {
       (proc as any).emit("close", 0);
       const result = await turnPromise;
       expect(result.sessionId).toBe("sess-open");
-      // After close, the open-stdin handle is cleaned up.
-      expect(runner.hasOpenMainTurnStdin("sess-open")).toBe(false);
+      // After close, the live session is cleaned up.
+      expect(runner.writeSteerToMainTurn("sess-open", "x")).toBe(false);
     });
   });
 });

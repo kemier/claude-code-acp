@@ -2289,17 +2289,6 @@ export function createClaudeCodeAgent(
   // that was emitted for the same tool_use.
   const sessionPendingToolNames = new Map<string, Map<string, string>>();
 
-  // Parallel to sessionPendingTools: maps toolUseId → toolName so the
-  // permission_request handler can correlate by name (the permission event
-  // carries toolName but NOT the original tool_use's toolUseId).
-  const sessionPendingToolNames = new Map<string, Map<string, string>>();
-
-  // Background post-turn drain promises. executePrompt returns its JSON-RPC
-  // response immediately after the LLM turn; the drain's follow-up turns run
-  // in the background. The next prompt() chains on this so it waits for the
-  // drain's LLM turns before starting.
-  const pendingDrainPromises = new Map<string, Promise<void>>();
-
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
   // We mirror them into ACP `session/update` with sessionUpdate:"plan" +
@@ -4274,20 +4263,6 @@ export function createClaudeCodeAgent(
         // user approves, the CLI executes the tool and emits a tool_result —
         // but the in-progress row has been sitting in "in_progress" the whole
         // time, so the spinner keeps going until the tool_result lands.
-        // Correlate the permission event back to the in-progress row via
-        // sessionPendingToolNames (toolUseId → toolName) and flip it to
-        // completed on approval so the spinner stops immediately.
-        const _matchNames = sessionPendingToolNames.get(sessionId);
-        const _matchTools = sessionPendingTools.get(sessionId);
-        let _matchedToolUseId: string | null = null;
-        if (_matchNames && _matchTools) {
-          for (const [tuId, name] of _matchNames) {
-            if (name === toolName && _matchTools.has(tuId)) {
-              _matchedToolUseId = tuId;
-              break;
-            }
-          }
-        }
 
         // Request permission from client (track promise for awaiting)
         const permPromise = connection
