@@ -40,6 +40,16 @@ vi.mock("../src/claude-runner.js", () => {
       text: "ok", sessionId: "uuid-stream",
     });
     this.cancel = vi.fn();
+    this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
+    this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+    this.startSessionStreamingWithContent = vi.fn().mockImplementation(
+      (_cwd: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+        this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
+    );
+    this.continueSessionStreamingWithContent = vi.fn().mockImplementation(
+      (_sid: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+        this.continueSessionStreaming(_sid, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
+    );
     this.setSessionPermissionMode = vi.fn();
   });
   return { ClaudeRunner: MockClaudeRunner };
@@ -155,6 +165,19 @@ describe("Agent --verbose duplicate final-block text dedup", () => {
       this.continueSessionStreaming = vi.fn().mockResolvedValue({
         text: finalText, sessionId: "uuid-verbose",
       });
+      this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
+      this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+      // Delegate the stream-json stdin path to the same event-emitting start
+      // so the verbose double-emission pattern is exercised on the main-turn
+      // (stdin) path too.
+      this.startSessionStreamingWithContent = vi.fn().mockImplementation(
+        (_cwd: string, _content: any, onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+          this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), onEvent, _trackingId, _m, _e)
+      );
+      this.continueSessionStreamingWithContent = vi.fn().mockImplementation(
+        (_sid: string, _content: any, onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+          this.continueSessionStreaming(_sid, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), onEvent, _trackingId, _m, _e)
+      );
       this.cancel = vi.fn();
     this.setSessionPermissionMode = vi.fn();
     });

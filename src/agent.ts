@@ -4560,28 +4560,28 @@ const drainSteerQueue = async (): Promise<void> => {
         return { stopReason: "cancelled" };
       }
       const claudeSessionIdForTurn = store.getClaudeSessionId(sessionId) ?? claudeSessionIdAfterDrain;
-      const turnContent: import("./claude-runner.js").StdinContentBlock[] = promptImages.length > 0
-        ? [{ type: "text", text: effectivePrompt }, ...promptImages]
-        : [];
+      // Build the stream-json stdin content for this turn. Always a text block
+      // (effectivePrompt) plus any images. Routing the MAIN turn through the
+      // stream-json stdin path (instead of the argv-prompt path) keeps the
+      // CLI's stdin OPEN for the duration of the turn, which is what lets
+      // handleSteer push a mid-turn steer into the in-flight turn (the Claude
+      // CLI absorbs a second `user` line into the running turn). The argv
+      // paths (startSessionStreaming / continueSessionStreaming) use
+      // stdio ["ignore",...] and have no open stdin to steer into.
+      const turnContent: import("./claude-runner.js").StdinContentBlock[] = [
+        { type: "text", text: effectivePrompt },
+        ...promptImages,
+      ];
       if (claudeSessionIdForTurn) {
         try {
-          result = promptImages.length > 0
-            ? await runner.continueSessionStreamingWithContent(
-                claudeSessionIdForTurn,
-                turnContent,
-                onEvent,
-                sessionId,
-                runModel,
-                runEffort
-              )
-            : await runner.continueSessionStreaming(
-                claudeSessionIdForTurn,
-                effectivePrompt,
-                onEvent,
-                sessionId,
-                runModel,
-                runEffort
-              );
+          result = await runner.continueSessionStreamingWithContent(
+            claudeSessionIdForTurn,
+            turnContent,
+            onEvent,
+            sessionId,
+            runModel,
+            runEffort
+          );
         } catch (resumeErr) {
           const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
           // A dead upstream must NOT cost the conversation. Starting fresh
@@ -4602,56 +4602,29 @@ const drainSteerQueue = async (): Promise<void> => {
             `Resume failed for ${claudeSessionIdAfterDrain}, starting fresh: ${resumeMsg}`
           );
           store.clearPersistedSession(cwd);
-          result = promptImages.length > 0
-            ? await runner.startSessionStreamingWithContent(
-                cwd,
-                turnContent,
-                onEvent,
-                sessionId,
-                runModel,
-                runEffort
-              )
-            : await runner.startSessionStreaming(
-                cwd,
-                effectivePrompt,
-                onEvent,
-                sessionId,
-                runModel,
-                runEffort
-              );
-          store.setClaudeSessionId(sessionId, result.sessionId);
-        }
-      } else {
-        const mcpServers = store.getMcpServers(sessionId);
-        if (promptImages.length > 0) {
+          const mcpServers = store.getMcpServers(sessionId);
           result = await runner.startSessionStreamingWithContent(
             cwd,
             turnContent,
             onEvent,
             sessionId,
             runModel,
-            runEffort
+            runEffort,
+            mcpServers
           );
-        } else if (mcpServers.length > 0) {
-          result = await runner.startSessionWithMcp(
-            cwd,
-            bodyText,
-            mcpServers,
-            onEvent,
-            sessionId,
-            runModel,
-            runEffort
-          );
-        } else {
-          result = await runner.startSessionStreaming(
-            cwd,
-            effectivePrompt,
-            onEvent,
-            sessionId,
-            runModel,
-            runEffort
-          );
+          store.setClaudeSessionId(sessionId, result.sessionId);
         }
+      } else {
+        const mcpServers = store.getMcpServers(sessionId);
+        result = await runner.startSessionStreamingWithContent(
+          cwd,
+          turnContent,
+          onEvent,
+          sessionId,
+          runModel,
+          runEffort,
+          mcpServers
+        );
         // Only persist the Claude session id if the CLI actually emitted one.
         // On an early cancel (user hit "Send Now" before the CLI's init event
         // arrived) result.sessionId can be empty — storing "" would overwrite

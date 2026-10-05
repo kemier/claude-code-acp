@@ -79,6 +79,16 @@ vi.mock("../src/claude-runner.js", () => {
       }
     });
     this.setSessionPermissionMode = vi.fn();
+    this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
+    this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+    this.startSessionStreamingWithContent = vi.fn().mockImplementation(
+      (_cwd: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+        this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
+    );
+    this.continueSessionStreamingWithContent = vi.fn().mockImplementation(
+      (_sid: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
+        this.continueSessionStreaming(_sid, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
+    );
   });
   return { ClaudeRunner: MockClaudeRunner };
 });

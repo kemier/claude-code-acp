@@ -64,6 +64,8 @@ vi.mock("../src/claude-runner.js", () => {
       }
     );
     this.cancel = vi.fn();
+    this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
+    this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
     this.setSessionPermissionMode = vi.fn();
   });
   return { ClaudeRunner: MockClaudeRunner };
@@ -291,7 +293,7 @@ describe("ClaudeCodeAgent", () => {
       });
     });
 
-    it("should keep text-only prompts on startSessionStreaming", async () => {
+    it("should route text-only prompts through the stream-json stdin path", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: {},
@@ -307,10 +309,15 @@ describe("ClaudeCodeAgent", () => {
         prompt: [{ type: "text", text: "Just text" }],
       });
 
-      expect(capturedRunnerCalls.filter((c) => c.kind === "start")).toHaveLength(1);
+      // All main turns (text-only and multimodal) take the stream-json stdin
+      // path so the CLI's stdin stays open for the duration of the turn and a
+      // mid-turn steer can be written into the in-flight turn. Text-only
+      // prompts are therefore delivered via startSessionStreamingWithContent
+      // (a text content block), NOT the argv-prompt startSessionStreaming.
       expect(
-        capturedRunnerCalls.some((c) => c.kind === "startWithContent")
-      ).toBe(false);
+        capturedRunnerCalls.filter((c) => c.kind === "startWithContent")
+      ).toHaveLength(1);
+      expect(capturedRunnerCalls.some((c) => c.kind === "start")).toBe(false);
     });
   });
 

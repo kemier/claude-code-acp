@@ -1,5 +1,6 @@
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
+import type { Writable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AgentConfig, loadConfig } from "./config.js";
@@ -205,6 +206,16 @@ export class ClaudeRunner {
    * SIGTERMed after the fact.
    */
   private cancelEscalationTimers = new Map<string, NodeJS.Timeout>();
+  /**
+   * Open stdins for in-flight main turns whose CLI was spawned with
+   * `--input-format stream-json` and whose stdin is deliberately left open
+   * (so a mid-turn steer can be written into the running process — the
+   * Claude CLI absorbs a second `user` line into the in-flight turn instead of
+   * queueing it as a follow-up). Keyed by trackingId (the ACP sessionId). The
+   * handle is removed when the process closes; `endOpenMainTurnStdin` closes
+   * it so the CLI sees EOF and exits cleanly after the turn's `result`.
+   */
+  private openMainTurnStdins = new Map<string, Writable>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
   /**
@@ -406,7 +417,8 @@ export class ClaudeRunner {
     onEvent: (event: StreamEvent) => void,
     trackingId?: string,
     modelOverride?: string,
-    effortOverride?: string
+    effortOverride?: string,
+    mcpServers?: McpServerConfig[]
   ): Promise<ClaudeResult> {
     if (trackingId) {
       return this.runPersistentTurn({
@@ -478,6 +490,26 @@ export class ClaudeRunner {
       args.push("--resume", claudeSessionId);
     }
     args.push(...this.buildExtraArgs(modelOverride, effortOverride));
+    return args;
+  }
+
+  /**
+   * Public variant of buildStreamJsonArgs that also accepts optional MCP
+   * config. Used by the main-turn streaming path so a turn that needs MCP
+   * servers (a fresh session with MCP config) can still take the stream-json
+   * stdin path (and therefore accept a mid-turn steer) instead of the
+   * argv-prompt path, which has no open stdin to steer into.
+   */
+  buildStreamJsonArgsWithMcp(
+    claudeSessionId: string | undefined,
+    mcpServers: McpServerConfig[],
+    modelOverride?: string,
+    effortOverride?: string
+  ): string[] {
+    const args = this.buildStreamJsonArgs(claudeSessionId, modelOverride, effortOverride);
+    if (mcpServers.length > 0) {
+      args.push(...this.buildMcpArgs(mcpServers));
+    }
     return args;
   }
 
@@ -1125,15 +1157,28 @@ export class ClaudeRunner {
         this.runningProcesses.set(trackingId, proc);
       }
 
-      // Write the SDK user message as a single JSON line, then end stdin so the
-      // CLI's --print mode knows there are no further input events.
+      // Write the SDK user message as a single JSON line. Leave stdin OPEN
+      // (do not `.end()`) so a mid-turn steer can be written into the running
+      // process — the Claude CLI absorbs a second `user` line into the
+      // in-flight turn instead of queueing it as a follow-up. The CLI also
+      // treats a closed stdin as "no more input" and exits cleanly after the
+      // turn's `result`, but with stdin open it simply blocks on stdin until
+      // `close` (which fires on the turn's `result`) resolves the promise and
+      // the close handler ends the stdin.
       const message = JSON.stringify({
         type: "user",
         message: { role: "user", content },
         parent_tool_use_id: null,
         session_id: "",
       });
-      proc.stdin!.end(message + "\n");
+      proc.stdin!.write(message + "\n");
+
+      // Track the open stdin so handleSteer (agent.ts) can push mid-turn steer
+      // lines into it via writeSteerToMainTurn(). It is removed from the
+      // registry on `close` (see below).
+      if (trackingId) {
+        this.openMainTurnStdins.set(trackingId, proc.stdin!);
+      }
 
       let buffer = "";
       let resultText = "";
@@ -1184,6 +1229,10 @@ export class ClaudeRunner {
             clearTimeout(esc);
             this.cancelEscalationTimers.delete(trackingId);
           }
+          // Drop the open-stdin handle so a stale steer cannot write into a
+          // closed stream after the turn ends. The stream itself is closed by
+          // endOpenMainTurnStdin (or the process is gone, so it's moot).
+          this.openMainTurnStdins.delete(trackingId);
         }
         const wasCancelled = trackingId
           ? this.cancelledProcesses.delete(trackingId)
