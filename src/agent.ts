@@ -2218,6 +2218,13 @@ export function createClaudeCodeAgent(
   // the same queue, delivering messages out of order.
   const steerDraining = new Set<string>();
 
+  // Background drain promises started by executePrompt's post-turn
+  // non-blocking drainSteerQueue(). The next prompt() chains on these so it
+  // waits for the drain's LLM turns to finish before starting its own turn —
+  // otherwise a new prompt would race with the drain's continueSessionStreaming
+  // (same onEvent closure, same --resume session id). Cleared on settle.
+  const pendingDrainPromises = new Map<string, Promise<unknown>>();
+
   // ─── Per-session prompt serialization ─────────────────────────────────────
   // The ACP SDK dispatches each incoming `session/prompt` request concurrently
   // — its read loop (acp.js #receive) calls #processMessage without awaiting
@@ -5007,16 +5014,20 @@ const drainSteerQueue = async (): Promise<void> => {
       // message queue while `isCompacting` and drains it once compaction
       // finishes. No-op when nothing was queued.
       //
-      // Non-blocking: same rationale as the post-turn drain above —
-      // executePrompt must return so the session/prompt JSON-RPC response
-      // is sent. The next prompt chains on pendingDrainPromises.
-      {
-        const dp = drainSteerQueue().catch((e) => {
-          logger.error(`Post-compact drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
-        });
-        pendingDrainPromises.set(sessionId, dp);
-        void dp.finally(() => pendingDrainPromises.delete(sessionId));
-      }
+      // Non-blocking: the drain's follow-up turns (continueSessionStreaming)
+      // run in the background so executePrompt can return its JSON-RPC
+      // response immediately. Without this, a mid-turn steer (absorbed via
+      // writeSteerToMainTurn) keeps executePrompt alive through the drain's
+      // LLM turns — the session/prompt response is never sent, vscode-acp's
+      // connection.prompt() never resolves, and the Stop button never
+      // switches to Send. The drain's turns still stream to the client; a
+      // new session/prompt chains on sessionPromptLocks and waits for the
+      // drain's turn to finish before starting.
+      const drainPromise = drainSteerQueue().catch((e) => {
+        logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      pendingDrainPromises.set(sessionId, drainPromise);
+      void drainPromise.finally(() => pendingDrainPromises.delete(sessionId));
 
       // If Claude CLI reported an error result (e.g. error_max_turns — the
       // model hit the turn ceiling mid-task), surface it to the user as an
@@ -5846,7 +5857,7 @@ const drainSteerQueue = async (): Promise<void> => {
       // resolves quickly and clears per-session state under the lock too).
       const prev = (sessionPromptLocks.get(sessionId) ?? Promise.resolve()).then(
         () => pendingDrainPromises.get(sessionId) ?? Promise.resolve(),
-        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve(),
+        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve()
       );
       // Assign this prompt a monotonically-increasing generation for the
       // session. A cancel() latches by generation (the one in flight at cancel
