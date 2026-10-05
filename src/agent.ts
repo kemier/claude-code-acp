@@ -2550,7 +2550,41 @@ export function createClaudeCodeAgent(
       logger.info(`Steer request for cancelled session ${sessionId} — ignoring (turn is stopping)`);
       return;
     }
-    // Queue the message for delivery after the current turn finishes.
+
+    // Mid-turn steer: write directly into the running process's stdin. The
+    // Claude CLI absorbs a second `user` line into the in-flight turn
+    // (verified against the live CLI) instead of queueing it as a follow-up,
+    // so the model folds this into its current work immediately.
+    const midTurnWritten = runner.writeSteerToMainTurn(sessionId, text);
+    if (midTurnWritten) {
+      logger.info(`Steer delivered mid-turn for session ${sessionId}: ${text.length} chars`);
+      // Stage 1 (visual bubble).
+      await connection
+        .sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "user_message_accepted",
+            content: { type: "text", text },
+          } as any,
+        })
+        .catch(() => { /* non-fatal: visual-only ack */ });
+      // Stage 2 (delivered echo) — the message IS delivered, so emit the
+      // delivered chunk now. This splices the client's queue entry and
+      // releases the next queued message.
+      await connection
+        .sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "user_message_chunk",
+            content: { type: "text", text },
+          } as any,
+        })
+        .catch(() => { /* non-fatal */ });
+      return;
+    }
+
+    // Fallback: no active turn (process not running). Queue the message for
+    // delivery after the current turn finishes.
     if (!steerQueues.has(sessionId)) {
       steerQueues.set(sessionId, []);
     }

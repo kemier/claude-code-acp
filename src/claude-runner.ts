@@ -697,6 +697,27 @@ export class ClaudeRunner {
     );
   }
 
+  /**
+   * Write a steer message into the session's running turn. Returns true if
+   * the message was written to a live process's stdin (the CLI absorbs it
+   * mid-turn), false if there is no active turn (caller should queue).
+   */
+  writeSteerToMainTurn(sessionId: string, text: string): boolean {
+    const live = this.liveSessions.get(sessionId);
+    if (!live || !live.turn) {
+      return false;
+    }
+    try {
+      live.proc.stdin!.write(this.userMessageLine([{ type: "text", text }]));
+      return true;
+    } catch (err) {
+      logger.warn(
+        `writeSteerToMainTurn(${sessionId}) failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return false;
+    }
+  }
+
   private liveSpawnKey(modelOverride?: string, effortOverride?: string): string {
     const model = modelOverride || this.config.model || "";
     return `${model}\0${effortOverride ?? ""}\0${this.sessionPermissionMode ?? ""}`;

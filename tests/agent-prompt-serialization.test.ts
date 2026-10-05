@@ -59,6 +59,8 @@ vi.mock("../src/claude-runner.js", () => {
     );
     this.cancel = vi.fn();
     this.setSessionPermissionMode = vi.fn();
+    this.isRunning = vi.fn(() => true);
+    this.writeSteerToMainTurn = vi.fn(() => false);
   });
   return { ClaudeRunner: MockClaudeRunner };
 });

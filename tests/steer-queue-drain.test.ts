@@ -41,6 +41,7 @@ vi.mock("../src/claude-runner.js", () => {
     this.startSession = vi.fn().mockResolvedValue({ text: "", sessionId: "claude-uuid-abc" });
     this.continueSession = vi.fn().mockResolvedValue({ text: "", sessionId: "claude-uuid-abc" });
     this.isRunning = vi.fn(() => running);
+    this.writeSteerToMainTurn = vi.fn(() => false);
     this.cancel = vi.fn();
     this.setSessionPermissionMode = vi.fn();
     this.cancelAll = vi.fn();

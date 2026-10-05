@@ -52,6 +52,7 @@ vi.mock("../src/claude-runner.js", () => {
         return { text: "ok", sessionId: "uuid-1" };
       });
     this.isRunning = vi.fn(() => true);
+    this.writeSteerToMainTurn = vi.fn(() => false);
     this.cancel = vi.fn();
     this.setSessionPermissionMode = vi.fn();
   });
