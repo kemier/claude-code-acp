@@ -237,11 +237,13 @@ async function enterPlanMode(
   connection: { sessionUpdate: (p: any) => Promise<unknown> },
   store: SessionStore,
   runner?: { setSessionPermissionMode: (m: string | null) => void },
-): Promise<void> {
+): Promise<boolean> {
   if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) === PLAN_COLLABORATION_MODE) {
     // Already in plan mode — the model re-called EnterPlanMode (e.g. after a
     // sub-turn). Nothing to do; re-emitting would be a redundant picker update.
-    return;
+    // Return false so the caller does NOT re-interrupt a turn that is already
+    // running under Plan.
+    return false;
   }
   sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE);
   // Plan mode is read-only: the model investigates and presents a plan but does
@@ -265,6 +267,7 @@ async function enterPlanMode(
   } catch {
     /* non-fatal — the next turn still injects the plan-mode preamble */
   }
+  return true;
 }
 
 /**
@@ -3351,6 +3354,64 @@ export function createClaudeCodeAgent(
 
 
   /**
+   * Interrupt a running turn and re-prompt with the fresh <collaboration_mode>
+   * block. Shared by the two mid-turn plan-mode flip paths so their behavior
+   * can never drift apart:
+   *
+   *   - the USER flipping the collaboration picker (setSessionConfigOption,
+   *     configId "collaboration_mode") — a deliberate mode change mid-turn;
+   *   - the MODEL calling EnterPlanMode (tool_use event) — a self-initiated
+   *     entry into Plan mode mid-turn.
+   *
+   * Why an interrupt is required at all: the Claude CLI is spawned PER PROMPT
+   * (`claude -p --resume <id>`), and the per-turn spawn flags are fixed at spawn
+   * time. A turn started in Default mode runs with `--permission-mode
+   * acceptEdits` + `--dangerously-skip-permissions` (ACP needs the latter to
+   * auto-approve). `--dangerously-skip-permissions` OVERRIDES `--permission-mode
+   * plan` at the CLI layer — verified empirically: a plan-mode spawn WITHOUT it
+   * hard-blocks writes (Write tool → permission_denials), but the SAME spawn WITH
+   * it lets the write through. So merely flipping the runner's permission mode on
+   * a running turn does nothing to the already-spawned process: the model keeps
+   * full edit/Bash access for the rest of the turn. The only way to enforce
+   * read-only (or default) mid-turn is to SIGINT the running CLI and re-spawn it
+   * with the new mode's flags, carrying the fresh <collaboration_mode> block.
+   *
+   * @param planActive the mode the re-prompted turn should run in.
+   * @param repromptModel the model override to reuse (so the flip doesn't change model).
+   * @param repromptEffort the effort to reuse (so the flip doesn't change effort).
+   */
+  const interruptForPlanMode = (
+    sessionId: string,
+    planActive: boolean,
+    repromptModel: string | undefined,
+    repromptEffort: string | undefined,
+  ): Promise<unknown> => {
+    const repromptText = buildMidTurnModeChangeNotice(planActive);
+    // SIGINT the running Claude subprocess (keeps the session id valid).
+    // The current executePrompt settles with stopReason:"cancelled"; the
+    // re-prompt chains after it on the per-session lock.
+    runner.cancel(sessionId);
+    // Chain the re-prompt on the lock: it runs once the cancelled turn
+    // settles. .then(onFulfilled, onRejected) means we start the re-prompt
+    // regardless of how the cancelled turn resolved — a cancelled turn that
+    // threw (rare) must not block the mode switch.
+    const prevLock = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
+    // A fresh generation so the cancel-latch scoping tracks this re-prompt
+    // (a later queued prompt is not cancelled by the stale latch; runner.cancel
+    // does not latch cancelledSessions, so the reprompt is not treated as a
+    // cancelled-before-start prompt).
+    const repromptGen = (promptGenCounter.get(sessionId) ?? 0) + 1;
+    promptGenCounter.set(sessionId, repromptGen);
+    const repromptLock = prevLock.then(
+      () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
+      () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
+    );
+    // Keep the lock chain alive for any further prompts queued behind.
+    sessionPromptLocks.set(sessionId, repromptLock.catch(() => {}));
+    return repromptLock;
+  };
+
+  /**
    * The full prompt-turn body (slash dispatch, LLM turn, steer drain,
    * auto-compact, usage/plan/goal bookkeeping). Hoisted to closure scope so
    * BOTH prompt() (the normal ACP entry point) AND setSessionConfigOption()
@@ -3938,8 +3999,36 @@ export function createClaudeCodeAgent(
        // read-only <collaboration_mode> Plan block. Without this the picker
        // only showed "Plan" on a user-initiated switch, so a self-entered plan
        // was invisible until the user manually flipped the mode.
+       //
+       // ROOT CAUSE FIX (plan-mode enforcement lag): EnterPlanMode fires MID-TURN,
+       // but the running claude -p process was spawned at turn start in Default
+       // mode with --dangerously-skip-permissions, which OVERRIDES the CLI's
+       // --permission-mode plan read-only gate (verified empirically). Updating
+       // the picker state alone therefore does NOT stop the model editing for
+       // the rest of the turn — the in-flight process keeps its old spawn flags.
+       // So we interrupt the running turn and re-prompt with the Plan
+       // <collaboration_mode> block, exactly like the user-initiated picker
+       // flip. enterPlanMode still does the picker/state writes; the interrupt
+       // enforces it on the live process. We are already inside executePrompt's
+       // onEvent (a turn in flight), so interruptForPlanMode chains the re-prompt
+       // on the per-session lock after the cancelled turn settles — fire-and-forget
+       // (no await: we're mid-stream and must keep the turn's event flow going).
        if (event.toolName === "EnterPlanMode") {
-         void enterPlanMode(sessionId, connection, store, runner);
+         void enterPlanMode(sessionId, connection, store, runner).then((entered) => {
+           // Only interrupt on a GENUINE entry into plan (enterPlanMode returns
+           // false for a redundant re-call when already in plan). newModeIsPlan
+           // = true: the re-prompted turn runs under Plan (read-only).
+           if (entered && (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))) {
+             const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+             const repromptEffort = resolveEffort(store, sessionId);
+             logger.info(
+               `Session ${sessionId} model called EnterPlanMode mid-turn — cancelling ` +
+                 `the running (full-access) turn and re-prompting with the Plan ` +
+                 `<collaboration_mode> block so read-only takes effect NOW.`,
+             );
+             void interruptForPlanMode(sessionId, true, repromptModel, repromptEffort);
+           }
+         });
        }
        // Build a descriptive title + kind + (for edits) diff content +
        // locations, mirroring codex-acp, so the chat UI shows the action
@@ -5503,8 +5592,13 @@ const drainSteerQueue = async (): Promise<void> => {
         const inFlight =
           runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId);
         if (shouldAnnounceModeChange(previousCollabMode, nextCollab) && inFlight) {
-          const prevWasPlan = previousCollabMode === PLAN_COLLABORATION_MODE;
-          const repromptText = buildMidTurnModeChangeNotice(prevWasPlan);
+          // The re-prompt's notice describes the NEW mode (the one the turn is
+          // about to run in), NOT the previous one. buildMidTurnModeChangeNotice
+          // takes "is the new mode plan?" — so a Default→Plan flip passes true
+          // ("no more edits") and a Plan→Default flip passes false ("implement
+          // now"). (An earlier revision passed prevWasPlan, the PREVIOUS mode,
+          // which inverted both directions.)
+          const newModeIsPlan = nextCollab === PLAN_COLLABORATION_MODE;
           // Resolve the same model/effort overrides the running turn used, so
           // the re-prompt does not silently change model or effort.
           const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
@@ -5512,33 +5606,15 @@ const drainSteerQueue = async (): Promise<void> => {
           logger.info(
             `Session ${sessionId} mode flip ${previousCollabMode ?? "(none)"} → ${nextCollab} ` +
               `with a turn in flight — cancelling and re-prompting with the fresh ` +
-              `${prevWasPlan ? "Default" : "Plan"} <collaboration_mode> block.`,
+              `${newModeIsPlan ? "Plan" : "Default"} <collaboration_mode> block.`,
           );
-          // SIGINT the running Claude subprocess (keeps the session id valid).
-          // The current executePrompt settles with stopReason:"cancelled"; the
-          // re-prompt chains after it on the per-session lock.
-          runner.cancel(sessionId);
-          // Chain the re-prompt on the lock: it runs once the cancelled turn
-          // settles. .then(onFulfilled, onRejected) means we start the
-          // re-prompt regardless of how the cancelled turn resolved — a
-          // cancelled turn that threw (rare) must not block the mode switch.
-          const prevLock = sessionPromptLocks.get(sessionId) ?? Promise.resolve();
-          // The re-prompt is a fresh prompt — give it its own generation so
-          // inFlightGen / the cancel before-start check track it correctly.
-          // (runner.cancel above does not latch cancelledSessions, so this
-          // reprompt is not treated as a cancelled-before-start prompt.)
-          const repromptGen = (promptGenCounter.get(sessionId) ?? 0) + 1;
-          promptGenCounter.set(sessionId, repromptGen);
-          const repromptLock = prevLock.then(
-            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
-            () => executePrompt(sessionId, repromptText, repromptModel, repromptEffort, [], repromptGen),
-          );
-          // Keep the lock chain alive for any further prompts queued behind.
-          sessionPromptLocks.set(sessionId, repromptLock.catch(() => {}));
+          // SIGINT the running turn and re-prompt with the fresh block (shared
+          // core with the model-initiated EnterPlanMode path).
+          //
           // Wait for the re-prompt to actually START the LLM turn (not just be
           // enqueued) before returning, so the client's config_option_update
           // reflects a turn that is genuinely running in the new mode.
-          await repromptLock;
+          await interruptForPlanMode(sessionId, newModeIsPlan, repromptModel, repromptEffort);
           logger.info(`Session ${sessionId} mode-change re-prompt completed`);
         }
       } else {
