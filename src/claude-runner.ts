@@ -1213,6 +1213,15 @@ export class ClaudeRunner {
             if (parsed.type === "result") {
               sessionId = parsed.session_id ?? sessionId;
               resultText = parsed.result ?? resultText;
+              // End stdin so the CLI knows "no more input" and exits cleanly.
+              // Without this the process stays alive after the result (stdin
+              // is still open, waiting for a steer that will never come), the
+              // close handler never fires, and the runner's promise never
+              // resolves — executePrompt hangs and the session/prompt
+              // JSON-RPC response is never sent (Stop button stays forever).
+              if (proc.stdin && !proc.stdin.destroyed && !proc.stdin.writableEnded) {
+                try { proc.stdin.end(); } catch { /* already closed */ }
+              }
             }
           } catch {
             // Skip unparseable lines

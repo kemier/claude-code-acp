@@ -4884,10 +4884,15 @@ const drainSteerQueue = async (): Promise<void> => {
      logger.info(`Prompt completed for session ${sessionId}`);
 
       // Drain any steers queued during this turn (see drainSteerQueue).
-      // Non-blocking: the drain's follow-up turns run in the background so
-      // executePrompt can return its JSON-RPC response immediately. A new
-      // session/prompt chains on sessionPromptLocks + pendingDrainPromises
-      // and waits for the drain's turn to finish before starting.
+      // Non-blocking: the drain's follow-up turns (continueSessionStreaming)
+      // run in the background so executePrompt can return its JSON-RPC
+      // response immediately. Without this, a mid-turn steer (absorbed via
+      // writeSteerToMainTurn) keeps executePrompt alive through the drain's
+      // LLM turns — the session/prompt response is never sent, vscode-acp's
+      // connection.prompt() never resolves, and the Stop button never
+      // switches to Send. The drain's turns still stream to the client; a
+      // new session/prompt chains on sessionPromptLocks and waits for the
+      // drain's turn to finish before starting.
       const drainPromise = drainSteerQueue().catch((e) => {
         logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
       });
@@ -5031,29 +5036,6 @@ const drainSteerQueue = async (): Promise<void> => {
          }
        }
       }
-
-      // Compaction (manual /compact via dispatchSlashCommand above, or the
-      // auto-compact just run) performs its own LLM calls, during which a
-      // prompt is still in flight — so handleSteer keeps accepting steers.
-      // Drain them now instead of leaving them queued until the next user
-      // prompt. This mirrors the vscode-acp client, which holds its own
-      // message queue while `isCompacting` and drains it once compaction
-      // finishes. No-op when nothing was queued.
-      //
-      // Non-blocking: the drain's follow-up turns (continueSessionStreaming)
-      // run in the background so executePrompt can return its JSON-RPC
-      // response immediately. Without this, a mid-turn steer (absorbed via
-      // writeSteerToMainTurn) keeps executePrompt alive through the drain's
-      // LLM turns — the session/prompt response is never sent, vscode-acp's
-      // connection.prompt() never resolves, and the Stop button never
-      // switches to Send. The drain's turns still stream to the client; a
-      // new session/prompt chains on sessionPromptLocks and waits for the
-      // drain's turn to finish before starting.
-      const drainPromise = drainSteerQueue().catch((e) => {
-        logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
-      });
-      pendingDrainPromises.set(sessionId, drainPromise);
-      void drainPromise.finally(() => pendingDrainPromises.delete(sessionId));
 
       // If Claude CLI reported an error result (e.g. error_max_turns — the
       // model hit the turn ceiling mid-task), surface it to the user as an
