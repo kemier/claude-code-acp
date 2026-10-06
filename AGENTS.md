@@ -204,16 +204,20 @@ Use conventional commits with gitemojis (Ericsson internal guideline):
 ## Build and Deploy
 
 ```bash
-# Local Mac
-./scripts/install.sh
-# or: npm run install:local
+# Local (Windows / Linux / macOS)
+npm run install:local
+# Unix equivalent: ./scripts/install.sh
 
-# Remote workstation (rsync + build + install)
+# Remote workstation (rsync + build + install; needs bash/rsync/ssh)
 ACP_SSH_HOST=workstation ./scripts/install-remote.sh
 # or: npm run install:remote
 
-# Both
+# Both (remote step still needs a Unix-like ssh/rsync host)
 npm run deploy
 ```
 
-Installs `claude-code-acp` and `claude-agent-acp` into `~/.local/bin` (symlinks to `bin/claude-code-acp.js`).
+`npm run build` uses Node `chmodSync` (not `chmod(1)`) so it succeeds on Windows.
+
+Installs `claude-code-acp` and `claude-agent-acp` into `~/.local/bin`:
+- Linux / macOS: symlinks to `bin/claude-code-acp.js`
+- Windows: `.cmd` shims that run `node` on that wrapper
