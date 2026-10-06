@@ -723,9 +723,10 @@ export function degradeImageBlocksForTextOnlyModel(
       try {
         const dir = fs.mkdtempSync(joinPath(os.tmpdir(), `claude-acp-img-${sessionId.slice(0, 8)}-`));
         const ext = MIME_TO_EXT[mimeType] ?? (mimeType?.split("/")[1] || "png");
-        tempPath = joinPath(dir, `image-${i + 1}.${ext}`);
-        fs.writeFileSync(tempPath, Buffer.from(data, "base64"));
-        tempPaths.push(tempPath);
+        const dest = joinPath(dir, `image-${i + 1}.${ext}`);
+        tempPath = dest;
+        fs.writeFileSync(dest, Buffer.from(data, "base64"));
+        tempPaths.push(dest);
       } catch (err) {
         logger.warn(`Failed to persist attached image to temp file: ${err instanceof Error ? err.message : String(err)}`);
       }
