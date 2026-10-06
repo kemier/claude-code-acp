@@ -80,6 +80,10 @@ function readSettingsFile(path: string): LoadedClaudeSettings {
   } catch {
     return { env: {} }; // absent is the normal case, not an error
   }
+  // PowerShell's default UTF-8 writer prefixes a BOM. JSON.parse rejects it,
+  // which used to drop the whole settings file and then fail session/load
+  // with "No model configured".
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
   let parsed: ClaudeSettings;
   try {
     parsed = JSON.parse(raw) as ClaudeSettings;

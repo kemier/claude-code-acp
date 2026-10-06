@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 const { FAKE_HOME, FAKE_CWD, ENCODED, PROJECT_DIR, fsFiles } = vi.hoisted(() => {
   const FAKE_HOME = "/fake/home";
   const FAKE_CWD = "/workspace/git/test-project";
-  const ENCODED = FAKE_CWD.replace(/\//g, "-"); // -workspace-git-test-project
+  const ENCODED = FAKE_CWD.replace(/[^a-zA-Z0-9]/g, "-"); // -workspace-git-test-project
   return {
     FAKE_HOME,
     FAKE_CWD,
@@ -22,7 +22,7 @@ const { FAKE_HOME, FAKE_CWD, ENCODED, PROJECT_DIR, fsFiles } = vi.hoisted(() => 
   };
 });
 
-import { createClaudeCodeAgent, listCliTranscriptSessions } from "../src/agent.js";
+import { createClaudeCodeAgent, encodeClaudeProjectSlug, listCliTranscriptSessions } from "../src/agent.js";
 import type { AgentSideConnection } from "@agentclientprotocol/sdk";
 
 // Build a JSONL transcript from entry specs.
@@ -92,6 +92,20 @@ function writeTranscript(name: string, content: string): void {
 
 beforeEach(() => {
   fsFiles.clear();
+});
+
+describe("encodeClaudeProjectSlug", () => {
+  it("encodes a Windows cwd the way the Claude CLI names the project folder", () => {
+    expect(encodeClaudeProjectSlug("e:\\projects\\vscode-acp")).toBe(
+      "e--projects-vscode-acp",
+    );
+  });
+
+  it("encodes a POSIX cwd by turning slashes into dashes", () => {
+    expect(encodeClaudeProjectSlug("/workspace/git/test-project")).toBe(
+      "-workspace-git-test-project",
+    );
+  });
 });
 
 describe("listCliTranscriptSessions", () => {

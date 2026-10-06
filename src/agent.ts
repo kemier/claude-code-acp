@@ -818,6 +818,16 @@ const REPLAY_PROMPT_FRAMING_RE =
 const REPLAY_COLLAB_MODE_BLOCK_RE =
   /^\<collaboration_mode>[\s\S]*?\<\/collaboration_mode>\n*/i;
 
+/**
+ * Claude CLI names each project folder by replacing every non-alphanumeric
+ * character in the cwd with `-`. `e:\projects\vscode-acp` becomes
+ * `e--projects-vscode-acp`. Replacing only `/` misses Windows `\` and `:`,
+ * so resume looks for a path that does not exist.
+ */
+export function encodeClaudeProjectSlug(cwd: string): string {
+  return cwd.replace(/[^a-zA-Z0-9]/g, "-");
+}
+
 export function stripReplayPromptFraming(text: string): string {
   let prev: string;
   let cur = text;
@@ -852,7 +862,7 @@ export async function listCliTranscriptSessions(
   if (!cwd) return [];
   const { homedir } = await import("node:os");
   const fs = await import("node:fs");
-  const projectDir = `${homedir()}/.claude/projects/${cwd.replace(/\//g, "-")}`;
+  const projectDir = `${homedir()}/.claude/projects/${encodeClaudeProjectSlug(cwd)}`;
   // existsSync is present in every fs mock; the heavier readdir/stat/read
   // helpers are accessed lazily below so partial fs mocks (used across the
   // test suite) don't break on missing exports when no project dir exists.
@@ -4930,7 +4940,7 @@ const drainSteerQueue = async (): Promise<void> => {
      if (!store.getClaudeSessionId(sessionId) && typeof params.cwd === "string") {
        const { homedir } = await import("node:os");
        const { existsSync } = await import("node:fs");
-       const transcriptPath = `${homedir()}/.claude/projects/${params.cwd.replace(/\//g, "-")}/${sessionId}.jsonl`;
+       const transcriptPath = `${homedir()}/.claude/projects/${encodeClaudeProjectSlug(params.cwd)}/${sessionId}.jsonl`;
        if (existsSync(transcriptPath)) {
          store.setClaudeSessionId(sessionId, sessionId);
          logger.info(
@@ -4947,7 +4957,7 @@ const drainSteerQueue = async (): Promise<void> => {
       let claudeSessionId = store.getClaudeSessionId(sessionId);
       const { homedir } = await import("node:os");
       const replayCwd = store.getCwd(sessionId)!;
-      const projectDir = `${homedir()}/.claude/projects/${replayCwd.replace(/\//g, "-")}`;
+      const projectDir = `${homedir()}/.claude/projects/${encodeClaudeProjectSlug(replayCwd)}`;
       if (!claudeSessionId) {
         // Sessions created before full-record persistence have no mapping. Fall
         // back to the most recent transcript for this directory so the resumed
@@ -5193,7 +5203,7 @@ const drainSteerQueue = async (): Promise<void> => {
       const forkClaudeId = randomUUID();
       if (sourceClaudeId) {
         const { homedir } = await import("node:os");
-        const projectDir = `${homedir()}/.claude/projects/${sourceCwd.replace(/\//g, "-")}`;
+        const projectDir = `${homedir()}/.claude/projects/${encodeClaudeProjectSlug(sourceCwd)}`;
         const sourcePath = `${projectDir}/${sourceClaudeId}.jsonl`;
         const forkPath = `${projectDir}/${forkClaudeId}.jsonl`;
         try {

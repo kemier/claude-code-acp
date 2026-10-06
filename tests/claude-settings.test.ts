@@ -233,5 +233,16 @@ describe("model picker from settings", () => {
     expect(() => getDefaultModelFromSettings()).toThrow(/No model configured/);
     expect(() => getAvailableModelsFromSettings()).toThrow(/No models configured/);
   });
+
+  it("reads settings.json that starts with a UTF-8 BOM", () => {
+    const dir = join(projectDir, ".claude");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "settings.json"),
+      "\uFEFF" + JSON.stringify({ env: { [KEY]: "from-bom" } }),
+    );
+    clearClaudeSettingsCache();
+    expect(getClaudeEnv(KEY)).toBe("from-bom");
+  });
 });
 
