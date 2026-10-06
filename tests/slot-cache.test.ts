@@ -12,27 +12,37 @@ import {
 describe("isSlotCacheEnabled", () => {
   it("is off by default", () => {
     const saved = process.env.CLAUDE_SLOT_CACHE_ENABLED;
+    const savedLlama = process.env.CLAUDE_LLAMA_SERVER_URL;
     delete process.env.CLAUDE_SLOT_CACHE_ENABLED;
+    delete process.env.CLAUDE_LLAMA_SERVER_URL;
     try {
       expect(isSlotCacheEnabled()).toBe(false);
     } finally {
       if (saved === undefined) delete process.env.CLAUDE_SLOT_CACHE_ENABLED;
       else process.env.CLAUDE_SLOT_CACHE_ENABLED = saved;
+      if (savedLlama === undefined) delete process.env.CLAUDE_LLAMA_SERVER_URL;
+      else process.env.CLAUDE_LLAMA_SERVER_URL = savedLlama;
     }
   });
 
-  it("is on only when set to exactly \"true\"", () => {
-    const saved = process.env.CLAUDE_SLOT_CACHE_ENABLED;
+  it("is on only when ENABLED=true and CLAUDE_LLAMA_SERVER_URL is set", () => {
+    const savedEnabled = process.env.CLAUDE_SLOT_CACHE_ENABLED;
+    const savedLlama = process.env.CLAUDE_LLAMA_SERVER_URL;
     try {
+      delete process.env.CLAUDE_LLAMA_SERVER_URL;
       process.env.CLAUDE_SLOT_CACHE_ENABLED = "true";
+      expect(isSlotCacheEnabled()).toBe(false);
+      process.env.CLAUDE_LLAMA_SERVER_URL = "http://192.168.124.14:8008";
       expect(isSlotCacheEnabled()).toBe(true);
       process.env.CLAUDE_SLOT_CACHE_ENABLED = "TRUE";
       expect(isSlotCacheEnabled()).toBe(false);
       process.env.CLAUDE_SLOT_CACHE_ENABLED = "1";
       expect(isSlotCacheEnabled()).toBe(false);
     } finally {
-      if (saved === undefined) delete process.env.CLAUDE_SLOT_CACHE_ENABLED;
-      else process.env.CLAUDE_SLOT_CACHE_ENABLED = saved;
+      if (savedEnabled === undefined) delete process.env.CLAUDE_SLOT_CACHE_ENABLED;
+      else process.env.CLAUDE_SLOT_CACHE_ENABLED = savedEnabled;
+      if (savedLlama === undefined) delete process.env.CLAUDE_LLAMA_SERVER_URL;
+      else process.env.CLAUDE_LLAMA_SERVER_URL = savedLlama;
     }
   });
 });
@@ -49,9 +59,9 @@ describe("getLlamaServerUrl", () => {
     expect(getLlamaServerUrl()).toBe("http://192.168.124.14:8008");
   });
 
-  it("falls back to ANTHROPIC_BASE_URL and strips /v1 and trailing slash", () => {
+  it("does not treat ANTHROPIC_BASE_URL as llama.cpp (Strata/CCR have no /slots)", () => {
     process.env.ANTHROPIC_BASE_URL = "http://10.0.0.1:9000/v1/";
-    expect(getLlamaServerUrl()).toBe("http://10.0.0.1:9000");
+    expect(getLlamaServerUrl()).toBe(null);
   });
 
   it("returns null when neither env var is set", () => {

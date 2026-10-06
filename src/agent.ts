@@ -36,9 +36,6 @@ import {
   getClaudeEnv,
   getDefaultEffortFromSettings,
   getDefaultModelFromSettings,
-  filterPickerModels,
-  type ProxyModelEntry,
-  type ProxyModelHealthEntry,
 } from "./claude-settings.js";
 import {
   validateCwd,
@@ -670,121 +667,22 @@ async function publishGoalSnapshot(
 }
 
 // ─── Context window resolution ──────────────────────────────────────────────
-// Default context window used when the proxy doesn't report one for a model.
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
-// Cached map of model-id → context_length, fetched from the proxy's
-// /v1/models endpoint. Falls back to DEFAULT_CONTEXT_WINDOW.
-const modelContextWindows = new Map<string, number>();
-// Cached map of model-id → vision-capable, derived from the proxy's
-// /v1/models `tags` (the `multimodal` tag, matching ericli's
-// hasMultimodalTag). Populated alongside modelContextWindows. When the proxy
-// is not in use (no base-url override) the map stays empty and the
-// name-pattern fallback in modelSupportsVision() decides — Claude's own
-// models are vision-capable, so the default is true for a bare Claude session.
-const modelVisionCapable = new Map<string, boolean>();
-// Once a fetch has SUCCEEDED this is set so we don't re-fetch on every lookup.
-// A FAILED fetch (proxy unreachable, non-200) deliberately leaves this false so
-// the next caller retries — otherwise a transiently-unreachable proxy at
-// process spawn would freeze the map empty for the whole session, and every
-// model would fall through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS override
-// (pinned to one model's window), mis-reporting every other model's denominator
-// and compaction threshold.
-let modelContextWindowsLoaded = false;
-// In-flight fetch promise so concurrent callers share one request without
-// marking the load complete until it settles.
-let modelContextWindowsLoadPromise: Promise<void> | null = null;
-
 /**
- * The proxy URL for direct /v1/models queries.
- * Claude CLI itself routes through ANTHROPIC_BASE_URL (a CCR gateway),
- * so we derive the direct proxy URL from ERICAI_PROXY_URL, falling back
- * to the default port 8317.
- */
-function getProxyBaseUrl(): string {
-  return (
-    process.env.ERICAI_PROXY_URL ||
-    process.env.ERICAI_PROXY_BASE_URL ||
-    "http://127.0.0.1:8317"
-  );
-}
-
-/**
- * Fetch /v1/models from the proxy and populate modelContextWindows.
- * Called once at module load; safe to call again to refresh. Concurrent
- * callers share a single in-flight fetch. The "loaded" gate is only set on
- * SUCCESS — a failed fetch leaves the map retryable so a transiently
- * unreachable proxy at spawn doesn't freeze the wrong override in for the
- * whole session.
- */
-export async function loadModelContextWindows(): Promise<void> {
-  if (modelContextWindowsLoaded) return;
-  if (modelContextWindowsLoadPromise) return modelContextWindowsLoadPromise;
-  modelContextWindowsLoadPromise = (async () => {
-    try {
-      const url = `${getProxyBaseUrl()}/v1/models`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(5000) });
-      if (!resp.ok) {
-        logger.warn(`Failed to fetch /v1/models from proxy (${resp.status}): ${url}`);
-        return;
-      }
-      const body = await resp.json() as { data?: Array<{ id: string; context_length?: number; tags?: string[] }> };
-      if (body.data) {
-        for (const m of body.data) {
-          if (typeof m.context_length === "number" && m.context_length > 0) {
-            modelContextWindows.set(m.id, m.context_length);
-          }
-          // Capture the multimodal tag so image prompts can be gated on the
-          // backend's actual vision capability (a proxy base-url override can
-          // serve a text-only model behind the "Claude" wire format).
-          if (Array.isArray(m.tags)) {
-            modelVisionCapable.set(m.id, m.tags.some((t) => String(t).toLowerCase() === "multimodal"));
-          }
-        }
-        logger.info(`Loaded ${modelContextWindows.size} model context windows from proxy`);
-        // Only pin the load complete once we actually have data. A failed or
-        // empty fetch stays retryable.
-        if (modelContextWindows.size > 0) modelContextWindowsLoaded = true;
-      }
-    } catch (err) {
-      logger.warn(`Could not load model context windows from proxy: ${err instanceof Error ? err.message : String(err)}`);
-    } finally {
-      modelContextWindowsLoadPromise = null;
-    }
-  })();
-  return modelContextWindowsLoadPromise;
-}
-
-/**
- * Name-pattern fallback for vision capability, used when the proxy tag map has
- * no entry for the model (proxy not in use, tag fetch failed, or a model the
- * catalog didn't advertise). Mirrors pi-acp's modelSupportsImage: the common
- * multimodal families. A bare Claude session (no base-url override) is
- * vision-capable by default, so an unknown id on the native Claude path
- * defaults to true — only a PROXY-served model with a known text-only name
- * defaults to false.
+ * Vision capability from the model id. Unknown ids on a native Claude path
+ * default to true (empty id); text-only names fail the pattern.
  */
 const VISION_MODEL_NAME_PATTERN =
   /(^|[^a-z])(claude|gpt-4o|gpt-4\.1|gpt-5|gemini|qwen.*vl|qwen3\.8-27b|llava|glm-4v|glm-4\.5v|phi-3-vision|o1|o3|o4|deepseek-vl|kimi-vl)/i;
 
 /**
  * True when the model serving this session can accept image inputs.
- *
- * Priority:
- *  1. Proxy tag map (authoritative — the backend curator's `multimodal` tag).
- *  2. Name-pattern fallback when the map has no entry.
- *
- * When no proxy base-url is configured (native Claude), the map is empty and
- * the name pattern matches "claude" → true, so image prompts pass through
- * unchanged (zero behavior change for the common case).
+ * Name-pattern only — local/dev does not query an EricAI model catalog.
  */
 export function modelSupportsVision(modelId: string | undefined): boolean {
   const id = String(modelId ?? "").toLowerCase();
-  if (!id) return true; // unknown model on native Claude → assume vision-capable
-  if (modelVisionCapable.has(id)) return modelVisionCapable.get(id)!;
-  // Map miss: only a proxy base-url override makes the tag map non-empty in
-  // practice. For a proxy-served model we couldn't look up, fall back to the
-  // name pattern. For native Claude (no proxy), "claude" matches → true.
+  if (!id) return true;
   return VISION_MODEL_NAME_PATTERN.test(id);
 }
 
@@ -840,189 +738,35 @@ export function degradeImageBlocksForTextOnlyModel(
   return { note: notes.join("\n"), tempPaths };
 }
 
-// ─── Dynamic proxy model picker list ──────────────────────────────────────
-// By default the ACP model picker advertises the static list from
-// ~/.claude/settings.json (CLAUDE_ACP_AVAILABLE_MODELS), which can drift from
-// the live proxy catalog (e.g. gpt-oss-120b / Qwen3.6-27B hardcoded while the
-// proxy deprecates them, and healthy multimodal models like Qwen3.8-27B-FP8-1M
-// never added). Setting CLAUDE_ACP_PROXY_MODELS=1 flips the picker to the live
-// proxy catalog (/v1/models + /v1/model-health) filtered through the SAME gate
-// the codex catalog and ericli pickers use (healthy + non-Deprecated +
-// coding/near_sota tag), so all four agents agree on the picker. When the
-// proxy list is unavailable or empty, the picker falls back to the static
-// settings list so a proxy outage never empties the dropdown.
-const PROXY_MODELS_ENV = "CLAUDE_ACP_PROXY_MODELS";
-
-let proxyPickerModels: Array<{ id: string; name: string }> | null = null;
-let proxyPickerModelsPromise: Promise<void> | null = null;
-
-/**
- * Epoch ms of the last successful proxy picker refresh. Models can become
- * healthy (scaled back up) after a session starts (e.g. glm-5.2), so a
- * one-shot load at startup can leave a newly-healthy model out of the picker
- * until the whole process restarts. A TTL lets subsequent refresh calls re-fetch
- * so the picker catches up to the backend without hammering /v1/models.
- */
-let lastProxyPickerModelsLoad = 0;
-const PROXY_PICKER_MODELS_TTL_MS = 30_000;
-
-/**
- * Reset the module-level proxy picker cache. Used by tests so each case starts
- * from a clean slate (the TTL would otherwise leak one test's successful load
- * into the next within the same process).
- */
-export function resetProxyPickerModelsCache(): void {
-  proxyPickerModels = null;
-  proxyPickerModelsPromise = null;
-  lastProxyPickerModelsLoad = 0;
-}
-
-/**
- * Whether the dynamic proxy picker is enabled.
- *
- * Reads through `getClaudeEnv` so the flag works both when exported into the
- * ACP parent process environment AND when set in the `env` block of
- * ~/.claude/settings.json (which only reaches the Claude CLI subprocess; the
- * ACP parent process never sees it in process.env).
- */
-function isProxyModelsEnabled(): boolean {
-  return getClaudeEnv(PROXY_MODELS_ENV) === "1";
-}
-
-/**
- * Fetch the live proxy catalog and filter it through the shared picker gate.
- * Result is cached in `proxyPickerModels`; a failed fetch leaves it null so
- * the next call retries. Throws when disabled (CLAUDE_ACP_PROXY_MODELS != "1")
- * so callers can skip gracefully.
- */
-export async function loadProxyPickerModels(): Promise<void> {
-  if (!isProxyModelsEnabled()) return; // opt-in (tests stay hermetic)
-  // Within the TTL the cached list is still considered fresh, even if a
-  // prior fetch succeeded — avoid re-polling the proxy on every session op.
-  if (proxyPickerModels && Date.now() - lastProxyPickerModelsLoad < PROXY_PICKER_MODELS_TTL_MS) {
-    return;
-  }
-  if (proxyPickerModelsPromise) return proxyPickerModelsPromise;
-  proxyPickerModelsPromise = (async () => {
-    try {
-      const base = getProxyBaseUrl();
-      const [modelsResp, healthResp] = await Promise.all([
-        fetch(`${base}/v1/models`, { signal: AbortSignal.timeout(5000) }),
-        fetch(`${base}/v1/model-health`, { signal: AbortSignal.timeout(5000) }),
-      ]);
-      let models: ProxyModelEntry[] = [];
-      if (modelsResp.ok) {
-        const body = (await modelsResp.json()) as { data?: ProxyModelEntry[] };
-        models = body.data ?? [];
-      }
-      let health: ProxyModelHealthEntry[] = [];
-      let healthOk = false;
-      if (healthResp.ok) {
-        const body = (await healthResp.json()) as { data?: ProxyModelHealthEntry[] };
-        health = body.data ?? [];
-        healthOk = true;
-      }
-      // When model-health returned no data, treat every catalog model as
-      // healthy so a health-endpoint error doesn't ghost the picker (mirrors
-      // ericli's `healthyById.size === 0` fallback). The tag gate still applies.
-      const ids = filterPickerModels(models, health, !healthOk || health.length === 0);
-      logger.info(
-        `Loaded ${ids.length} picker models from proxy` +
-          (isProxyModelsEnabled() ? " (dynamic)" : ""),
-      );
-      proxyPickerModels = ids.map((id) => ({ id, name: id }));
-      lastProxyPickerModelsLoad = Date.now();
-    } catch (err) {
-      proxyPickerModels = null;
-      logger.warn(
-        `Could not load picker models from proxy: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    } finally {
-      proxyPickerModelsPromise = null;
-    }
-  })();
-  return proxyPickerModelsPromise;
-}
-
-/**
- * The models to advertise in the ACP picker.
- *
- * When CLAUDE_ACP_PROXY_MODELS=1 and the proxy list has loaded, that live
- * filtered list wins. Otherwise (flag off, still loading, or proxy
- * unreachable) fall back to the static settings list — the pre-existing
- * behaviour — so an outage never empties the picker.
- */
 function getPickerModelList(): Array<{ id: string; name: string }> {
-  // The length check matters: an empty proxy list (fetched fine, but the
-  // gate filtered every model — e.g. all scaled to zero) is truthy in JS and
-  // would otherwise win over the settings list, crashing buildConfigOptions
-  // at `availableModels[0].id`.
-  if (isProxyModelsEnabled() && proxyPickerModels && proxyPickerModels.length > 0) {
-    return proxyPickerModels;
-  }
   return getAvailableModelsFromSettings();
 }
 
 /**
- * Context windows reported by Claude Code itself (`modelUsage[...].contextWindow`
- * on the result event). Used when the proxy did not advertise a window for the
- * model, so the denominator comes from the CLI rather than a hardcoded default.
- * The proxy value still wins when present: it reflects the model's true window,
- * whereas the CLI falls back to 200000 unless CLAUDE_CODE_MAX_CONTEXT_TOKENS is
- * set.
+ * Context windows reported by Claude Code (`modelUsage[...].contextWindow`
+ * on the result event). Wins over CLAUDE_CODE_MAX_CONTEXT_TOKENS and the
+ * 200k default when the CLI has actually reported a window for that model.
  */
 const cliReportedContextWindows = new Map<string, number>();
 
+export function recordCliContextWindow(modelId: string, contextWindow: number): void {
+  cliReportedContextWindows.set(modelId, contextWindow);
+}
+
+export function resetCliReportedContextWindows(): void {
+  cliReportedContextWindows.clear();
+}
+
 /**
- * Resolve the full context window (in tokens) for a given model.
+ * Resolve the display context window (tokens) for a model.
  *
- * This is the *display* window — the denominator for `usage_update`, matching
- * how Claude Code's status line always uses the model's full window even when
- * the compaction threshold is decoupled from it.
- *
- * Precedence mirrors Claude Code CLI:
- *  1. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — the documented override for models the
- *     CLI does not recognize as Claude models (i.e. anything routed through
- *     `ANTHROPIC_BASE_URL`, which is exactly our case). Applied directly as of
- *     CLI v2.1.193.
- *  2. The proxy's advertised `context_length` from /v1/models — authoritative
- *     for the real backend model.
- *  3. The window Claude Code itself reported on the result event.
- *  4. DEFAULT_CONTEXT_WINDOW.
- *
- * Interaction with the override:
- *  - When the model's real window is UNKNOWN, the override is used verbatim
- *    (it's the only signal we have).
- *  - When the model's real window is SMALLER than the override, the real
- *    window wins — the override is a documented *maximum*, so applying a
- *    196608 override to glm-5.1 (131072) must clamp down to 131072.
- *    Without this, the threshold would sit above the real limit and the
- *    conversation would overflow without ever compacting.
- *  - When the model's real window is LARGER than the override, the real
- *    window wins — the override was written for a different (smaller)
- *    model and must not hide capacity from a larger one. Otherwise
- *    deepseek-v4-flash (262144) would display as 196608 and compact far
- *    earlier than necessary.
- *
- * Net effect: the real window always wins when known; the override only
- * applies when no real window is available.
+ * 1. Window Claude Code reported on a result event.
+ * 2. CLAUDE_CODE_MAX_CONTEXT_TOKENS.
+ * 3. DEFAULT_CONTEXT_WINDOW (200k).
  */
 export function getContextWindowForModel(modelId: string | undefined): number {
-  const proxyKnown = modelId ? modelContextWindows.get(modelId) : undefined;
   const cliKnown = modelId ? cliReportedContextWindows.get(modelId) : undefined;
-  const known = proxyKnown ?? cliKnown;
-  if (known !== undefined) return known;
-  // The model is in neither map. If the proxy load hasn't completed (or failed
-  // at spawn and is now retryable), kick off a background refresh so the NEXT
-  // lookup sees the real window instead of falling through to the override —
-  // which is typically pinned to one specific model's window and would
-  // mis-report every other model's denominator and compaction threshold. This
-  // is fire-and-forget: the current call still falls back below; the refresh
-  // populates the map for subsequent calls (the next usage_update, which fires
-  // many times per turn).
-  if (modelId && !modelContextWindowsLoaded) {
-    void loadModelContextWindows();
-  }
+  if (cliKnown !== undefined) return cliKnown;
   const override = parsePositiveIntEnv(getClaudeEnv("CLAUDE_CODE_MAX_CONTEXT_TOKENS"));
   if (override !== undefined) return override;
   return DEFAULT_CONTEXT_WINDOW;
@@ -3570,18 +3314,6 @@ export function createClaudeCodeAgent(
     // Get model and effort overrides from session config (set via pickers)
     const configOverrides = store.getConfigOverrides(sessionId);
     const runModel = configOverrides["model"] as string | undefined;
-    // Best-effort: trigger a context-window map load (one-shot, idempotent) so
-    // the first usage_update of the turn uses the proxy's real per-model
-    // window instead of falling through to the CLAUDE_CODE_MAX_CONTEXT_TOKENS
-    // override (which is pinned to one model's window and would mis-report
-    // every other model's denominator). This is NON-BLOCKING: a blocking await
-    // here delays prompt() past the point where an early cancel() can be
-    // observed, which loses the cancel signal (the test for cancel-during-prompt
-    // times out). The startup fire-and-forget in index.ts and the refresh-on-miss
-    // in getContextWindowForModel already populate the map; this just nudges an
-    // in-flight load along if the proxy wasn't reachable at spawn.
-    void loadModelContextWindows();
-    void loadProxyPickerModels();
     // Only pass effort if the selected model actually supports it; otherwise
     // fall back to the model's default effort. Using resolveEffort() keeps
     // the actually-sent effort consistent with what the picker shows and
@@ -3909,26 +3641,14 @@ export function createClaudeCodeAgent(
         // Best effort — a missing command-output row must not fail the turn.
       });
     }
-    // Record the context window Claude Code resolved for this model, so the
-    // usage denominator can fall back to the CLI's own figure instead of a
-    // hardcoded 200k when the proxy advertises nothing. NOTE: the CLI's value
-    // is only a FALLBACK — getContextWindowForModel prefers the proxy's
-    // /v1/models figure (authoritative) via `??`. The CLI often reports a
-    // stale/default window for non-Claude models routed via ANTHROPIC_BASE_URL
-    // (e.g. it reports 196608 for deepseek-v4-flash, whose real window is
-    // 262144). If the proxy map doesn't have this model, refresh it — the
-    // proxy may have added the model after our one-shot load.
+    // Record the context window Claude Code resolved for this model.
     if (event.contextWindow && event.contextWindow > 0) {
       const cwModel = resolveSessionModel(store, sessionId, runModel);
       if (cliReportedContextWindows.get(cwModel) !== event.contextWindow) {
-        cliReportedContextWindows.set(cwModel, event.contextWindow);
+        recordCliContextWindow(cwModel, event.contextWindow);
         logger.info(
           `Claude Code reports contextWindow=${event.contextWindow} for ${cwModel}`
         );
-      }
-      if (!modelContextWindows.has(cwModel)) {
-        void loadModelContextWindows();
-        void loadProxyPickerModels();
       }
     }
     // Log the stop reason so premature turn termination (end_turn vs
@@ -4494,18 +4214,6 @@ const drainSteerQueue = async (): Promise<void> => {
       const claudeSessionIdAfterDrain = store.getClaudeSessionId(sessionId);
       let result;
       if (!skipMainTurn) {
-      // Ensure the proxy /v1/models fetch has settled before the first
-      // getContextWindowForModel call. startAgent() fires it as a
-      // fire-and-forget; if the first prompt arrives before the ~200ms
-      // fetch resolves, the map is empty and the lookup falls through to
-      // CLAUDE_CODE_MAX_CONTEXT_TOKENS (pinned to one model's window),
-      // mis-computing the compaction threshold for every other model.
-      // After the first await the map is populated for the rest of the
-      // process lifetime — subsequent prompts skip this (the promise is
-      // already resolved).
-      if (modelContextWindowsLoadPromise) {
-        await modelContextWindowsLoadPromise;
-      }
       // ─── Pre-turn compaction guard ────────────────────────────────
       // The post-turn auto-compact check (below, after "Prompt completed")
       // runs against `sessionLastUsage` — the REAL prompt count from the

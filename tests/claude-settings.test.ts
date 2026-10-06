@@ -23,7 +23,6 @@ import {
   loadClaudeSettingsEnv,
   clearClaudeSettingsCache,
   resolveModelAlias,
-  filterProxyModelsForPicker,
   MODEL_ENV_KEYS,
   AVAILABLE_MODELS_ENV_KEY,
 } from "../src/claude-settings.js";
@@ -236,65 +235,3 @@ describe("model picker from settings", () => {
   });
 });
 
-describe("filterProxyModelsForPicker", () => {
-  const health = new Set([
-    "Qwen3-Coder-480B",
-    "Qwen3.8-27B-FP8-1M",
-    "deepseek-v4-flash",
-    "glm-5.2",
-  ]);
-
-  it("keeps coding-tagged models even when they also carry the fast tag", () => {
-    const ids = filterProxyModelsForPicker(
-      [
-        { id: "Qwen3-Coder-480B", tags: ["fast", "coding"] },
-        { id: "Qwen3.8-27B-FP8-1M", tags: ["1M", "multimodal", "coding"] },
-      ],
-      health,
-    );
-    expect(ids).toEqual(["Qwen3-Coder-480B", "Qwen3.8-27B-FP8-1M"]);
-  });
-
-  it("keeps near_sota models (flagship, e.g. deepseek-v4-flash, glm-5.2)", () => {
-    const ids = filterProxyModelsForPicker(
-      [
-        { id: "deepseek-v4-flash", tags: ["near_sota"] },
-        { id: "glm-5.2", tags: ["sota", "near_sota"] },
-      ],
-      health,
-    );
-    expect(ids).toEqual(["deepseek-v4-flash", "glm-5.2"]);
-  });
-
-  it("drops fast-tagged chat models and untagged models", () => {
-    const ids = filterProxyModelsForPicker(
-      [
-        { id: "gpt-oss-120b", tags: ["fast"] },
-        { id: "DeepSeek-V3.2", tags: [] },
-        { id: "Qwen3-32B", tags: [] },
-      ],
-      health,
-    );
-    expect(ids).toEqual([]);
-  });
-
-  it("drops models not in the health set even when their tags qualify", () => {
-    const ids = filterProxyModelsForPicker(
-      [{ id: "not-loaded", tags: ["coding"] }],
-      health,
-    );
-    expect(ids).toEqual([]);
-  });
-
-  it("sorts results alphabetically regardless of input order", () => {
-    const ids = filterProxyModelsForPicker(
-      [
-        { id: "deepseek-v4-flash", tags: ["near_sota"] },
-        { id: "glm-5.2", tags: ["sota", "near_sota"] },
-        { id: "Qwen3.8-27B-FP8-1M", tags: ["coding"] },
-      ],
-      health,
-    );
-    expect(ids).toEqual(["Qwen3.8-27B-FP8-1M", "deepseek-v4-flash", "glm-5.2"]);
-  });
-});

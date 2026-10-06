@@ -95,10 +95,6 @@ describe("per-session prompt serialization", () => {
     vi.clearAllMocks();
     releaseFirstTurn = () => {};
     firstTurnStarted = () => {};
-    // The proxy discovery at newSession time must not reach the developer's
-    // live proxy: point it at an unreachable address. The picker then falls
-    // back to the static settings list and no fetch can race the tests.
-    process.env.ERICAI_PROXY_URL = "http://127.0.0.1:59999";
     conn = createMockConnection();
     agent = createClaudeCodeAgent(conn);
     await agent.initialize({
@@ -191,36 +187,5 @@ describe("per-session prompt serialization", () => {
     await p2;
 
     expect(overlap).toBe(false);
-  });
-
-  it("an empty dynamic proxy list falls back to the static settings picker (never empties it)", async () => {
-    // Simulate the hazard: the dynamic picker is enabled (settings env block
-    // has CLAUDE_ACP_PROXY_MODELS=1) and the proxy fetched OK, but the shared
-    // gate filtered EVERY model (e.g. all scaled to zero) → cached list is [].
-    // [] is truthy in JS, so getPickerModelList must check length, not
-    // truthiness, and fall back to the static settings list instead of
-    // crashing buildConfigOptions at `availableModels[0].id`.
-    const { loadProxyPickerModels, resetProxyPickerModelsCache } = await import("../src/agent.js");
-    resetProxyPickerModelsCache();
-    const realFetch = globalThis.fetch;
-    globalThis.fetch = vi.fn(async (url: string) => {
-      if (String(url).includes("/v1/model-health")) {
-        return { ok: true, status: 200, json: async () => ({ data: [] }) };
-      }
-      // Every catalog model fails the coding/near_sota gate.
-      return { ok: true, status: 200, json: async () => ({ data: [{ id: "gpt-oss-120b", tags: ["fast"] }] }) };
-    }) as typeof fetch;
-    try {
-      await loadProxyPickerModels();
-      // A fresh session must still build its config options from the static
-      // settings list — no crash, non-empty picker.
-      const r = await agent.newSession({ cwd: "/tmp/proj", mcpServers: [] });
-      const modelOption = (r.configOptions as any[]).find((o) => o.id === "model");
-      expect(modelOption).toBeTruthy();
-      expect(modelOption.options.length).toBeGreaterThan(0);
-    } finally {
-      globalThis.fetch = realFetch;
-      resetProxyPickerModelsCache();
-    }
   });
 });

@@ -7,14 +7,12 @@
  *
  * Requires:
  *   - llama-server started with `--slot-save-path <dir>`
- *   - CLAUDE_LLAMA_SERVER_URL env var (e.g. "http://192.168.124.14:8008"), or
- *     fallback to ANTHROPIC_BASE_URL (only valid when Claude Code is routed
- *     directly at llama-server, which natively serves /v1/messages)
- *   - CLAUDE_SLOT_CACHE_ENABLED env var set to "true" (feature gate)
+ *   - CLAUDE_LLAMA_SERVER_URL env var (e.g. "http://192.168.124.14:8008")
+ *   - CLAUDE_SLOT_CACHE_ENABLED=true
  *
- * When the resolved URL is a proxy (no /slots endpoint), the probe fails and
- * every save/restore is skipped with a log line — the feature is inert, not
- * destructive.
+ * ANTHROPIC_BASE_URL is not used: it may point at Strata, CCR, or any
+ * OpenAI/Anthropic-compatible server that does not implement llama.cpp /slots.
+ * When CLAUDE_LLAMA_SERVER_URL is unset, save/restore are no-ops.
  */
 
 import { logger } from "./logger.js";
@@ -47,12 +45,14 @@ type SlotCacheResult = {
 };
 
 export function isSlotCacheEnabled(): boolean {
-  return process.env.CLAUDE_SLOT_CACHE_ENABLED === "true";
+  return (
+    process.env.CLAUDE_SLOT_CACHE_ENABLED === "true" &&
+    Boolean(process.env.CLAUDE_LLAMA_SERVER_URL)
+  );
 }
 
 export function getLlamaServerUrl(): string | null {
-  const url =
-    process.env.CLAUDE_LLAMA_SERVER_URL || process.env.ANTHROPIC_BASE_URL;
+  const url = process.env.CLAUDE_LLAMA_SERVER_URL;
   if (!url) return null;
   return url.replace(/\/v1\/?$/, "").replace(/\/$/, "");
 }
@@ -86,7 +86,7 @@ export async function saveSlotCache(
       fileBytes: 0,
       elapsedMs: 0,
       error:
-        "CLAUDE_LLAMA_SERVER_URL not set and no ANTHROPIC_BASE_URL in env",
+        "CLAUDE_LLAMA_SERVER_URL not set",
     };
   }
 
@@ -148,7 +148,7 @@ export async function restoreSlotCache(
       fileBytes: 0,
       elapsedMs: 0,
       error:
-        "CLAUDE_LLAMA_SERVER_URL not set and no ANTHROPIC_BASE_URL in env",
+        "CLAUDE_LLAMA_SERVER_URL not set",
     };
   }
 

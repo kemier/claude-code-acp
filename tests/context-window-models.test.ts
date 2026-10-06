@@ -1,21 +1,7 @@
-// Verifies how the per-model window from the proxy interacts with the CLI's
-// global CLAUDE_CODE_MAX_CONTEXT_TOKENS override.
-//
-// Lives in its own file because loading the proxy's model list mutates
-// module-level state (and only runs once), which would change the defaults the
-// other context-window tests assert against.
-//
-// The hazard under test: the CLI applies its context override to every model.
-// Our model picker offers windows from 131072 (glm-5.1) to 262144 (Qwen3-Coder,
-// deepseek-v4-pro, deepseek-v4-flash — the whole DeepSeek V4 series shares one
-// 262144 backend limit). The real proxy-advertised window always wins when
-// known: it protects smaller-window models (a 196608 override must not inflate
-// a 131072 model past its real limit) and preserves larger windows (the
-// override must not clamp a 262144 model down to 196608, which would hide
-// capacity and compact too early). The override only applies when the proxy
-// never advertised a window for the model.
+// Per-model windows come from Claude Code's result.contextWindow, not a
+// catalog fetch. A known CLI window wins over CLAUDE_CODE_MAX_CONTEXT_TOKENS.
 
-import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/claude-settings.js", () => ({
   getClaudeEnv: (key: string) => process.env[key],
@@ -24,13 +10,13 @@ vi.mock("../src/claude-settings.js", () => ({
 }));
 
 import {
-  loadModelContextWindows,
+  recordCliContextWindow,
+  resetCliReportedContextWindows,
   getContextWindowForModel,
   getAutoCompactThreshold,
 } from "../src/agent.js";
 
-/** Windows as the proxy really advertises them on /v1/models. */
-const PROXY_WINDOWS: Record<string, number> = {
+const CLI_WINDOWS: Record<string, number> = {
   "glm-5.2": 196_608,
   "glm-5.1": 131_072,
   "deepseek-v4-pro": 262_144,
@@ -38,21 +24,14 @@ const PROXY_WINDOWS: Record<string, number> = {
   "Qwen3-Coder": 262_144,
 };
 
-beforeAll(async () => {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({
-        data: Object.entries(PROXY_WINDOWS).map(([id, context_length]) => ({
-          id,
-          context_length,
-        })),
-      }),
-    })),
-  );
-  await loadModelContextWindows();
+beforeAll(() => {
+  for (const [id, window] of Object.entries(CLI_WINDOWS)) {
+    recordCliContextWindow(id, window);
+  }
+});
+
+afterAll(() => {
+  resetCliReportedContextWindows();
 });
 
 const ENV_KEYS = [
@@ -77,8 +56,8 @@ afterEach(() => {
   }
 });
 
-describe("per-model windows from the proxy", () => {
-  it("uses the proxy's window when no override is set", () => {
+describe("per-model windows from the CLI", () => {
+  it("uses the CLI-reported window when no override is set", () => {
     expect(getContextWindowForModel("glm-5.2")).toBe(196_608);
     expect(getContextWindowForModel("glm-5.1")).toBe(131_072);
     expect(getContextWindowForModel("deepseek-v4-pro")).toBe(262_144);
@@ -86,66 +65,45 @@ describe("per-model windows from the proxy", () => {
     expect(getContextWindowForModel("Qwen3-Coder")).toBe(262_144);
   });
 
-  it("falls back to the default for a model the proxy did not advertise", () => {
+  it("falls back to the default for a model the CLI has not reported", () => {
     expect(getContextWindowForModel("some-unknown-model")).toBe(200_000);
   });
 });
 
-describe("global override vs per-model reality", () => {
-  it("honors the override for the model it was written for", () => {
+describe("global override vs per-model CLI window", () => {
+  it("honors the override for a model with a matching CLI window", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     expect(getContextWindowForModel("glm-5.2")).toBe(196_608);
   });
 
-  it("does not inflate a model whose real window is smaller", () => {
-    // Without the cap this would report 196608 for a 131072-token model and the
-    // threshold would sit above the real limit — overflow with no compaction.
-    // glm-5.1 is the 131072 model; deepseek-v4-pro is 262144 (see below).
+  it("does not inflate a model whose CLI window is smaller", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     expect(getContextWindowForModel("glm-5.1")).toBe(131_072);
   });
 
   it("compacts at window - 13000 for a smaller model (no reserve)", () => {
-    // With the summary reserve removed, the threshold is just window - 13000.
-    // The output budget no longer factors in, so threshold + maxOutput can
-    // exceed the real window (accepted overflow risk, compaction mode A).
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "20000";
     const threshold = getAutoCompactThreshold("glm-5.1");
-    // 131072 - 13000
     expect(threshold).toBe(118_072);
-    // No longer guaranteed to fit: 118072 + 20000 = 138072 > 131072.
     expect(threshold + 20_000).toBeGreaterThan(131_072);
   });
 
   it("does not let the override lower a larger model's window", () => {
-    // These models really have 262144; the override was written for a smaller
-    // model (glm-5.2 @ 196608) and must not hide capacity from a larger one.
-    // Clamping a larger window down to the override would compact far earlier
-    // than necessary and misreport the denominator in the usage UI. The whole
-    // DeepSeek V4 series shares the same 262144 backend limit.
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     expect(getContextWindowForModel("Qwen3-Coder")).toBe(262_144);
     expect(getContextWindowForModel("deepseek-v4-pro")).toBe(262_144);
     expect(getContextWindowForModel("deepseek-v4-flash")).toBe(262_144);
   });
 
-  it("applies the override to a model the proxy never advertised", () => {
+  it("applies the override to a model the CLI never reported", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     expect(getContextWindowForModel("some-unknown-model")).toBe(196_608);
   });
 });
 
-describe("CLI-reported window vs proxy reality", () => {
-  // Production bug (2026-08-07): the CLI reports contextWindow=196608 for
-  // deepseek-v4-flash (whose real window is 262144) because it doesn't
-  // recognize non-Claude models routed via ANTHROPIC_BASE_URL. The proxy map's
-  // authoritative value MUST win — the wrong CLI figure must never shadow it,
-  // or the usage denominator and compaction threshold get pinned to the wrong
-  // (smaller) model's window. The proxy map is loaded in beforeAll with the
-  // correct 262144; this asserts the override (196608, matching the CLI's wrong
-  // value) does NOT win when the proxy map has the model.
-  it("prefers the proxy window over the override when the model is known", () => {
+describe("CLI-reported window vs env override", () => {
+  it("prefers the CLI window over the override when the model is known", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     expect(getContextWindowForModel("deepseek-v4-flash")).toBe(262_144);
   });
@@ -153,12 +111,8 @@ describe("CLI-reported window vs proxy reality", () => {
   it("computes the 90% threshold against the real (larger) window", () => {
     process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "196608";
     process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
-    // 90% of 262144 = 235930, not 90% of 196608 (176947). Pinning the
-    // threshold to the larger window means compaction fires later, matching
-    // the model's real capacity.
     expect(getAutoCompactThreshold("deepseek-v4-flash")).toBe(
-      Math.floor((262_144 * 90) / 100)
+      Math.floor(262_144 * 0.9),
     );
   });
 });
-
