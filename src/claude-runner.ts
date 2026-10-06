@@ -634,6 +634,19 @@ export class ClaudeRunner {
     delete env.CLAUDECODE;
     delete env.CLAUDE_CODE_SESSION_ID;
     delete env.CLAUDE_CODE_CHILD_SESSION;
+    // Local llama.cpp/Strata prefix-caches the tokenized prompt. Claude Code
+    // bakes a live `git status` snapshot into the END of the system prompt
+    // (after the tools JSON in Qwen's template). A fresh `--resume` re-runs
+    // git, so the prefix diverges there (~19k tokens in a typical session)
+    // and the rest of the conversation is prefilled from scratch. Disable
+    // the snapshot for local backends; the agent can still run `git status`
+    // via Bash. User-set CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS wins.
+    const local =
+      Boolean(env.CLAUDE_LLAMA_SERVER_URL) ||
+      /127\.0\.0\.1|localhost/i.test(env.ANTHROPIC_BASE_URL || "");
+    if (local && env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS === undefined) {
+      env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
+    }
     return env;
   }
 
@@ -706,10 +719,15 @@ export class ClaudeRunner {
   /**
    * One Claude CLI process per ACP session. Follow-up prompts (the next user
    * message, a steer drained at end_turn) are written to its stdin instead of
-   * spawning `claude -p --resume`. A new process re-reads `git status` into
-   * the system prompt, so the llama.cpp prefix diverges and the whole
-   * conversation is prefilled again. The process is built once, so that
+   * spawning `claude -p --resume`. A new process re-renders the system prompt
+   * (tools JSON, then Claude's instructions, with a fresh `git status` dump
+   * at the end). Strata/llama.cpp prefix-match tokens, so that dump is the
+   * first difference (~19k tokens into a typical prompt) and the rest of the
+   * conversation is prefilled from scratch. The process is kept alive so the
    * snapshot stays byte-identical and only the new turn is prefilled.
+   * sanitizeEnv also sets CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS on local
+   * llama backends so a forced --resume (engine restart, crash) does not
+   * re-introduce that dump.
    *
    * Dropped (and the next prompt falls back to --resume) when the process
    * exits, the user cancels, or model / effort / permission mode changes —
