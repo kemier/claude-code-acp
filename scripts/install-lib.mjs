@@ -59,11 +59,21 @@ export function installLaunchers({ platform, localBin, wrapperPath }) {
 }
 
 function runNpm(args, cwd) {
-  const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
-  const result = spawnSync(npmBin, args, {
+  // `npm run` sets npm_execpath to npm's JS entry. Spawn that with node so
+  // Windows does not have to launch npm.cmd (Node 20+ returns EINVAL, and
+  // shell:true warns DEP0190).
+  const npmExec = process.env.npm_execpath;
+  const command = npmExec
+    ? process.execPath
+    : process.platform === "win32"
+      ? "npm.cmd"
+      : "npm";
+  const commandArgs = npmExec ? [npmExec, ...args] : args;
+  const result = spawnSync(command, commandArgs, {
     cwd,
     stdio: "inherit",
     windowsHide: true,
+    shell: !npmExec && process.platform === "win32",
   });
   if (result.error) {
     throw result.error;
