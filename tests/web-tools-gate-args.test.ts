@@ -43,7 +43,7 @@ describe("isProxyBaseUrl", () => {
   });
 });
 
-describe("buildExtraArgs drops server-side web tools on a proxy route", () => {
+describe("buildExtraArgs drops server-side web tools in ACP mode (every route)", () => {
   it("adds --disallowedTools WebSearch for a proxy base URL", () => {
     const args = extraArgsFor("http://127.0.0.1:8317");
     const i = args.indexOf("--disallowedTools");
@@ -54,13 +54,18 @@ describe("buildExtraArgs drops server-side web tools on a proxy route", () => {
     expect(args[i + 1]).not.toContain("WebFetch");
   });
 
-  it("does NOT add it for a direct Anthropic route", () => {
-    expect(extraArgsFor("https://api.anthropic.com")).not.toContain("--disallowedTools");
-    expect(extraArgsFor(undefined)).not.toContain("--disallowedTools");
+  it("drops WebSearch on a direct Anthropic route too (ACP mode never exposes it)", () => {
+    for (const base of ["https://api.anthropic.com", undefined]) {
+      const args = extraArgsFor(base);
+      const i = args.indexOf("--disallowedTools");
+      expect(i).toBeGreaterThanOrEqual(0);
+      expect(args[i + 1]).toBe("WebSearch");
+    }
   });
 
-  it("honors the CLAUDE_ACP_KEEP_WEB_TOOLS=1 escape hatch", () => {
+  it("honors the CLAUDE_ACP_KEEP_WEB_TOOLS=1 escape hatch on every route", () => {
     expect(extraArgsFor("http://127.0.0.1:8317", "1")).not.toContain("--disallowedTools");
+    expect(extraArgsFor("https://api.anthropic.com", "1")).not.toContain("--disallowedTools");
   });
 
   it("drops WebFetch too when CLAUDE_ACP_DISALLOWED_WEB_TOOLS names it (network-blocked hosts)", () => {

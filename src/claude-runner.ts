@@ -297,19 +297,18 @@ export class ClaudeRunner {
       );
     }
     // WebSearch is a server-side Anthropic tool: the search is executed by
-    // Anthropic's API, not the CLI. With ANTHROPIC_BASE_URL pointed at a proxy
-    // serving non-Claude models (ericai-proxy: GLM/DeepSeek/Qwen), nobody
-    // executes it — the tool_use opens and waits for a tool_result that never
-    // arrives, which the chat shows as a hung turn. Drop it from the advertised
-    // set so the model never calls an unsupported tool. A direct Anthropic
-    // route keeps it (real Claude models do execute it).
-    // WebFetch is fetched by the CLI itself (client-side), so the proxy route
-    // does not break it — but where the network blocks it (e.g. China), the
-    // fetch stalls. Add it to the dropped set via
-    // CLAUDE_ACP_DISALLOWED_WEB_TOOLS=WebSearch,WebFetch on such hosts.
-    // CLAUDE_ACP_KEEP_WEB_TOOLS=1 drops nothing at all (proxy that does front
-    // a web-search-capable backend).
-    if (!process.env.CLAUDE_ACP_KEEP_WEB_TOOLS && isProxyBaseUrl(process.env.ANTHROPIC_BASE_URL)) {
+    // Anthropic's API, not the CLI. ACP turns are headless and no route in
+    // front of them reliably executes it — a proxy gateway (GLM/DeepSeek/Qwen)
+    // has no executor at all, and even a direct Anthropic host whose network
+    // blocks the server-side fetch (e.g. China) returns an empty result the
+    // model then hallucinates over. ACP mode therefore never exposes it: drop
+    // it unconditionally so the model can't call it on any route.
+    // WebFetch is fetched by the CLI itself (client-side), so it stays
+    // available unless the operator names it in
+    // CLAUDE_ACP_DISALLOWED_WEB_TOOLS (network-blocked hosts, e.g. China).
+    // CLAUDE_ACP_KEEP_WEB_TOOLS=1 drops nothing at all (a route that does
+    // front a web-search-capable backend).
+    if (!process.env.CLAUDE_ACP_KEEP_WEB_TOOLS) {
       const dropped = (process.env.CLAUDE_ACP_DISALLOWED_WEB_TOOLS || "WebSearch")
         .split(",")
         .map((t) => t.trim())
