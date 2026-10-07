@@ -651,8 +651,8 @@ export class ClaudeRunner {
   }
 
   /**
-   * Signal a spawned claude process. The streaming spawns use `detached:
-   * true`, so the child leads its own process group and signaling `-pid`
+   * Signal a spawned claude process. The streaming spawns use `detached`
+   * on POSIX, so the child leads its own process group and signaling `-pid`
    * reaches every descendant the turn's tools forked (a Bash poll's
    * `bash → sleep/ssh` tree). Without the group signal those grandchildren
    * outlive the cancelled turn as orphans — continuing to run, consume the
@@ -855,7 +855,13 @@ export class ClaudeRunner {
       cwd: opts.cwd,
       env: this.sanitizeEnv(),
       stdio: ["pipe", "pipe", "pipe"],
-      detached: true,
+      // POSIX: own process group so cancel() can signal(-pgid) the whole
+      // tree. On Windows `detached` instead gives the child a fresh console
+      // window — the visible flash when the first prompt spawns this
+      // process — and kill already falls back to proc.kill there, so gate
+      // it and hide the console.
+      detached: process.platform !== "win32",
+      windowsHide: true,
     });
     const live: LiveClaudeSession = {
       proc,
@@ -979,6 +985,7 @@ export class ClaudeRunner {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
       });
 
       let stdout = "";
@@ -1027,11 +1034,14 @@ export class ClaudeRunner {
       // signal(-pgid) the whole tree — a Bash tool's `bash → sleep/ssh`
       // grandchildren keep running (and keep the turn's output flowing) when
       // only the claude parent is signalled, orphaning the turn's work.
+      // Windows has no process groups: detached there only forces a fresh
+      // console window (the first-prompt flash), so gate it and hide.
       const proc = spawn(this.resolveClaudeBin(), args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
 
       if (trackingId) {
@@ -1163,11 +1173,13 @@ export class ClaudeRunner {
       logger.debug(`spawn streaming-json: claude ${maskArgs(args)}`);
       // detached: own process group — see runStreaming for why cancel()
       // needs to signal the whole tree, not just the claude parent.
+      // Windows: gate + hide (see the persistent-spawn comment).
       const proc = spawn("claude", args, {
         cwd,
         env: this.sanitizeEnv(),
         stdio: ["pipe", "pipe", "pipe"],
-        detached: true,
+        detached: process.platform !== "win32",
+        windowsHide: true,
       });
 
       if (trackingId) {
