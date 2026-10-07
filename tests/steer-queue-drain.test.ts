@@ -21,6 +21,8 @@ interface RecordedCall {
 }
 let recorded: RecordedCall[] = [];
 let running = false;
+/** When true, writeSteerToMainTurn succeeds (mid-turn stdin path). */
+let midTurnWriteOk = false;
 /** Fires once the given call index begins, so a test can steer mid-turn. */
 let onStreamCall: ((call: RecordedCall) => void | Promise<void>) | null = null;
 
@@ -41,9 +43,8 @@ vi.mock("../src/claude-runner.js", () => {
     this.startSession = vi.fn().mockResolvedValue({ text: "", sessionId: "claude-uuid-abc" });
     this.continueSession = vi.fn().mockResolvedValue({ text: "", sessionId: "claude-uuid-abc" });
     this.isRunning = vi.fn(() => running);
-    this.writeSteerToMainTurn = vi.fn(() => false);
     this.cancel = vi.fn();
-    this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
+    this.writeSteerToMainTurn = vi.fn(() => midTurnWriteOk);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(
       (_cwd: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
@@ -67,6 +68,7 @@ async function setup() {
   vi.clearAllMocks();
   recorded = [];
   running = false;
+  midTurnWriteOk = false;
   onStreamCall = null;
   const conn = createMockConnection();
   const agent: any = createClaudeCodeAgent(conn);
@@ -192,6 +194,40 @@ describe("steer queue drain ordering", () => {
     recorded = [];
     await prompt(agent, sid, "next");
     expect(prompts().some((p) => p.includes("IGNORED"))).toBe(false);
+  });
+
+  it("after end_turn, re-queues a mid-turn stdin steer the model ignored (no tool_use after)", async () => {
+    // Regression: steer "fix it" during the final summary was written to
+    // stdin (Steer delivered mid-turn) but the model still end_turn'd — no
+    // follow-up turn until the user typed "go on". Orphans must be re-queued
+    // onto drainSteerQueue so a Follow-up turn starts automatically.
+    const { agent, sid } = await setup();
+    await prompt(agent, sid, "establish");
+
+    recorded = [];
+    midTurnWriteOk = true;
+    onStreamCall = async (call) => {
+      if (call.prompt.includes("main-work") && !call.prompt.includes("Follow-up")) {
+        onStreamCall = null;
+        // sessionPromptInFlight is set inside executePrompt — steer is accepted.
+        await agent.extNotification("session/steer", {
+          sessionId: sid,
+          text: "fix it",
+        });
+        midTurnWriteOk = false;
+      }
+    };
+    await prompt(agent, sid, "main-work");
+
+    await vi.waitFor(
+      () => {
+        const followUps = prompts().filter(
+          (p) => p.includes("Follow-up instruction") && p.includes("fix it"),
+        );
+        expect(followUps.length).toBeGreaterThanOrEqual(1);
+      },
+      { timeout: 3000 },
+    );
   });
 
   it("emits a user_message_accepted (stage-1) on receipt, distinct from the delivered chunk", async () => {
