@@ -76,13 +76,26 @@ describe("SessionStore persistence across agent restarts", () => {
     const store = new SessionStore();
     // No full records existed, so nothing to rehydrate...
     expect(store.has("acp-x")).toBe(false);
-    // ...but a new session in that cwd still resumes the old Claude conversation.
-    store.create("acp-x", "/work/legacy");
+    // session/new (plain create) must NOT inherit — otherwise "+" keeps the old chat.
+    store.create("acp-fresh", "/work/legacy");
+    expect(store.getClaudeSessionId("acp-fresh")).toBeUndefined();
+    // loadSession rehydration (ensure) still resumes the last Claude UUID for the cwd.
+    store.ensure("acp-x", "/work/legacy");
     expect(store.getClaudeSessionId("acp-x")).toBe("legacy-uuid");
 
     const onDisk = JSON.parse(readFileSync(STORE_FILE(), "utf-8"));
     expect(onDisk.version).toBe(2);
     expect(onDisk.byPersistKey["cwd:/work/legacy"]).toBe("legacy-uuid");
+  });
+
+  it("session/new create() does not attach the cwd's last Claude session", () => {
+    const first = new SessionStore();
+    first.create("acp-1", "/work/proj");
+    first.setClaudeSessionId("acp-1", "old-claude-uuid");
+
+    const second = new SessionStore();
+    second.create("acp-2", "/work/proj");
+    expect(second.getClaudeSessionId("acp-2")).toBeUndefined();
   });
 
   it("ensure() is a no-op for a session that already exists", () => {

@@ -56,8 +56,11 @@ interface SessionData {
  * conversation rendered empty. It also makes `session/list` work across
  * restarts, which previously listed nothing.
  *
- * `byPersistKey` is the original cwd→Claude-UUID mapping, kept so a NEW session
- * in a known directory still resumes the last Claude conversation there.
+ * `byPersistKey` is the cwd→last-Claude-UUID mapping. Used when rehydrating an
+ * unknown session via `ensure(..., { resumeLastClaude: true })` (loadSession
+ * fallback). Intentionally NOT applied on a plain `create()` / `session/new` —
+ * otherwise the ACP "+" new-conversation button keeps `--resume`-ing the old
+ * Claude transcript in the same workspace.
  *
  * Legacy files are a bare `{ [persistKey]: claudeSessionId }` map; loadPersisted
  * migrates those on read.
@@ -118,22 +121,30 @@ export class SessionStore {
    */
   ensure(sessionId: string, cwd: string, mcpServers: McpServerConfig[] = []): void {
     if (this.sessions.has(sessionId)) return;
-    this.create(sessionId, cwd, mcpServers);
+    // loadSession rehydration: fall back to the last Claude UUID for this cwd
+    // when the ACP session was never fully persisted.
+    this.create(sessionId, cwd, mcpServers, { resumeLastClaude: true });
   }
 
   create(
     sessionId: string,
     cwd: string,
-    mcpServers: McpServerConfig[] = []
+    mcpServers: McpServerConfig[] = [],
+    opts: { resumeLastClaude?: boolean } = {},
   ): void {
     if (this.sessions.has(sessionId)) {
       throw new Error(`Session ${sessionId} already exists`);
     }
 
-    // Restore Claude Code session ID from disk if available
-    const persistKey = getPersistKey(cwd);
-    const persisted = this.loadPersisted();
-    const claudeSessionId = persisted.byPersistKey[persistKey];
+    // Only attach the cwd→last-Claude mapping when explicitly requested
+    // (ensure/loadSession). session/new must start with no Claude id so the
+    // first prompt calls startSession (fresh conversation), not --resume.
+    let claudeSessionId: string | undefined;
+    if (opts.resumeLastClaude) {
+      const persistKey = getPersistKey(cwd);
+      const persisted = this.loadPersisted();
+      claudeSessionId = persisted.byPersistKey[persistKey];
+    }
 
     const now = new Date().toISOString();
     this.sessions.set(sessionId, {
@@ -147,7 +158,7 @@ export class SessionStore {
 
     if (claudeSessionId) {
       logger.info(
-        `Restored Claude Code session ${claudeSessionId} for ${persistKey}`
+        `Restored Claude Code session ${claudeSessionId} for ${getPersistKey(cwd)}`
       );
     }
     this.persistSessions();
