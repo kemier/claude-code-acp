@@ -3100,6 +3100,7 @@ export function createClaudeCodeAgent(
         sessionId,
         modelOverride,
         effectiveEffort,
+        store.getMcpServers(sessionId),
       );
       // Now clear the old session and start fresh with the summary.
       const cwd = store.getCwd(sessionId)!;
@@ -4183,7 +4184,7 @@ const drainSteerQueue = async (): Promise<void> => {
             // /goal <objective> — start an LLM turn pursuing it.
             try {
               ctxEstimator.addText(steerDispatch.startTurn);
-              await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, runModel, runEffort);
+              await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, runModel, runEffort, store.getMcpServers(sessionId));
               await Promise.all(permissionPromises);
             } catch (goalErr) {
               logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
@@ -4230,7 +4231,8 @@ const drainSteerQueue = async (): Promise<void> => {
             onEvent,
             sessionId,
              runModel,
-              runEffort
+              runEffort,
+              store.getMcpServers(sessionId)
             );
             await Promise.all(permissionPromises);
           } catch (steerErr) {
@@ -4348,7 +4350,8 @@ const drainSteerQueue = async (): Promise<void> => {
             onEvent,
             sessionId,
             runModel,
-            runEffort
+            runEffort,
+            store.getMcpServers(sessionId)
           );
         } catch (resumeErr) {
           const resumeMsg = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
@@ -4542,6 +4545,7 @@ const drainSteerQueue = async (): Promise<void> => {
                 sessionId,
                 runModel,
                 runEffort,
+                store.getMcpServers(sessionId),
               );
               await Promise.all(permissionPromises);
             } catch (followUpErr) {
@@ -4748,6 +4752,7 @@ const drainSteerQueue = async (): Promise<void> => {
                    sessionId,
                    runModel,
                    runEffort,
+                   store.getMcpServers(sessionId),
                  )
                : await runner.continueSessionStreaming(
                    claudeSid,
@@ -4756,6 +4761,7 @@ const drainSteerQueue = async (): Promise<void> => {
                    sessionId,
                    runModel,
                    runEffort,
+                   store.getMcpServers(sessionId),
                  );
              store.setClaudeSessionId(sessionId, continueResult.sessionId);
              await Promise.all(permissionPromises);

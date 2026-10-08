@@ -429,6 +429,7 @@ export class ClaudeRunner {
         onEvent,
         modelOverride,
         effortOverride,
+        mcpServers,
       });
     }
     const args = this.buildStreamJsonArgs(undefined, modelOverride, effortOverride);
@@ -445,7 +446,8 @@ export class ClaudeRunner {
     onEvent: (event: StreamEvent) => void,
     trackingId?: string,
     modelOverride?: string,
-    effortOverride?: string
+    effortOverride?: string,
+    mcpServers?: McpServerConfig[]
   ): Promise<ClaudeResult> {
     if (trackingId) {
       return this.runPersistentTurn({
@@ -457,9 +459,15 @@ export class ClaudeRunner {
         onEvent,
         modelOverride,
         effortOverride,
+        mcpServers,
       });
     }
-    const args = this.buildStreamJsonArgs(claudeSessionId, modelOverride, effortOverride);
+    const args = this.buildStreamJsonArgsWithMcp(
+      claudeSessionId,
+      mcpServers ?? [],
+      modelOverride,
+      effortOverride
+    );
     return this.runStreamingJsonLine(args, undefined, content, onEvent, trackingId);
   }
 
@@ -518,7 +526,8 @@ export class ClaudeRunner {
     onEvent: (event: StreamEvent) => void,
     trackingId?: string,
     modelOverride?: string,
-    effortOverride?: string
+    effortOverride?: string,
+    mcpServers?: McpServerConfig[]
   ): Promise<ClaudeResult> {
     if (trackingId) {
       return this.runPersistentTurn({
@@ -530,6 +539,7 @@ export class ClaudeRunner {
         onEvent,
         modelOverride,
         effortOverride,
+        mcpServers,
       });
     }
     const args = [
@@ -548,6 +558,9 @@ export class ClaudeRunner {
       "--include-partial-messages",
       ...this.buildExtraArgs(modelOverride, effortOverride),
     ];
+    if (mcpServers && mcpServers.length > 0) {
+      args.push(...this.buildMcpArgs(mcpServers));
+    }
     return this.runStreaming(args, undefined, onEvent, trackingId);
   }
 
@@ -829,6 +842,7 @@ export class ClaudeRunner {
     onEvent: (event: StreamEvent) => void;
     modelOverride?: string;
     effortOverride?: string;
+    mcpServers?: McpServerConfig[];
   }): Promise<ClaudeResult> {
     const existing = this.liveSessions.get(opts.trackingId);
     const spawnKey = this.liveSpawnKey(opts.modelOverride, opts.effortOverride);
@@ -845,8 +859,9 @@ export class ClaudeRunner {
     }
     if (existing) this.dropLiveSession(opts.trackingId);
 
-    const args = this.buildStreamJsonArgs(
+    const args = this.buildStreamJsonArgsWithMcp(
       opts.resumeId,
+      opts.mcpServers ?? [],
       opts.modelOverride,
       opts.effortOverride,
     );
