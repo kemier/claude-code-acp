@@ -5842,7 +5842,11 @@ const drainSteerQueue = async (): Promise<void> => {
       // dispatchSlashCommand without touching shared per-session state
       // (sessionTodos, sessionEstimators, the Claude session id, the onEvent
       // closure). They bypass the per-session prompt lock so the result
-      // appears immediately — not after the in-flight turn finishes.
+      // appears immediately — not after the in-flight turn finishes. This
+      // branch runs BEFORE the prompt joins sessionPromptLocks, so a
+      // handled command returns without ever touching the chain: no entry
+      // is left dangling and a later /ps (or any prompt) does not wait on
+      // one.
       //
       // CRITICAL: when the command is handled we must RETURN here, not fall
       // through to the serialized path. dispatchSlashCommand is NOT idempotent

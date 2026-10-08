@@ -23,26 +23,32 @@ vi.mock("../src/validation.js", () => ({
  * been detected — collectCompletedBackgroundBash removes it from
  * sessionBackgroundBash when it finishes, so the list reflects the live set.
  */
+
+type Gate = { release: () => void };
+
+function makeGate(): Gate & Promise<{ text: string; sessionId: string }> {
+  let resolveFn: (v: { text: string; sessionId: string }) => void;
+  const promise = new Promise<{ text: string; sessionId: string }>((res) => {
+    resolveFn = res;
+  });
+  return Object.assign(promise, {
+    release: () => resolveFn({ text: "ok", sessionId: "uuid-1" }),
+  });
+}
+
+// Each test configures the next startSessionStreaming invocation via this
+// hook: it may emit tool events through onEvent and return a Promise that
+// gates the turn's completion (so the turn is in flight while a mid-turn
+// /ps is dispatched).
+let nextStartTurn:
+  | ((onEvent: (e: any) => void) => Promise<{ text: string; sessionId: string }>)
+  | undefined;
+
 vi.mock("../src/claude-runner.js", () => {
   const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
     this.startSessionStreaming = vi.fn().mockImplementation(
-      (_cwd: string, _prompt: string, onEvent: any) => {
-        // Launch a background Bash command, then the launch-ack, then end the
-        // turn WITHOUT a completion — so it stays in sessionBackgroundBash.
-        onEvent({
-          type: "tool_use",
-          toolName: "Bash",
-          toolUseId: "bash-ps-1",
-          toolInput: { command: "npm run watch", run_in_background: true },
-        });
-        onEvent({
-          type: "user",
-          text: "Command running in background",
-          toolResultIds: ["bash-ps-1"],
-        });
-        onEvent({ type: "result", stopReason: "end_turn", usage: {} });
-        return Promise.resolve({ text: "ok", sessionId: "uuid-1" });
-      },
+      (_cwd: string, _prompt: string, onEvent: any) =>
+        (nextStartTurn ?? ((_e: any) => Promise.resolve({ text: "ok", sessionId: "uuid-1" })))(onEvent),
     );
     this.continueSessionStreaming = vi.fn().mockResolvedValue({
       text: "ok",
@@ -84,17 +90,40 @@ function commandOutputTexts(conn: AgentSideConnection): string[] {
     .map((u: any) => u.content.text);
 }
 
+/** A turn that launches one background Bash command (launch-ack only, no
+ *  completion) so it stays in sessionBackgroundBash. */
+function emitBashLaunch(onEvent: (e: any) => void, toolUseId: string): void {
+  onEvent({
+    type: "tool_use",
+    toolName: "Bash",
+    toolUseId,
+    toolInput: { command: "npm run watch", run_in_background: true },
+  });
+  onEvent({
+    type: "user",
+    text: "Command running in background",
+    toolResultIds: [toolUseId],
+  });
+}
+
 describe("/ps lists real background Bash commands", () => {
   let conn: AgentSideConnection;
   let agent: ReturnType<typeof createClaudeCodeAgent>;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    nextStartTurn = undefined;
     conn = createMockConnection();
     agent = createClaudeCodeAgent(conn, { pendingAgentWaitMs: 100 });
   });
 
   it("lists a running background command after a turn that started one", async () => {
+    nextStartTurn = (onEvent) => {
+      emitBashLaunch(onEvent, "bash-ps-1");
+      onEvent({ type: "result", stopReason: "end_turn", usage: {} });
+      return Promise.resolve({ text: "ok", sessionId: "uuid-1" });
+    };
+
     await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
@@ -124,6 +153,8 @@ describe("/ps lists real background Bash commands", () => {
   }, 20_000);
 
   it("reports none when no background command is running", async () => {
+    nextStartTurn = (_onEvent) => Promise.resolve({ text: "ok", sessionId: "uuid-1" });
+
     await agent.initialize({
       protocolVersion: 1,
       clientCapabilities: {},
@@ -138,5 +169,68 @@ describe("/ps lists real background Bash commands", () => {
 
     const out = commandOutputTexts(conn);
     expect(out).toContain("No background terminals running.");
+  }, 20_000);
+
+  it("resolves a mid-turn /ps promptly while the turn that started the bg command is still running", async () => {
+    // Regression: the read-only fast path used to join the per-session
+    // serialization chain BEFORE checking isReadOnlyCommand and then return
+    // early, leaving its chain entry dangling until the in-flight turn
+    // settled. A mid-turn /ps therefore took ~turn duration to answer, and
+    // any prompt queued behind it (e.g. a second /ps) waited the same.
+    const gate = makeGate();
+    nextStartTurn = (onEvent) => {
+      emitBashLaunch(onEvent, "bash-mid-1");
+      // No result event: the turn stays in flight until the gate releases.
+      return gate as any;
+    };
+
+    await agent.initialize({
+      protocolVersion: 1,
+      clientCapabilities: {},
+      clientInfo: { name: "test", version: "1.0" },
+    } as any);
+    const session = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    // Start the turn; it will not settle on its own.
+    const turnPromise = agent.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "start the watch" }],
+    } as any);
+
+    // Let the turn's events (tool_use + launch-ack) be processed, and let the
+    // first prompt join the per-session lock chain.
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Mid-turn /ps: must resolve quickly and report the live bg command —
+    // not wait for the in-flight turn to settle.
+    const t0 = Date.now();
+    const psPromise = agent.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "/ps" }],
+    } as any);
+    const psResult = await psPromise;
+    const psElapsed = Date.now() - t0;
+    expect(psResult.stopReason).toBe("end_turn");
+    expect(psElapsed).toBeLessThan(2000);
+
+    const out = commandOutputTexts(conn);
+    const psLine = out.find((t) => /background command/.test(t));
+    expect(psLine).toBeTruthy();
+    expect(psLine).toContain("npm run watch");
+
+    // A SECOND /ps right after must also resolve promptly — with the old
+    // bug it would have waited on the dangling chain entry for the turn.
+    const t1 = Date.now();
+    const ps2Result = await agent.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: "text", text: "/ps" }],
+    } as any);
+    const ps2Elapsed = Date.now() - t1;
+    expect(ps2Result.stopReason).toBe("end_turn");
+    expect(ps2Elapsed).toBeLessThan(2000);
+
+    // Release the gated turn so the test process can settle.
+    gate.release();
+    await turnPromise;
   }, 20_000);
 });
