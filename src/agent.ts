@@ -2070,6 +2070,11 @@ export function createClaudeCodeAgent(
   // final output — mirroring the subagent <task-notification> auto-follow-up.
   // Maps sessionId → (Claude tool_use_id → { acpCallId, command, startedAt }).
   const sessionBackgroundBash = new Map<string, Map<string, { acpCallId: string; command: string; startedAt: number }>>();
+  // sessionId → true once loadSession's transcript replay has rehydrated
+  // sessionBackgroundBash for it. Lets /ps tell a resumed session's empty
+  // tracker apart from a fresh session's empty tracker — see the /ps
+  // handler ("restored session" notice). Cleared by /clear.
+  const sessionResumedFromReplay = new Set<string>();
 
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
@@ -2506,6 +2511,16 @@ export function createClaudeCodeAgent(
       let psText: string;
       if (!bg || bg.size === 0) {
         psText = "No background terminals running.";
+        // A resumed (session/load-replayed) session with an empty tracker
+        // would otherwise read as a bug: the user's pre-reload background
+        // commands are NOT tracked — the live map is per-agent-process, and
+        // replay only rehydrates commands whose completion never surfaced
+        // in the transcript. Say so, so "No background terminals running."
+        // is self-explanatory instead of looking like a stale/wrong answer.
+        if (sessionResumedFromReplay.has(sessionId)) {
+          psText +=
+            "\n(restored session — background commands started before the resume are tracked only while their completion has not been reported; start a new background command to see it listed)";
+        }
       } else {
         const fmtElapsed = (ms: number): string => {
           const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
@@ -2626,6 +2641,10 @@ export function createClaudeCodeAgent(
       store.setClaudeSessionId(sessionId, "");
       sessionGoals.delete(sessionId);
       sessionTodos.delete(sessionId);
+      // /clear drops the whole conversation, so the rehydrated background
+      // commands and the "restored session" notice go with it.
+      sessionBackgroundBash.delete(sessionId);
+      sessionResumedFromReplay.delete(sessionId);
       // Clearing drops the entire conversation, so the context estimate must
       // reset too — otherwise the ring would keep showing the pre-clear size.
       const clearedEstimator = sessionEstimators.get(sessionId);
@@ -5322,6 +5341,32 @@ const drainSteerQueue = async (): Promise<void> => {
             const replayedUpdates: any[] = [];
             let compactedAtLeastOnce = false;
             let replayMessageCounter = 0;
+            // Rehydrate the live background-Bash tracker from the transcript
+            // so a resumed session's /ps reflects pre-reload background
+            // commands instead of always claiming none are running
+            // (sessionBackgroundBash is per-agent-process and would be empty
+            // after a respawn). A replayed `Bash` tool_use with
+            // run_in_background:true registers its command; a later entry
+            // whose <task-notification> references the SAME tool_use_id means
+            // the CLI already reported its completion — drop the entry (the
+            // live collectCompletedBackgroundBash uses the same id match;
+            // the text fallback is skipped on replay because completion
+            // events are NOT transcript entries and command-text matching
+            // would be unreliable).
+            let replayBg = sessionBackgroundBash.get(sessionId);
+            const registerReplayBg = (tuId: string, cmd: string): void => {
+              if (!replayBg) {
+                replayBg = new Map();
+                sessionBackgroundBash.set(sessionId, replayBg);
+              }
+              replayBg.set(tuId, { acpCallId: tuId, command: cmd, startedAt: Date.now() });
+            };
+            const clearReplayBg = (tuId: string): void => {
+              const m = sessionBackgroundBash.get(sessionId);
+              if (!m) return;
+              m.delete(tuId);
+              if (m.size === 0) sessionBackgroundBash.delete(sessionId);
+            };
             for (const line of lines) {
               try {
                 const entry = JSON.parse(line);
@@ -5380,6 +5425,15 @@ const drainSteerQueue = async (): Promise<void> => {
                     if (/^\[Request interrupted by user\]/i.test(content.trim())) {
                       continue;
                     }
+                    // A replayed <task-notification> that references a
+                    // background command's tool_use_id is the CLI's completion
+                    // record for it — rehydration drops it from the tracker
+                    // (same id match as the live path).
+                    if (/<task-notification>/i.test(content)) {
+                      for (const m of [...content.matchAll(/<tool-use-id>([^<\s]+)<\/tool-use-id>/g)]) {
+                        clearReplayBg(m[1]);
+                      }
+                    }
                   }
                   if (typeof content === "string" && content.trim()) {
                     replayedUpdates.push({
@@ -5392,10 +5446,33 @@ const drainSteerQueue = async (): Promise<void> => {
                         const clean = stripReplayPromptFraming(block.text);
                         if (!clean.trim()) continue;
                         if (/^\[Request interrupted by user\]/i.test(clean.trim())) continue;
+                        // A <task-notification> in a replayed user text block
+                        // (the CLI's completion record for a background
+                        // command) carries its tool_use_id — drop it.
+                        if (/<task-notification>/i.test(clean)) {
+                          for (const m of [...clean.matchAll(/<tool-use-id>([^<\s]+)<\/tool-use-id>/g)]) {
+                            clearReplayBg(m[1]);
+                          }
+                        }
                         replayedUpdates.push({
                           sessionUpdate: "user_message_chunk",
                           content: { type: "text", text: clean },
                         });
+                      } else if (block.type === "tool_result") {
+                        // Same for notifications embedded in a tool_result's
+                        // content (e.g. the CLI's pre-resume teardown record
+                        // for a background command).
+                        const trContent =
+                          typeof block.content === "string"
+                            ? block.content
+                            : Array.isArray(block.content)
+                              ? block.content
+                                  .map((b: any) => (typeof b === "string" ? b : b?.text ?? ""))
+                                  .join("")
+                              : "";
+                        if (trContent && /<task-notification>/i.test(trContent) && block.tool_use_id) {
+                          clearReplayBg(block.tool_use_id);
+                        }
                       }
                     }
                   }
@@ -5448,6 +5525,22 @@ const drainSteerQueue = async (): Promise<void> => {
                         ) {
                           replayedUpdates.push(planOut.snapshot);
                         }
+                        // Rehydrate the background-Bash tracker: a replayed
+                        // `Bash` tool_use with run_in_background:true is the
+                        // same signal the live path uses. It is dropped again
+                        // when a later replayed <task-notification> references
+                        // its tool_use_id (completion already reported).
+                        if (
+                          block.name === "Bash" &&
+                          block.id &&
+                          (block.input ?? {})?.run_in_background === true
+                        ) {
+                          const cmd =
+                            typeof (block.input as any).command === "string"
+                              ? (block.input as any).command
+                              : "(bash)";
+                          registerReplayBg(block.id, cmd);
+                        }
                       }
                     }
                   }
@@ -5460,6 +5553,10 @@ const drainSteerQueue = async (): Promise<void> => {
             for (const update of replayedUpdates) {
               await connection.sessionUpdate({ sessionId, update } as any);
             }
+            // Mark this session as resume-rehydrated so /ps can tell a resumed
+            // session's (possibly legitimately) empty background tracker
+            // apart from a fresh session's.
+            sessionResumedFromReplay.add(sessionId);
             logger.info(
               `Replay complete for session ${sessionId}` +
                 (compactedAtLeastOnce
