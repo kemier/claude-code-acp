@@ -2059,6 +2059,17 @@ export function createClaudeCodeAgent(
   // carries toolName but NOT toolUseId) back to the in-progress tool row
   // that was emitted for the same tool_use.
   const sessionPendingToolNames = new Map<string, Map<string, string>>();
+  // Background Bash commands: a Bash tool_use with run_in_background:true
+  // returns an immediate "Command running in background" tool_result within
+  // the SAME turn — so the model only ever saw the launch ack, and (in headless
+  // `claude -p` mode) the CLI never re-injects the later completion, so the
+  // model keeps believing the command is running ("the sweep is still going").
+  // Record each backgrounded command here so the post-turn flush can detect
+  // the completion (a later tool_result reusing the same tool_use_id, or a
+  // <task-notification> for it) and inject a synthetic user message with the
+  // final output — mirroring the subagent <task-notification> auto-follow-up.
+  // Maps sessionId → (Claude tool_use_id → { acpCallId, command }).
+  const sessionBackgroundBash = new Map<string, Map<string, { acpCallId: string; command: string }>>();
 
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
@@ -3333,6 +3344,17 @@ export function createClaudeCodeAgent(
    let messageCounter = 0;
    let currentMessageId: string | null = null;
 
+    // Background Bash commands that FINISHED during this turn (their completion
+    // tool_result / <task-notification> arrived mid-turn). The post-turn flush
+    // reads this to inject a synthetic user message with the final output so
+    // the model learns the command finished — see sessionBackgroundBash.
+    const backgroundBashCompletedForTurn = new Map<string, Array<{ command: string; output: string; via: string }>>();
+    // Background Bash commands still UNRESOLVED at end_turn (their completion
+    // did not surface this turn — the classic premature-end_turn case). The
+    // post-turn flush injects a status-only synthetic message so the model is
+    // not left believing they are still running.
+    const backgroundBashPendingForTurn = new Map<string, string[]>();
+
     // Real-time context estimator — tracks conversation content to estimate
     // context size during the turn (before the result event arrives).
     // REUSE the session-persistent estimator across turns: a fresh estimator
@@ -3624,7 +3646,85 @@ export function createClaudeCodeAgent(
           sessionPendingTools.delete(sessionId);
         }
       }
+      // Detect a background Bash command that just FINISHED (a completion
+      // tool_result reusing its tool_use_id, or a <task-notification>).
+      // Capture the result so the post-turn flush can inject a synthetic
+      // user message with the final output — otherwise the model (in headless
+      // `claude -p`) never learns the command finished.
+      for (const done of collectCompletedBackgroundBash(
+        sessionId,
+        event.text,
+        event.toolResultIds,
+      )) {
+        // Lazy-init: the per-turn array may not exist yet if events arrive
+        // synchronously before the turn bookkeeping is set up (tests) — real
+        // streaming is async so the key is present, but init here regardless.
+        let arr = backgroundBashCompletedForTurn.get(sessionId);
+        if (!arr) {
+          arr = [];
+          backgroundBashCompletedForTurn.set(sessionId, arr);
+        }
+        arr.push(done);
+      }
     }
+  // A backgrounded Bash command's launch-ack tool_result ("Command running in
+  // background…") arrives in the SAME turn as the tool_use, so the pending-tool
+  // row flips completed then and the model never learns the command FINISHED.
+  // The CLI (in headless `claude -p`) re-injects the FINAL completion as a
+  // separate user event reusing the same tool_use_id (or a <task-notification>).
+  // This recognizes that second event, removes the command from
+  // sessionBackgroundBash, and returns its captured output so the caller can
+  // decide whether to inject a synthetic user message with the result.
+  function collectCompletedBackgroundBash(
+    sessionId: string,
+    text: string | undefined,
+    toolResultIds: string[] | undefined,
+  ): Array<{ command: string; output: string; via: "tool_result" | "task-notification" }> {
+    const bg = sessionBackgroundBash.get(sessionId);
+    if (!bg || bg.size === 0) return [];
+    const isCompletionText = (t: string): boolean =>
+      /<task-notification>/i.test(t) ||
+      /finished|exited|completed|done\b|terminated|killed|exited with|exit code/i.test(t);
+    const out: Array<{ command: string; output: string; via: "tool_result" | "task-notification" }> = [];
+    // A completion <task-notification> may arrive without repeating the
+    // tool_use_id — match on the command text embedded in it.
+    const notifHit = (t: string): string | null => {
+      if (!t || !/<task-notification>/i.test(t)) return null;
+      for (const [tuId, info] of bg) {
+        if (info.command && t.includes(info.command)) {
+          bg.delete(tuId);
+          if (bg.size === 0) sessionBackgroundBash.delete(sessionId);
+          return info.command;
+        }
+      }
+      return null;
+    };
+    for (const tuId of toolResultIds ?? []) {
+      const info = bg.get(tuId);
+      if (!info) continue;
+      const snippet = text && text.length > 0 ? text : "(no output)";
+      const via: "tool_result" | "task-notification" =
+        text && /<task-notification>/i.test(text) ? "task-notification" : "tool_result";
+      if (via === "tool_result" && !isCompletionText(snippet)) continue; // launch-ack, not completion
+      bg.delete(tuId);
+      if (bg.size === 0) sessionBackgroundBash.delete(sessionId);
+      const pend = backgroundBashPendingForTurn.get(sessionId);
+      if (pend) {
+        const idx = pend.indexOf(info.command);
+        if (idx >= 0) pend.splice(idx, 1);
+        if (pend.length === 0) backgroundBashPendingForTurn.delete(sessionId);
+      }
+      out.push({ command: info.command, output: snippet, via });
+    }
+    if (text) {
+      const matched = notifHit(text);
+      if (matched) {
+        out.push({ command: matched, output: text, via: "task-notification" });
+      }
+    }
+    return out;
+  }
+
   // Handle result event — Claude CLI reports CUMULATIVE usage across all
   // API calls in the turn (accumulateUsage in QueryEngine.ts). For a
   // single-call turn, input_tokens = real context size (accurate). For a
@@ -3895,6 +3995,33 @@ export function createClaudeCodeAgent(
            sessionPendingToolNames.set(sessionId, pendingNames);
          }
          pendingNames.set(event.toolUseId, event.toolName);
+         // A backgrounded Bash command resolves its launch-ack tool_result
+         // within the same turn (so the pending-tool row flips completed and
+         // disappears from sessionPendingTools), but the model never learns
+         // the command FINISHED — in headless `claude -p` the CLI does not
+         // re-inject the later completion. Record it so the post-turn flush
+         // can detect completion and inject the final output (Option B:
+         // background-Bash completion awareness, mirroring the subagent
+         // <task-notification> auto-follow-up). Only Bash with
+         // run_in_background:true — foreground Bash is not tracked.
+         if (event.toolName === "Bash") {
+           const bgInput = (event.toolInput ?? {}) as Record<string, unknown>;
+           if (bgInput.run_in_background === true) {
+             const cmd = typeof bgInput.command === "string" ? bgInput.command : "(bash)";
+             let bg = sessionBackgroundBash.get(sessionId);
+             if (!bg) {
+               bg = new Map();
+               sessionBackgroundBash.set(sessionId, bg);
+             }
+             bg.set(event.toolUseId, { acpCallId: toolCallId, command: cmd });
+             const pend = backgroundBashPendingForTurn.get(sessionId);
+             if (pend) {
+               pend.push(cmd);
+             } else {
+               backgroundBashPendingForTurn.set(sessionId, [cmd]);
+             }
+           }
+         }
          // Server-side / network-blocked web tool watchdog. WebSearch
          // executes on Anthropic's API, so on a proxy route (non-anthropic
          // ANTHROPIC_BASE_URL) with a non-Claude model nobody executes it
@@ -4566,6 +4693,93 @@ const drainSteerQueue = async (): Promise<void> => {
           logger.info(
             `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
           );
+        }
+      }
+
+      // ── Background Bash completion injection (Option B) ──────────────────
+      // A backgrounded Bash command's launch-ack ("Command running in
+      // background…") is what the model saw this turn. In headless `claude -p`
+      // the CLI never re-injects the later completion, so without this the
+      // model keeps believing the command is still running — the exact
+      // "the sweep is still going" staleness. Two cases:
+      //   (a) COMPLETED this turn — collectCompletedBackgroundBash captured the
+      //       completion tool_result / <task-notification>; inject the output.
+      //   (b) STILL PENDING at end_turn — completion did not surface (premature
+      //       end_turn); inject a status-only note so the model is not left
+      //       believing it is still running.
+      {
+        const doneList = backgroundBashCompletedForTurn.get(sessionId) ?? [];
+        const pendingList = backgroundBashPendingForTurn.get(sessionId) ?? [];
+        backgroundBashCompletedForTurn.delete(sessionId);
+        backgroundBashPendingForTurn.delete(sessionId);
+        if (doneList.length > 0 || pendingList.length > 0) {
+          let followUpText: string;
+          if (doneList.length > 0) {
+            const cap = 2000;
+            const body = doneList
+              .map(
+                (d) =>
+                  `- ${d.command} (completed via ${d.via}):\n${d.output.length > cap ? d.output.slice(0, cap) + " …[truncated]" : d.output}`,
+              )
+              .join("\n");
+            followUpText =
+              `[Auto] The following background command(s) you started have finished. ` +
+              `Here are their results — please incorporate them and continue. Do not assume they are still running:\n${body}`;
+          } else {
+            followUpText =
+              `[Auto] Note: the following background command(s) you started have not yet reported ` +
+              `a completion this turn — they may still be running or their result may not have been ` +
+              `delivered. Before asserting they are still in progress, verify their status (e.g. run ` +
+              `the relevant command or check the output) rather than assuming.\n- ${pendingList.join("\n- ")}`;
+          }
+          const count = autoFollowUpCount.get(sessionId) ?? 0;
+          if (count < AUTO_FOLLOW_UP_CAP) {
+            autoFollowUpCount.set(sessionId, count + 1);
+            const claudeSidForBg = store.getClaudeSessionId(sessionId);
+            if (claudeSidForBg) {
+              await connection
+                .sessionUpdate({
+                  sessionId,
+                  update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpText } } as any,
+                })
+                .catch(() => { /* non-fatal */ });
+              logger.info(
+                `Background Bash completion injection ${count + 1}/${AUTO_FOLLOW_UP_CAP} ` +
+                  `delivering ${doneList.length} result(s) / ${pendingList.length} pending as its own turn ` +
+                  `for session ${sessionId}.`,
+              );
+              permissionPromises.length = 0;
+              try {
+                ctxEstimator.addText(followUpText);
+                await runner.continueSessionStreaming(
+                  claudeSidForBg,
+                  followUpText,
+                  onEvent,
+                  sessionId,
+                  runModel,
+                  runEffort,
+                  store.getMcpServers(sessionId),
+                );
+                await Promise.all(permissionPromises);
+              } catch (bgFollowUpErr) {
+                logger.error(
+                  `Background Bash completion turn failed for session ${sessionId}: ` +
+                    `${bgFollowUpErr instanceof Error ? bgFollowUpErr.message : String(bgFollowUpErr)}`,
+                );
+              }
+            } else {
+              if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
+              steerQueues.get(sessionId)!.push(followUpText);
+              logger.info(
+                `Background Bash completion ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued ` +
+                  `(no active session yet) for session ${sessionId}.`,
+              );
+            }
+          } else {
+            logger.info(
+              `Background Bash completion injection skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
+            );
+          }
         }
       }
 
