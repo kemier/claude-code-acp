@@ -1929,22 +1929,6 @@ export function createClaudeCodeAgent(
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   const steerQueues = new Map<string, string[]>();
-  /**
-   * Mid-turn steers that were written to the live Claude stdin
-   * (`writeSteerToMainTurn`). Those are NOT placed on `steerQueues`, so
-   * `drainSteerQueue` would never start a follow-up turn for them.
-   *
-   * If the model is already streaming its final answer it often still
-   * `end_turn`s — the steer lands in the transcript but is never acted on
-   * (observed: user steers "fix it" during the summary, turn ends, no new
-   * turn until they type "go on"). Track each mid-turn delivery; if no
-   * `tool_use` arrives after it before the turn ends, re-queue the text so
-   * the post-turn drain starts a real follow-up turn.
-   */
-  type MidTurnSteer = { text: string; toolUseAfter: boolean };
-  const sessionMidTurnSteers = new Map<string, MidTurnSteer[]>();
-  /** Collapsed steer texts already echoed via mid-turn `user_message_chunk` — skip a second echo on drain. */
-  const steerAlreadyEchoed = new Map<string, Set<string>>();
   // Per-session prompt serialization + cancel scoping.
   //
   // The bug: cancel() latches cancelledSessions for the in-flight prompt, but
@@ -2307,18 +2291,17 @@ export function createClaudeCodeAgent(
    * same collapsed rule (its `collapseWhitespaceChars` / `steerEchoMatchesEntry`),
    * so comparing collapsed forms tolerates the line-wrap / trailing-space drift
    * between what the user typed, what was queued, and what is echoed back.
-   *
-   * Declared above handleSteer / handleSteerRemove so mid-turn delivery can
-   * record the collapsed form in `steerAlreadyEchoed`.
    */
   const collapseSteerText = (s: string): string => s.replace(/\s+/g, " ").trim();
 
   /**
-   * Steering notification — injects a user message into the active turn.
-   * Prefer mid-turn stdin write when a Claude process is live; otherwise queue
-   * for `drainSteerQueue` after the current turn. Mid-turn deliveries that the
-   * model ignores (end_turn with no tool_use after the steer) are re-queued —
-   * see `sessionMidTurnSteers`.
+   * Steering notification — a user message sent while a turn is active.
+   * Never injected into the running Claude turn: it is queued on `steerQueues`
+   * and delivered as a clean follow-up turn by `drainSteerQueue` after the
+   * current turn ends (via `continueSessionStreaming` on the persistent CLI).
+   * Injecting into the live turn's stdin makes the CLI re-plan around the
+   * injected line (a 5-11s pause with no events), so the steer is kept local
+   * and answered as its own turn instead.
    *
    * Custom ACP extension: `session/steer`.
    */
@@ -2350,48 +2333,10 @@ export function createClaudeCodeAgent(
       return;
     }
 
-    // Mid-turn steer: write directly into the running process's stdin. The
-    // Claude CLI absorbs a second `user` line into the in-flight turn
-    // (verified against the live CLI) instead of queueing it as a follow-up,
-    // so the model folds this into its current work immediately.
-    const midTurnWritten = runner.writeSteerToMainTurn(sessionId, text);
-    if (midTurnWritten) {
-      logger.info(`Steer delivered mid-turn for session ${sessionId}: ${text.length} chars`);
-      // Remember this delivery so a silent end_turn (no tool_use after the
-      // steer) can re-queue it for drainSteerQueue — see sessionMidTurnSteers.
-      const midList = sessionMidTurnSteers.get(sessionId) ?? [];
-      midList.push({ text, toolUseAfter: false });
-      sessionMidTurnSteers.set(sessionId, midList);
-      const echoed = steerAlreadyEchoed.get(sessionId) ?? new Set<string>();
-      echoed.add(collapseSteerText(text));
-      steerAlreadyEchoed.set(sessionId, echoed);
-      // Stage 1 (visual bubble).
-      await connection
-        .sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "user_message_accepted",
-            content: { type: "text", text },
-          } as any,
-        })
-        .catch(() => { /* non-fatal: visual-only ack */ });
-      // Stage 2 (delivered echo) — the message IS delivered, so emit the
-      // delivered chunk now. This splices the client's queue entry and
-      // releases the next queued message.
-      await connection
-        .sessionUpdate({
-          sessionId,
-          update: {
-            sessionUpdate: "user_message_chunk",
-            content: { type: "text", text },
-          } as any,
-        })
-        .catch(() => { /* non-fatal */ });
-      return;
-    }
-
-    // Fallback: no active turn (process not running). Queue the message for
-    // delivery after the current turn finishes.
+    // Never inject into the running turn's stdin — the Claude CLI queues a
+    // second `user` line and re-plans around it (a multi-second pause with no
+    // events). Instead queue the steer for delivery as a clean follow-up turn
+    // by `drainSteerQueue` once the current turn ends.
     if (!steerQueues.has(sessionId)) {
       steerQueues.set(sessionId, []);
     }
@@ -3921,12 +3866,6 @@ export function createClaudeCodeAgent(
          });
        }
      } else if (event.type === "tool_use" && event.toolName) {
-       // Any tool_use after a mid-turn steer means the model folded that steer
-       // into the live turn — do not re-queue it for a post-end_turn follow-up.
-       const midSteers = sessionMidTurnSteers.get(sessionId);
-       if (midSteers) {
-         for (const s of midSteers) s.toolUseAfter = true;
-       }
        ctxEstimator.addToolCall(event.toolName, event.toolInput);
        const toolCallId = nextToolCallId();
        logger.debug(`Tool call: ${event.toolName}`);
@@ -4320,23 +4259,14 @@ const drainSteerQueue = async (): Promise<void> => {
         break;
       }
       deliveredAny = true;
-      // Echo now that this message is actually going to the model, so the client's
-      // release signal means delivered rather than received. Skip if mid-turn
-      // delivery already emitted this chunk (orphan re-queue path) — a second
-      // echo would duplicate the user bubble in the IDE.
-      const echoedSet = steerAlreadyEchoed.get(sessionId);
-      const collapsed = collapseSteerText(steerText);
-      if (echoedSet?.has(collapsed)) {
-        echoedSet.delete(collapsed);
-        if (echoedSet.size === 0) steerAlreadyEchoed.delete(sessionId);
-      } else {
-        await connection
-          .sessionUpdate({
-            sessionId,
-            update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: steerText } } as any,
-          })
-          .catch(() => { /* non-fatal */ });
-      }
+      // Echo now that this message is actually going to the model, so the
+      // client's release signal means delivered rather than received.
+      await connection
+        .sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: steerText } } as any,
+        })
+        .catch(() => { /* non-fatal */ });
      // NOTE: the tool-call counter is deliberately NOT reset here. Restarting
      // it mid-turn on a steer drain made the steered work reuse the ids of the
      // tools that ran before it, so the client updated the wrong rows.
@@ -4881,39 +4811,15 @@ const drainSteerQueue = async (): Promise<void> => {
 
      logger.info(`Prompt completed for session ${sessionId}`);
 
-      // Mid-turn steers written to stdin are not on steerQueues. If the model
-      // end_turn'd without any tool_use after those steers, they were ignored —
-      // put them on the queue so the drain below starts a follow-up turn.
-      const midTurnDelivered = sessionMidTurnSteers.get(sessionId);
-      sessionMidTurnSteers.delete(sessionId);
-      if (midTurnDelivered && midTurnDelivered.length > 0) {
-        const orphans = midTurnDelivered.filter((s) => !s.toolUseAfter).map((s) => s.text);
-        if (orphans.length > 0) {
-          if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
-          const q = steerQueues.get(sessionId)!;
-          for (const t of orphans) {
-            q.push(t);
-            logger.info(
-              `Mid-turn steer ignored by end_turn (no tool_use after) — re-queueing for follow-up ` +
-                `session=${sessionId}: ${t.length} chars`,
-            );
-          }
-        } else {
-          // Model acted on the steers; drop the echo-skip markers too.
-          steerAlreadyEchoed.delete(sessionId);
-        }
-      }
-
       // Drain any steers queued during this turn (see drainSteerQueue).
       // Non-blocking: the drain's follow-up turns (continueSessionStreaming)
       // run in the background so executePrompt can return its JSON-RPC
-      // response immediately. Without this, a mid-turn steer (absorbed via
-      // writeSteerToMainTurn) keeps executePrompt alive through the drain's
-      // LLM turns — the session/prompt response is never sent, vscode-acp's
-      // connection.prompt() never resolves, and the Stop button never
-      // switches to Send. The drain's turns still stream to the client; a
-      // new session/prompt chains on sessionPromptLocks and waits for the
-      // drain's turn to finish before starting.
+      // response immediately. Without this, a queued steer keeps executePrompt
+      // alive through the drain's LLM turns — the session/prompt response is
+      // never sent, vscode-acp's connection.prompt() never resolves, and the
+      // Stop button never switches to Send. The drain's turns still stream to
+      // the client; a new session/prompt chains on sessionPromptLocks and
+      // waits for the drain's turn to finish before starting.
       const drainPromise = drainSteerQueue().catch((e) => {
         logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
       });
@@ -6057,10 +5963,8 @@ const drainSteerQueue = async (): Promise<void> => {
         );
         pendingSteers.length = 0;
       }
-      // Mid-turn stdin steers were already echoed; drop the orphan-tracking so
-      // a cancelled turn does not start a follow-up for them after settle.
-      sessionMidTurnSteers.delete(params.sessionId);
-      steerAlreadyEchoed.delete(params.sessionId);
+      // Cancel: discard undelivered steers (already handled above) so a
+      // cancelled turn does not start a follow-up for them after settle.
       runner.cancel(params.sessionId);
     },
 

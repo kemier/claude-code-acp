@@ -1,6 +1,5 @@
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { writeFileSync, mkdtempSync, rmSync, existsSync } from "node:fs";
-import type { Writable } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type AgentConfig, loadConfig } from "./config.js";
@@ -206,16 +205,6 @@ export class ClaudeRunner {
    * SIGTERMed after the fact.
    */
   private cancelEscalationTimers = new Map<string, NodeJS.Timeout>();
-  /**
-   * Open stdins for in-flight main turns whose CLI was spawned with
-   * `--input-format stream-json` and whose stdin is deliberately left open
-   * (so a mid-turn steer can be written into the running process — the
-   * Claude CLI absorbs a second `user` line into the in-flight turn instead of
-   * queueing it as a follow-up). Keyed by trackingId (the ACP sessionId). The
-   * handle is removed when the process closes; `endOpenMainTurnStdin` closes
-   * it so the CLI sees EOF and exits cleanly after the turn's `result`.
-   */
-  private openMainTurnStdins = new Map<string, Writable>();
   private tempDirs: string[] = [];
   private config: AgentConfig;
   /**
@@ -759,27 +748,6 @@ export class ClaudeRunner {
     );
   }
 
-  /**
-   * Write a steer message into the session's running turn. Returns true if
-   * the message was written to a live process's stdin (the CLI absorbs it
-   * mid-turn), false if there is no active turn (caller should queue).
-   */
-  writeSteerToMainTurn(sessionId: string, text: string): boolean {
-    const live = this.liveSessions.get(sessionId);
-    if (!live || !live.turn) {
-      return false;
-    }
-    try {
-      live.proc.stdin!.write(this.userMessageLine([{ type: "text", text }]));
-      return true;
-    } catch (err) {
-      logger.warn(
-        `writeSteerToMainTurn(${sessionId}) failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      return false;
-    }
-  }
-
   private liveSpawnKey(modelOverride?: string, effortOverride?: string): string {
     const model = modelOverride || this.config.model || "";
     return `${model}\0${effortOverride ?? ""}\0${this.sessionPermissionMode ?? ""}`;
@@ -1201,14 +1169,10 @@ export class ClaudeRunner {
         this.runningProcesses.set(trackingId, proc);
       }
 
-      // Write the SDK user message as a single JSON line. Leave stdin OPEN
-      // (do not `.end()`) so a mid-turn steer can be written into the running
-      // process — the Claude CLI absorbs a second `user` line into the
-      // in-flight turn instead of queueing it as a follow-up. The CLI also
-      // treats a closed stdin as "no more input" and exits cleanly after the
-      // turn's `result`, but with stdin open it simply blocks on stdin until
-      // `close` (which fires on the turn's `result`) resolves the promise and
-      // the close handler ends the stdin.
+      // Write the SDK user message as a single JSON line, then end stdin on the
+      // turn's `result` (see below) so the CLI sees "no more input" and exits
+      // cleanly — otherwise the process blocks on stdin forever and the
+      // runner's promise never resolves.
       const message = JSON.stringify({
         type: "user",
         message: { role: "user", content },
@@ -1216,13 +1180,6 @@ export class ClaudeRunner {
         session_id: "",
       });
       proc.stdin!.write(message + "\n");
-
-      // Track the open stdin so handleSteer (agent.ts) can push mid-turn steer
-      // lines into it via writeSteerToMainTurn(). It is removed from the
-      // registry on `close` (see below).
-      if (trackingId) {
-        this.openMainTurnStdins.set(trackingId, proc.stdin!);
-      }
 
       let buffer = "";
       let resultText = "";
@@ -1282,10 +1239,6 @@ export class ClaudeRunner {
             clearTimeout(esc);
             this.cancelEscalationTimers.delete(trackingId);
           }
-          // Drop the open-stdin handle so a stale steer cannot write into a
-          // closed stream after the turn ends. The stream itself is closed by
-          // endOpenMainTurnStdin (or the process is gone, so it's moot).
-          this.openMainTurnStdins.delete(trackingId);
         }
         const wasCancelled = trackingId
           ? this.cancelledProcesses.delete(trackingId)
