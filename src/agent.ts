@@ -2068,8 +2068,8 @@ export function createClaudeCodeAgent(
   // the completion (a later tool_result reusing the same tool_use_id, or a
   // <task-notification> for it) and inject a synthetic user message with the
   // final output — mirroring the subagent <task-notification> auto-follow-up.
-  // Maps sessionId → (Claude tool_use_id → { acpCallId, command }).
-  const sessionBackgroundBash = new Map<string, Map<string, { acpCallId: string; command: string }>>();
+  // Maps sessionId → (Claude tool_use_id → { acpCallId, command, startedAt }).
+  const sessionBackgroundBash = new Map<string, Map<string, { acpCallId: string; command: string; startedAt: number }>>();
 
   // ─── Todo list (plan) tracking ───────────────────────────────────────────
   // Claude Code's TaskCreate/TaskUpdate/TaskList tools manage a todo list.
@@ -2495,11 +2495,37 @@ export function createClaudeCodeAgent(
     const { name, rest } = command;
 
     if (name === "ps") {
+      // List the session's background Bash commands (started with
+      // run_in_background:true). A command is "running" while its completion
+      // (a later tool_result reusing the tool_use_id / a <task-notification>)
+      // has NOT yet been detected — collectCompletedBackgroundBash removes it
+      // from sessionBackgroundBash when it finishes, so what remains here is
+      // the live set. Previously this was a hardcoded "No background terminals
+      // running." stub; now it reflects the real tracked background commands.
+      const bg = sessionBackgroundBash.get(sessionId);
+      let psText: string;
+      if (!bg || bg.size === 0) {
+        psText = "No background terminals running.";
+      } else {
+        const fmtElapsed = (ms: number): string => {
+          const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+          if (s < 60) return `${s}s`;
+          const m = Math.floor(s / 60);
+          if (m < 60) return `${m}m ${s % 60}s`;
+          const h = Math.floor(m / 60);
+          return `${h}h ${m % 60}m`;
+        };
+        psText =
+          `${bg.size} background command(s) running:\n` +
+          [...bg.values()]
+            .map((info) => `- [${fmtElapsed(info.startedAt)}] ${info.command}`)
+            .join("\n");
+      }
       await connection.sessionUpdate({
         sessionId,
         update: {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: "No background terminals running." },
+          content: { type: "text", text: psText },
           messageId: nextCommandMessageId(),
           // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
           // Without this marker a client cannot tell command output from the
@@ -4013,7 +4039,7 @@ export function createClaudeCodeAgent(
                bg = new Map();
                sessionBackgroundBash.set(sessionId, bg);
              }
-             bg.set(event.toolUseId, { acpCallId: toolCallId, command: cmd });
+             bg.set(event.toolUseId, { acpCallId: toolCallId, command: cmd, startedAt: Date.now() });
              const pend = backgroundBashPendingForTurn.get(sessionId);
              if (pend) {
                pend.push(cmd);
