@@ -4999,6 +4999,17 @@ const drainSteerQueue = async (): Promise<void> => {
            `Session ${sessionId} not found`
          );
        }
+     } else {
+       // The session was rehydrated from the on-disk store with the mcpServers
+       // captured at session/new. The client re-supplies the MCP servers it wants
+       // this agent to run — which may carry a freshly-resolved server path (e.g.
+       // a fixed jev-mcp path after a vscode-acp deploy). Without this, the stale
+       // persisted set wins and the corrected path is silently dropped for resumed
+       // sessions. The client is authoritative here; refresh the store + persist.
+       const incoming = normalizeMcpServers((params as any).mcpServers ?? []);
+       if (incoming.length > 0) {
+         store.setMcpServers(sessionId, incoming);
+       }
      }
 
      // If the sessionId being loaded is itself a Claude CLI transcript UUID

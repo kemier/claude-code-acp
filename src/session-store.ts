@@ -168,6 +168,27 @@ export class SessionStore {
     return this.sessions.get(sessionId)?.mcpServers ?? [];
   }
 
+  /**
+   * Replace a session's MCP server set and persist it.
+   *
+   * The store rehydrates sessions from disk (with the `mcpServers` captured at
+   * `session/new`) on agent restart. On `loadSession` the client re-supplies the
+   * MCP servers it wants the agent to run — which may carry a freshly-resolved
+   * server path (e.g. after a vscode-acp deploy that fixed the `jev-mcp` path
+   * resolution). When the session already exists in memory (the common case for a
+   * resumed session, because rehydration populated the map), the stale persisted
+   * set would otherwise win and the corrected path would be silently dropped.
+   * Calling this from `loadSession` makes the client's current value authoritative
+   * and refreshes the on-disk copy so future reloads start correct.
+   */
+  setMcpServers(sessionId: string, mcpServers: McpServerConfig[]): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    session.mcpServers = mcpServers;
+    session.updatedAt = new Date().toISOString();
+    this.persistSessions();
+  }
+
   getCwd(sessionId: string): string | undefined {
     return this.sessions.get(sessionId)?.cwd;
   }
