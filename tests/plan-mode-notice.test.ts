@@ -71,34 +71,6 @@ describe("collaboration mode change mid-turn", () => {
     expect(body).toContain("sessionPromptLocks.get(sessionId)");
     expect(body).toContain("promptGenCounter.get(sessionId)");
   });
-
-  it("the model-initiated EnterPlanMode handler interrupts a running full-access turn", () => {
-    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
-    const idx = src.indexOf('if (event.toolName === "EnterPlanMode") {');
-    expect(idx).toBeGreaterThan(0);
-    const body = src.slice(idx, idx + 2000);
-    // Only interrupt on a GENUINE entry (enterPlanMode returns false for a
-    // redundant re-call) and only while a turn is in flight.
-    expect(body).toContain("void enterPlanMode(sessionId, connection, store, runner).then((entered) => {");
-    expect(body).toContain("if (entered && (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))) {");
-    // Re-prompt with the Plan block (newModeIsPlan = true) so read-only applies
-    // NOW — the running turn was spawned with --dangerously-skip-permissions,
-    // which overrides the CLI's plan gate.
-    expect(body).toContain("void interruptForPlanMode(sessionId, true, repromptModel, repromptEffort);");
-  });
-
-  it("enterPlanMode reports whether a genuine flip into plan occurred", () => {
-    const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
-    const idx = src.indexOf("async function enterPlanMode(");
-    expect(idx).toBeGreaterThan(0);
-    const body = src.slice(idx, idx + 2200);
-    // Returns false for the redundant re-call (already in plan)…
-    expect(body).toContain("return false;");
-    // …and true after a genuine flip, so the caller can gate the interrupt.
-    expect(body).toContain("return true;");
-    // Declared to return a boolean, not void.
-    expect(body).toContain("Promise<boolean>");
-  });
 });
 
 /**

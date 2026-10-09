@@ -219,10 +219,12 @@ export class ClaudeRunner {
   private sessionPermissionMode: string | null = null;
 
   /**
-   * Set the permission mode for the next spawn. Called by the agent from
-   * enterPlanMode (→ "read-only") and leavePlanMode (→ "agent"). Because the
-   * CLI is spawned per-prompt (--resume <id>), each turn's spawn picks up the
-   * current mode without restarting the session or losing conversation history.
+   * Set the permission mode for the next spawn. Called by the agent from the
+   * mode pickers (setSessionMode / setSessionConfigOption → applyModeChange) —
+   * "read-only" for Plan mode, "agent"/"agent-full-access" otherwise. Because
+   * the CLI is spawned per-prompt (--resume <id>), each turn's spawn picks up
+   * the current mode without restarting the session or losing conversation
+   * history.
    */
   setSessionPermissionMode(mode: string | null): void {
     this.sessionPermissionMode = mode;

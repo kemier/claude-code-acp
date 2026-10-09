@@ -162,112 +162,6 @@ const PLAN_COLLABORATION_MODE = "plan";
 const sessionCollaborationModes = new Map<string, string>();
 
 /**
- * Leave Plan mode for `sessionId` and tell the client.
- *
- * Claude Code signals plan completion with its ExitPlanMode tool. `setSessionMode`
- * echoes client-initiated switches, so this is the only agent-initiated path.
- *
- * Two independent pickers must both flip back:
- *   - permission mode (store.mode, "agent"/"read-only") via current_mode_update
- *   - collaboration mode (sessionCollaborationModes) via config_option_update
- *
- * `enterPlanMode` sets the permission mode to "read-only" when the model
- * self-enters plan mode, so leaving must restore it to "agent" (full access) —
- * otherwise the permission picker stays stuck on "Read-only" after the plan is
- * approved and the model starts implementing.
- */
-async function leavePlanMode(
-  sessionId: string,
-  connection: { sessionUpdate: (p: any) => Promise<unknown> },
-  store: SessionStore,
-  runner?: { setSessionPermissionMode: (m: string | null) => void },
-): Promise<void> {
-  if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) !== PLAN_COLLABORATION_MODE) {
-    return;
-  }
-  sessionCollaborationModes.set(sessionId, DEFAULT_COLLABORATION_MODE);
-  // Plan mode is read-only by design; restoring full access so the model can
-  // implement the approved plan. Both the stored mode (persists across
-  // restarts, drives the picker) and the runner's spawn flag (drives the
-  // --permission-mode the next claude -p process receives) are updated.
-  store.setMode(sessionId, DEFAULT_MODE);
-  runner?.setSessionPermissionMode(DEFAULT_MODE);
-  logger.info(`Session ${sessionId} left plan mode (ExitPlanMode)`);
-  try {
-    await connection.sessionUpdate({
-      sessionId,
-      update: { sessionUpdate: "current_mode_update", currentModeId: DEFAULT_MODE } as any,
-    });
-    await connection.sessionUpdate({
-      sessionId,
-      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
-    });
-  } catch {
-    /* non-fatal — the next turn still runs without the plan-mode preamble */
-  }
-}
-
-/**
- * Enter Plan mode for `sessionId` and tell the client.
- *
- * Mirror of {@link leavePlanMode}. The Claude CLI exposes a native EnterPlanMode
- * tool the model calls when it decides a task needs planning before acting
- * (mirrors ericli's auto enter_plan_mode). Without mapping it the picker kept
- * reading "Default" while the model was actually planning — the user had no way
- * to see that plan mode was active until they flipped the picker themselves.
- *
- * Two independent pickers must both flip to "plan":
- *   - permission mode → "read-only" (current_mode_update with a valid
- *     AVAILABLE_MODES id + store.setMode so it persists and buildConfigOptions
- *     reflects it)
- *   - collaboration mode → "plan" (config_option_update "collaboration_mode")
- *
- * The old code sent currentModeId: "plan" here, but "plan" is not an id in
- * AVAILABLE_MODES (which is read-only/agent/agent-full-access), so vscode-acp's
- * availableModes.find() missed and the permission picker silently stayed on the
- * previous mode. Sending "read-only" is the valid id that makes the picker
- * flip to "Read-only" in lockstep with the collaboration picker flipping to
- * "Plan".
- */
-async function enterPlanMode(
-  sessionId: string,
-  connection: { sessionUpdate: (p: any) => Promise<unknown> },
-  store: SessionStore,
-  runner?: { setSessionPermissionMode: (m: string | null) => void },
-): Promise<boolean> {
-  if ((sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) === PLAN_COLLABORATION_MODE) {
-    // Already in plan mode — the model re-called EnterPlanMode (e.g. after a
-    // sub-turn). Nothing to do; re-emitting would be a redundant picker update.
-    // Return false so the caller does NOT re-interrupt a turn that is already
-    // running under Plan.
-    return false;
-  }
-  sessionCollaborationModes.set(sessionId, PLAN_COLLABORATION_MODE);
-  // Plan mode is read-only: the model investigates and presents a plan but does
-  // not edit files or run commands. Switching the permission mode to "read-only"
-  // makes the IDE's permission picker reflect that (agent → read-only) AND sets
-  // the runner's spawn flag so the next claude -p process is launched with
-  // --permission-mode plan — the CLI then hard-blocks mutating tools at its own
-  // layer, not just via the <collaboration_mode> prompt block.
-  store.setMode(sessionId, "read-only");
-  runner?.setSessionPermissionMode("read-only");
-  logger.info(`Session ${sessionId} entered plan mode (EnterPlanMode)`);
-  try {
-    await connection.sessionUpdate({
-      sessionId,
-      update: { sessionUpdate: "current_mode_update", currentModeId: "read-only" } as any,
-    });
-    await connection.sessionUpdate({
-      sessionId,
-      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
-    });
-  } catch {
-    /* non-fatal — the next turn still injects the plan-mode preamble */
-  }
-  return true;
-}
-
-/**
  * Apply a user-initiated permission-mode change (the Mode picker) and tell the
  * client, keeping every surface consistent:
  *
@@ -280,11 +174,9 @@ async function enterPlanMode(
  *   - current_mode_update   → legacy `modes` display + permission picker label
  *   - config_option_update  → fresh configOptions so the config pickers re-render
  *
- * The model-initiated path (EnterPlanMode/ExitPlanMode) routes through
- * enterPlanMode/leavePlanMode, which do the same state writes with their own
- * no-op guards; this is the USER-initiated path that was previously missing the
- * runner sync and the current_mode_update — the reason flipping the Mode picker
- * to "Read-only" appeared to do nothing.
+ * This is the single funnel for plan-mode changes: the CLI's native
+ * EnterPlanMode/ExitPlanMode tools never fire under headless `claude -p`, so the
+ * picker is the only driver and it always routes here.
  */
 async function applyModeChange(
   sessionId: string,
@@ -3198,13 +3090,12 @@ export function createClaudeCodeAgent(
 
   /**
    * Interrupt a running turn and re-prompt with the fresh <collaboration_mode>
-   * block. Shared by the two mid-turn plan-mode flip paths so their behavior
-   * can never drift apart:
+   * block. Used by the mid-turn plan-mode flip when the USER flips the
+   * collaboration picker (setSessionConfigOption, configId "collaboration_mode"):
+   * a deliberate mode change mid-turn.
    *
-   *   - the USER flipping the collaboration picker (setSessionConfigOption,
-   *     configId "collaboration_mode") — a deliberate mode change mid-turn;
-   *   - the MODEL calling EnterPlanMode (tool_use event) — a self-initiated
-   *     entry into Plan mode mid-turn.
+   * (The CLI's native EnterPlanMode/ExitPlanMode tools never fire under headless
+   * `claude -p`, so there is no model-initiated flip path to share this with.)
    *
    * Why an interrupt is required at all: the Claude CLI is spawned PER PROMPT
    * (`claude -p --resume <id>`), and the per-turn spawn flags are fixed at spawn
@@ -3889,53 +3780,11 @@ export function createClaudeCodeAgent(
        // is a full snapshot, so the count reflects the live list size
        // rather than a running total of updates.
        handleTaskTool(sessionId, event.toolName, event.toolInput);
-       // Claude Code owns a native ExitPlanMode tool: the model calls it once
-       // the plan is ready and expects the host to leave Plan mode. Without
-       // mapping it the session stayed in Plan forever — the picker still read
-       // "Plan", the injected <collaboration_mode> block kept telling the model
-       // that an execution request is a request to PLAN the execution, and a
-       // follow-up "implement it" came back as code in the chat instead of
-       // edits. Clear the flag and tell the client so the picker follows.
-       if (event.toolName === "ExitPlanMode") {
-         void leavePlanMode(sessionId, connection, store, runner);
-       }
-       // The symmetric enter path: the model calls EnterPlanMode when it decides
-       // a task needs planning before acting. Map it so the picker flips to
-       // "Plan" live (current_mode_update) and the next prompt injects the
-       // read-only <collaboration_mode> Plan block. Without this the picker
-       // only showed "Plan" on a user-initiated switch, so a self-entered plan
-       // was invisible until the user manually flipped the mode.
-       //
-       // ROOT CAUSE FIX (plan-mode enforcement lag): EnterPlanMode fires MID-TURN,
-       // but the running claude -p process was spawned at turn start in Default
-       // mode with --dangerously-skip-permissions, which OVERRIDES the CLI's
-       // --permission-mode plan read-only gate (verified empirically). Updating
-       // the picker state alone therefore does NOT stop the model editing for
-       // the rest of the turn — the in-flight process keeps its old spawn flags.
-       // So we interrupt the running turn and re-prompt with the Plan
-       // <collaboration_mode> block, exactly like the user-initiated picker
-       // flip. enterPlanMode still does the picker/state writes; the interrupt
-       // enforces it on the live process. We are already inside executePrompt's
-       // onEvent (a turn in flight), so interruptForPlanMode chains the re-prompt
-       // on the per-session lock after the cancelled turn settles — fire-and-forget
-       // (no await: we're mid-stream and must keep the turn's event flow going).
-       if (event.toolName === "EnterPlanMode") {
-         void enterPlanMode(sessionId, connection, store, runner).then((entered) => {
-           // Only interrupt on a GENUINE entry into plan (enterPlanMode returns
-           // false for a redundant re-call when already in plan). newModeIsPlan
-           // = true: the re-prompted turn runs under Plan (read-only).
-           if (entered && (runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId))) {
-             const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-             const repromptEffort = resolveEffort(store, sessionId);
-             logger.info(
-               `Session ${sessionId} model called EnterPlanMode mid-turn — cancelling ` +
-                 `the running (full-access) turn and re-prompting with the Plan ` +
-                 `<collaboration_mode> block so read-only takes effect NOW.`,
-             );
-             void interruptForPlanMode(sessionId, true, repromptModel, repromptEffort);
-           }
-         });
-       }
+       // NOTE: the CLI's native EnterPlanMode/ExitPlanMode tools are
+       // interactive-TUI-only — they never fire under headless `claude -p`, so
+       // there is no tool_use event to relay here. Plan mode is driven solely by
+       // the user floating the picker (setSessionMode/setSessionConfigOption →
+       // applyModeChange).
        // Build a descriptive title + kind + (for edits) diff content +
        // locations, mirroring codex-acp, so the chat UI shows the action
        // verb and a click-to-open diff instead of a bare filename.
@@ -5788,8 +5637,7 @@ const drainSteerQueue = async (): Promise<void> => {
               `with a turn in flight — cancelling and re-prompting with the fresh ` +
               `${newModeIsPlan ? "Plan" : "Default"} <collaboration_mode> block.`,
           );
-          // SIGINT the running turn and re-prompt with the fresh block (shared
-          // core with the model-initiated EnterPlanMode path).
+          // SIGINT the running turn and re-prompt with the fresh block.
           //
           // Wait for the re-prompt to actually START the LLM turn (not just be
           // enqueued) before returning, so the client's config_option_update
@@ -5844,12 +5692,10 @@ const drainSteerQueue = async (): Promise<void> => {
       }
 
       // Sync the runner's permission mode from the stored session mode BEFORE
-      // any spawn in this prompt. enterPlanMode/leavePlanMode set it during the
-      // previous turn's tool events, but a user-initiated picker switch
-      // (setSessionMode / setSessionConfigOption) only writes store.mode — it
-      // does NOT touch the runner. Without this sync, a manual "Read-only"
-      // picker flip would not propagate to the next claude -p spawn (the CLI
-      // would still run with the previous turn's --permission-mode).
+      // any spawn in this prompt. A user-initiated picker switch
+      // (setSessionMode / setSessionConfigOption) writes both store.mode and
+      // the runner, but this sync is the backstop that guarantees the next
+      // claude -p spawn gets the stored --permission-mode.
       runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE);
 
       // Extract text from content blocks
