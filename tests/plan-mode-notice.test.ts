@@ -122,7 +122,7 @@ describe("steer echo timing", () => {
   const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
 
   it("receipt acks with user_message_accepted, NOT a delivered user_message_chunk", () => {
-    const at = src.indexOf("steerQueues.get(sessionId)!.push(text);");
+    const at = src.indexOf("steerQueues.get(sessionId)!.push({ text, images: steerImages });");
     expect(at).toBeGreaterThan(0);
     const handlerTail = src.slice(at, at + 1400);
     // Stage-1 visual ack IS emitted on receipt…

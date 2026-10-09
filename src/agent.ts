@@ -1928,7 +1928,15 @@ export function createClaudeCodeAgent(
   const store = new SessionStore();
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
-  const steerQueues = new Map<string, string[]>();
+  // A queued steer carries its text PLUS any image content blocks the client
+  // attached (session/steer now carries `images` ACP blocks). Images are
+  // converted to stream-json stdin blocks up front so drainSteerQueue can send
+  // them via continueSessionStreamingWithContent (mirroring the main turn).
+  type SteerItem = {
+    text: string;
+    images: import("./claude-runner.js").StdinContentBlock[];
+  };
+  const steerQueues = new Map<string, SteerItem[]>();
   // Per-session prompt serialization + cancel scoping.
   //
   // The bug: cancel() latches cancelledSessions for the in-flight prompt, but
@@ -2305,7 +2313,7 @@ export function createClaudeCodeAgent(
    *
    * Custom ACP extension: `session/steer`.
    */
-  async function handleSteer(params: { sessionId: string; text: string }): Promise<void> {
+  async function handleSteer(params: { sessionId: string; text: string; images?: ReadonlyArray<{ type: string; data?: unknown; mimeType?: string | null }> }): Promise<void> {
     const { sessionId, text } = params;
     if (!store.has(sessionId)) {
       logger.warn(`Steer request for unknown session ${sessionId}`);
@@ -2340,8 +2348,14 @@ export function createClaudeCodeAgent(
     if (!steerQueues.has(sessionId)) {
       steerQueues.set(sessionId, []);
     }
-    steerQueues.get(sessionId)!.push(text);
-    logger.info(`Steer queued for session ${sessionId}: ${text.length} chars`);
+    // Convert the ACP image blocks to stream-json stdin blocks now (same
+    // helper the main prompt path uses). Best-effort: blocks with empty data
+    // are skipped, matching acpImageBlocksToStdinBlocks.
+    const steerImages = params.images
+      ? acpImageBlocksToStdinBlocks(params.images)
+      : [];
+    steerQueues.get(sessionId)!.push({ text, images: steerImages });
+    logger.info(`Steer queued for session ${sessionId}: ${text.length} chars${steerImages.length ? ` (+${steerImages.length} image(s))` : ""}`);
     // Stage 1 of the two-stage steer receipt (mirrors ericli's Option A):
     // emit a DISTINCT `user_message_accepted` notification so vscode-acp can
     // show the user's mid-turn bubble immediately (inserted before the running
@@ -2397,7 +2411,7 @@ export function createClaudeCodeAgent(
       logger.info(`Steer-remove for session ${sessionId}: no queued steer to retract (queueLen=${queue?.length ?? 0})`);
       return;
     }
-    const idx = queue.findIndex((q) => collapseSteerText(q) === target);
+    const idx = queue.findIndex((q) => collapseSteerText(q.text) === target);
     if (idx === -1) {
       logger.info(`Steer-remove for session ${sessionId}: no matching queued steer (already delivered or never queued)`);
       return;
@@ -4245,7 +4259,9 @@ const drainSteerQueue = async (): Promise<void> => {
   let deliveredAny = false;
   try {
     while (queue.length > 0) {
-      const steerText = queue.shift()!;
+      const steerItem = queue.shift()!;
+      const steerText = steerItem.text;
+      const steerImages = steerItem.images;
       // Cancellation discards the rest — the user asked to stop.
       if (cancelledSessions.has(sessionId)) {
         queue.length = 0;
@@ -4255,7 +4271,7 @@ const drainSteerQueue = async (): Promise<void> => {
       // No Claude session to resume into (e.g. straight after /clear). Put it
       // back so a later drain delivers it once a session exists again.
       if (!claudeSid) {
-        queue.unshift(steerText);
+        queue.unshift(steerItem);
         break;
       }
       deliveredAny = true;
@@ -4315,7 +4331,7 @@ const drainSteerQueue = async (): Promise<void> => {
             `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
           );
           // Put it back at the front so it drains once the subagent resolves.
-          queue.unshift(steerText);
+          queue.unshift(steerItem);
           break;
         }
 
@@ -4325,17 +4341,59 @@ const drainSteerQueue = async (): Promise<void> => {
           : steerText;
         // Frame as a follow-up so the model treats this as a new user
         // instruction rather than a description of interrupted state.
-        const steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
+        let steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
         ctxEstimator.addText(steerPrompt);
-        await runner.continueSessionStreaming(
+
+        // Image-bearing steers: deliver via the stream-json content path
+        // (mirrors the main turn's turnContent) so the model actually receives
+        // the pictures. On a text-only serving model, degrade the images to a
+        // temp-file note and fall back to the argv text path (same graceful
+        // degradation the main prompt applies — the upstream would reject
+        // image blocks a non-multimodal backend can't parse).
+        let outImages: import("./claude-runner.js").StdinContentBlock[] = steerImages;
+        if (outImages.length > 0) {
+          const steerModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+          if (!modelSupportsVision(steerModel)) {
+            logger.info(
+              `Steer drain on text-only model (${steerModel || "unknown"}): degrading ${outImages.length} image(s) to text notes`,
+            );
+            const { note, tempPaths } = degradeImageBlocksForTextOnlyModel(
+              outImages.filter((b): b is { type: "image"; source: { media_type: string; data: string } } => b.type === "image"),
+              sessionId,
+            );
+            if (tempPaths.length > 0) {
+              logger.info(`Steer drain persisted attached images to temp files: ${tempPaths.join(", ")}`);
+            }
+            steerPrompt = steerPrompt + "\n" + note;
+            outImages = [];
+          }
+        }
+
+        if (outImages.length > 0) {
+          const steerContent: import("./claude-runner.js").StdinContentBlock[] = [
+            { type: "text", text: steerPrompt },
+            ...outImages,
+          ];
+          await runner.continueSessionStreamingWithContent(
+            claudeSid,
+            steerContent,
+            onEvent,
+            sessionId,
+            runModel,
+            runEffort,
+            store.getMcpServers(sessionId)
+          );
+        } else {
+          await runner.continueSessionStreaming(
             claudeSid,
             steerPrompt,
             onEvent,
             sessionId,
-             runModel,
-              runEffort,
-              store.getMcpServers(sessionId)
-            );
+            runModel,
+            runEffort,
+            store.getMcpServers(sessionId)
+          );
+        }
             await Promise.all(permissionPromises);
           } catch (steerErr) {
             logger.error(`Steer drain failed for session ${sessionId}: ${steerErr instanceof Error ? steerErr.message : String(steerErr)}`);
@@ -4659,7 +4717,7 @@ const drainSteerQueue = async (): Promise<void> => {
             // No Claude session to resume into (e.g. straight after /clear).
             // Queue it so a later drain delivers it once a session exists.
             if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
-            steerQueues.get(sessionId)!.push(followUpText);
+            steerQueues.get(sessionId)!.push({ text: followUpText, images: [] });
             logger.info(
               `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued (no active session yet) for session ${sessionId}.`,
             );
@@ -4744,7 +4802,7 @@ const drainSteerQueue = async (): Promise<void> => {
               }
             } else {
               if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
-              steerQueues.get(sessionId)!.push(followUpText);
+              steerQueues.get(sessionId)!.push({ text: followUpText, images: [] });
               logger.info(
                 `Background Bash completion ${count + 1}/${AUTO_FOLLOW_UP_CAP} queued ` +
                   `(no active session yet) for session ${sessionId}.`,
@@ -5975,7 +6033,7 @@ const drainSteerQueue = async (): Promise<void> => {
      */
     async extNotification(method: string, params: Record<string, unknown>): Promise<void> {
       if (method === "session/steer") {
-        return handleSteer(params as { sessionId: string; text: string });
+        return handleSteer(params as { sessionId: string; text: string; images?: ReadonlyArray<{ type: string; data?: unknown; mimeType?: string | null }> });
       }
       if (method === "session/steer-remove") {
         return handleSteerRemove(params as { sessionId: string; text: string });
