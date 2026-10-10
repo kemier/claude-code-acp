@@ -625,12 +625,25 @@ export class ClaudeRunner {
     this.tempDirs = [];
   }
 
+  /**
+   * Per-selection overrides from acpEndpoints (BASE_URL / MODEL / llama URL).
+   * Applied on top of process.env for every Claude CLI spawn. Cleared by
+   * passing `{}` when the picker value is not an endpoint id.
+   */
+  private endpointEnv: Record<string, string> = {};
+
+  setEndpointEnv(env: Record<string, string>): void {
+    this.endpointEnv = { ...env };
+  }
+
   private sanitizeEnv(): NodeJS.ProcessEnv {
     // Keep ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN so claude CLI
     // routes through our CCR gateway → ericai-proxy → EricAI vLLM.
     // The original code deleted these to force subscription auth, but
     // in our setup we use API key auth via the proxy chain.
-    const env = { ...process.env };
+    // endpointEnv (selected Strata host) overlays process.env so the
+    // dual-boot Windows/Ubuntu picker can switch ANTHROPIC_BASE_URL per turn.
+    const env = { ...process.env, ...this.endpointEnv };
     // Never leak the parent Claude Code session into the spawned CLI: claude
     // refuses to run nested when CLAUDECODE is set ("Claude Code cannot be
     // launched inside another Claude Code session", exit code 1). This hits
@@ -645,9 +658,10 @@ export class ClaudeRunner {
     // and the rest of the conversation is prefilled from scratch. Disable
     // the snapshot for local backends; the agent can still run `git status`
     // via Bash. User-set CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS wins.
+    // Include private LAN hosts (192.168.x / 10.x) used by dual-boot Strata.
     const local =
       Boolean(env.CLAUDE_LLAMA_SERVER_URL) ||
-      /127\.0\.0\.1|localhost/i.test(env.ANTHROPIC_BASE_URL || "");
+      /127\.0\.0\.1|localhost|192\.168\.|10\.\d/i.test(env.ANTHROPIC_BASE_URL || "");
     if (local && env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS === undefined) {
       env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
     }
@@ -752,7 +766,9 @@ export class ClaudeRunner {
 
   private liveSpawnKey(modelOverride?: string, effortOverride?: string): string {
     const model = modelOverride || this.config.model || "";
-    return `${model}\0${effortOverride ?? ""}\0${this.sessionPermissionMode ?? ""}`;
+    // Include BASE_URL so switching Windows↔Ubuntu Strata drops the live CLI.
+    const base = this.endpointEnv.ANTHROPIC_BASE_URL || "";
+    return `${model}\0${effortOverride ?? ""}\0${this.sessionPermissionMode ?? ""}\0${base}`;
   }
 
   private canReuseLive(

@@ -16,12 +16,17 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  getAcpEndpoints,
   getAvailableModelsFromSettings,
   getClaudeEnv,
   getDefaultEffortFromSettings,
+  getDefaultEndpointId,
   getDefaultModelFromSettings,
+  buildEndpointSpawnEnv,
+  findAcpEndpoint,
   loadClaudeSettingsEnv,
   clearClaudeSettingsCache,
+  resolveBackendModel,
   resolveModelAlias,
   MODEL_ENV_KEYS,
   AVAILABLE_MODELS_ENV_KEY,
@@ -232,6 +237,67 @@ describe("model picker from settings", () => {
     writeProjectSettings("settings.json", { env: {} });
     expect(() => getDefaultModelFromSettings()).toThrow(/No model configured/);
     expect(() => getAvailableModelsFromSettings()).toThrow(/No models configured/);
+  });
+
+  it("parses acpEndpoints and resolves picker values to backend models", () => {
+    const savedBase = process.env.ANTHROPIC_BASE_URL;
+    delete process.env.ANTHROPIC_BASE_URL;
+    try {
+      writeProjectSettings("settings.json", {
+        env: { ANTHROPIC_AUTH_TOKEN: "tok" },
+        acpEndpoints: [
+          {
+            id: "strata-windows",
+            name: "qwen (Windows)",
+            model: "qwen3.8-flash-next-coder-iq1_m",
+            baseUrl: "http://192.168.124.20:8080/",
+          },
+          {
+            id: "strata-ubuntu",
+            name: "qwen (Ubuntu)",
+            model: "qwen3.8-flash-next-coder-iq1_m",
+            baseUrl: "http://192.168.124.14:8080",
+          },
+        ],
+      });
+      const eps = getAcpEndpoints();
+      expect(eps.map((e) => e.id)).toEqual(["strata-windows", "strata-ubuntu"]);
+      expect(eps[0].baseUrl).toBe("http://192.168.124.20:8080");
+      expect(findAcpEndpoint("strata-ubuntu")?.name).toBe("qwen (Ubuntu)");
+      expect(resolveBackendModel("strata-windows")).toBe("qwen3.8-flash-next-coder-iq1_m");
+      expect(resolveBackendModel("plain-model")).toBe("plain-model");
+      expect(getDefaultModelFromSettings()).toBe("qwen3.8-flash-next-coder-iq1_m");
+      expect(getDefaultEndpointId()).toBe("strata-windows");
+      expect(buildEndpointSpawnEnv("strata-ubuntu")).toEqual({
+        ANTHROPIC_BASE_URL: "http://192.168.124.14:8080",
+        ANTHROPIC_MODEL: "qwen3.8-flash-next-coder-iq1_m",
+      });
+      expect(buildEndpointSpawnEnv("not-an-endpoint")).toBeNull();
+    } finally {
+      if (savedBase === undefined) delete process.env.ANTHROPIC_BASE_URL;
+      else process.env.ANTHROPIC_BASE_URL = savedBase;
+    }
+  });
+
+  it("prefers acpEndpoint matching leftover ANTHROPIC_BASE_URL as default", () => {
+    writeProjectSettings("settings.json", {
+      env: { ANTHROPIC_BASE_URL: "http://192.168.124.14:8080" },
+      acpEndpoints: [
+        {
+          id: "strata-windows",
+          name: "Win",
+          model: "m",
+          baseUrl: "http://192.168.124.20:8080",
+        },
+        {
+          id: "strata-ubuntu",
+          name: "Ubu",
+          model: "m",
+          baseUrl: "http://192.168.124.14:8080",
+        },
+      ],
+    });
+    expect(getDefaultEndpointId()).toBe("strata-ubuntu");
   });
 
   it("reads settings.json that starts with a UTF-8 BOM", () => {

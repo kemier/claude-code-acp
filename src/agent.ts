@@ -32,11 +32,17 @@ import { ClaudeRunner, isProxyBaseUrl, type StreamEvent, type McpServerConfig } 
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
 import {
+  buildEndpointSpawnEnv,
+  findAcpEndpoint,
+  getAcpEndpoints,
   getAvailableModelsFromSettings,
   getClaudeEnv,
   getDefaultEffortFromSettings,
+  getDefaultEndpointId,
   getDefaultModelFromSettings,
+  resolveBackendModel,
 } from "./claude-settings.js";
+import { filterHealthyEndpoints } from "./endpoint-health.js";
 import {
   validateCwd,
   validateMcpCommand,
@@ -200,7 +206,10 @@ async function applyModeChange(
     });
     await connection.sessionUpdate({
       sessionId,
-      update: { sessionUpdate: "config_option_update", configOptions: buildConfigOptions(store, sessionId) } as any,
+      update: {
+        sessionUpdate: "config_option_update",
+        configOptions: await buildConfigOptions(store, sessionId),
+      } as any,
     });
   } catch {
     /* non-fatal — the next turn still syncs the runner from store.getMode() */
@@ -399,15 +408,58 @@ function getDefaultEffort(modelId: string): string | undefined {
   return efforts.includes("high") ? "high" : efforts[0];
 }
 
-/** Session model override, else the model configured in Claude settings. */
-function resolveSessionModel(
+/**
+ * Picker value for the session (endpoint id or plain model id).
+ * Prefer the stored override, else the default endpoint id, else the
+ * settings default model.
+ */
+function resolveSessionPickerValue(
   store: SessionStore,
   sessionId: string,
   modelOverride?: string,
 ): string {
   const override =
     modelOverride ?? (store.getConfigOverrides(sessionId)["model"] as string | undefined);
-  return override || getDefaultModelFromSettings();
+  if (override) return override;
+  return getDefaultEndpointId() || getDefaultModelFromSettings();
+}
+
+/**
+ * Backend model id for spawn / effort / context. Endpoint picker values
+ * resolve to their configured `model`; plain ids pass through.
+ */
+function resolveSessionModel(
+  store: SessionStore,
+  sessionId: string,
+  modelOverride?: string,
+): string {
+  return resolveBackendModel(resolveSessionPickerValue(store, sessionId, modelOverride));
+}
+
+let warnedStaticBaseUrl = false;
+
+/** Apply selected acpEndpoint's BASE_URL / MODEL onto the ClaudeRunner spawn env. */
+function applyEndpointEnvToRunner(
+  runner: { setEndpointEnv?: (env: Record<string, string>) => void },
+  store: SessionStore,
+  sessionId: string,
+  modelOverride?: string,
+): void {
+  if (typeof runner.setEndpointEnv !== "function") return;
+  const picker = resolveSessionPickerValue(store, sessionId, modelOverride);
+  const env = buildEndpointSpawnEnv(picker);
+  runner.setEndpointEnv(env ?? {});
+  if (env && getClaudeEnv("ANTHROPIC_BASE_URL") && !warnedStaticBaseUrl) {
+    // Claude Code applies settings.env over inherited process env. A static
+    // ANTHROPIC_BASE_URL in ~/.claude/settings.json would ignore the selected
+    // endpoint — warn once so the dual-boot switch is not silent.
+    warnedStaticBaseUrl = true;
+    logger.warn(
+      `acpEndpoints: settings.env still sets ANTHROPIC_BASE_URL=` +
+        `${getClaudeEnv("ANTHROPIC_BASE_URL")}; remove it so the picker can ` +
+        `switch hosts (selected ${picker} → ${env.ANTHROPIC_BASE_URL})`,
+    );
+  }
 }
 
 // Watchdog timers for web tools that can never return on the current route:
@@ -631,8 +683,24 @@ export function degradeImageBlocksForTextOnlyModel(
   return { note: notes.join("\n"), tempPaths };
 }
 
-function getPickerModelList(): Array<{ id: string; name: string }> {
-  return getAvailableModelsFromSettings();
+/**
+ * Models advertised in the ACP picker. When `acpEndpoints` is configured,
+ * only healthy labeled endpoints are shown (dual-boot Windows/Ubuntu Strata).
+ * Falls back to the static settings list when no endpoint is healthy.
+ */
+async function getPickerModelList(): Promise<Array<{ id: string; name: string }>> {
+  const endpoints = getAcpEndpoints();
+  if (endpoints.length === 0) {
+    return getAvailableModelsFromSettings();
+  }
+  const healthy = await filterHealthyEndpoints(endpoints);
+  if (healthy.length === 0) {
+    logger.warn(
+      "acpEndpoints: no healthy backends; falling back to CLAUDE_ACP_AVAILABLE_MODELS / ANTHROPIC_MODEL",
+    );
+    return getAvailableModelsFromSettings();
+  }
+  return healthy.map((e) => ({ id: e.id, name: e.name }));
 }
 
 /**
@@ -1710,30 +1778,34 @@ function buildReviewTurnPrompt(diffCommand: string, scope: string): string {
   ].join("\n");
 }
 
-function buildConfigOptions(store: SessionStore, sessionId: string) {
-  // Dynamic proxy-filtered list when enabled, else the static settings list.
-  const availableModels = getPickerModelList();
+async function buildConfigOptions(store: SessionStore, sessionId: string) {
+  const availableModels = await getPickerModelList();
   const modelOverride = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-  let currentModel = modelOverride || getDefaultModelFromSettings();
-  // Picker options come strictly from settings/env. If the resolved default is
-  // not in that list (e.g. settings.model vs CLAUDE_ACP_AVAILABLE_MODELS),
-  // snap to the first available model. Session overrides outside the list stay
-  // visible so a just-selected value is not dropped before settings update.
-  if (!availableModels.some((m) => m.id === currentModel)) {
+  let currentPicker =
+    modelOverride || getDefaultEndpointId() || getDefaultModelFromSettings();
+  // Picker options come from healthy acpEndpoints (or settings). If the
+  // resolved default is not in that list, snap to the first available entry.
+  // A just-selected override that is temporarily unhealthy (or a plain model
+  // id outside the endpoint list) stays visible so the UI does not drop it.
+  if (!availableModels.some((m) => m.id === currentPicker)) {
     if (modelOverride) {
-      availableModels.unshift({ id: modelOverride, name: modelOverride });
+      const ep = findAcpEndpoint(modelOverride);
+      availableModels.unshift({
+        id: modelOverride,
+        name: ep?.name ?? modelOverride,
+      });
     } else {
-      currentModel = availableModels[0].id;
+      currentPicker = availableModels[0].id;
     }
   }
   const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
   const effortOverride = store.getConfigOverrides(sessionId)["effort"] as string | undefined;
   const currentCollabMode = sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE;
 
-  // Get effort levels supported by the CURRENT model
-  const modelEfforts = getEffortsForModel(currentModel);
-  // If the stored effort is not supported by this model, fall back to default
-  const defaultEffort = getDefaultEffort(currentModel);
+  // Effort levels follow the backend model id, not the endpoint label id.
+  const backendModel = resolveBackendModel(currentPicker);
+  const modelEfforts = getEffortsForModel(backendModel);
+  const defaultEffort = getDefaultEffort(backendModel);
   const currentEffort =
     effortOverride && modelEfforts.includes(effortOverride)
       ? effortOverride
@@ -1770,13 +1842,13 @@ function buildConfigOptions(store: SessionStore, sessionId: string) {
       name: "Model",
       type: "select" as const,
       category: "model",
-      description: "Model from Claude Code settings (~/.claude/settings.json)",
+      description: "Model / Strata host from Claude Code settings (~/.claude/settings.json)",
       options: availableModels.map((m) => ({
         value: m.id,
         name: m.name,
         description: m.id,
       })),
-      currentValue: currentModel,
+      currentValue: currentPicker,
     },
   ];
 
@@ -3277,6 +3349,7 @@ export function createClaudeCodeAgent(
     // prompt() used the default "high").
     const runModelResolved = resolveSessionModel(store, sessionId, runModel);
     const runEffort = resolveEffort(store, sessionId);
+    applyEndpointEnvToRunner(runner, store, sessionId, runModel);
 
     logger.info(`Prompt for session ${sessionId}: ${bodyText.length} chars`);
     logger.debug(
@@ -5038,10 +5111,22 @@ const drainSteerQueue = async (): Promise<void> => {
         // vscode-acp buffers it via pendingAvailableCommands.
       });
 
+      // Pin the health-filtered picker value so spawn BASE_URL matches the UI
+      // (getDefaultEndpointId alone can disagree with the healthy subset).
+      const configOptions = await buildConfigOptions(store, sessionId);
+      const modelOpt = configOptions.find((o: { id?: string }) => o.id === "model");
+      if (
+        modelOpt?.currentValue &&
+        getAcpEndpoints().length > 0 &&
+        !store.getConfigOverrides(sessionId)["model"]
+      ) {
+        store.setConfigOverride(sessionId, "model", modelOpt.currentValue);
+      }
+
       return {
         sessionId,
         modes: buildModeState(DEFAULT_MODE),
-        configOptions: buildConfigOptions(store, sessionId),
+        configOptions,
         availableCommands: BUILTIN_COMMANDS,
       } as NewSessionResponse;
     },
@@ -5384,9 +5469,19 @@ const drainSteerQueue = async (): Promise<void> => {
         }
       }
 
+     const configOptions = await buildConfigOptions(store, sessionId);
+     const modelOpt = configOptions.find((o: { id?: string }) => o.id === "model");
+     if (
+       modelOpt?.currentValue &&
+       getAcpEndpoints().length > 0 &&
+       !store.getConfigOverrides(sessionId)["model"]
+     ) {
+       store.setConfigOverride(sessionId, "model", modelOpt.currentValue);
+     }
+
      return {
        modes: buildModeState(currentMode),
-       configOptions: buildConfigOptions(store, sessionId),
+       configOptions,
         availableCommands: BUILTIN_COMMANDS,
       } as LoadSessionResponse;
     },
@@ -5497,7 +5592,7 @@ const drainSteerQueue = async (): Promise<void> => {
       return {
         sessionId: forkAcpId,
         modes: buildModeState(store.getMode(sourceSessionId) ?? DEFAULT_MODE),
-        configOptions: buildConfigOptions(store, forkAcpId),
+        configOptions: await buildConfigOptions(store, forkAcpId),
       } as ForkSessionResponse;
     },
 
@@ -5658,12 +5753,19 @@ const drainSteerQueue = async (): Promise<void> => {
         store.setConfigOverride(sessionId, configId, value);
         logger.info(`Session ${sessionId} config ${configId} set to ${value}`);
         if (configId === "model" && prevModel !== value) {
-          reEmitUsageOnModelSwitch(sessionId, connection, store, prevModel, String(value));
+          reEmitUsageOnModelSwitch(
+            sessionId,
+            connection,
+            store,
+            prevModel,
+            resolveBackendModel(String(value)),
+          );
+          applyEndpointEnvToRunner(runner, store, sessionId, String(value));
         }
       }
 
      // Send config_option_update notification
-     const configOptions = buildConfigOptions(store, sessionId);
+     const configOptions = await buildConfigOptions(store, sessionId);
       await connection.sessionUpdate({
         sessionId,
         update: {

@@ -18,17 +18,28 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { logger } from "./logger.js";
 
+/** One labeled backend (e.g. Windows vs Ubuntu Strata) for the ACP model picker. */
+export type AcpEndpoint = {
+  id: string;
+  name: string;
+  model: string;
+  baseUrl: string;
+};
+
 /** Shape of the parts of settings.json we care about. */
 type ClaudeSettings = {
   env?: Record<string, unknown>;
   model?: unknown;
   effortLevel?: unknown;
+  /** Dual-boot / multi-host backends. Later settings layers override by `id`. */
+  acpEndpoints?: unknown;
 };
 
 type LoadedClaudeSettings = {
   env: Record<string, string>;
   model?: string;
   effortLevel?: string;
+  acpEndpoints: AcpEndpoint[];
 };
 
 /** Env keys that name concrete backend models in Claude Code settings. */
@@ -73,12 +84,71 @@ function settingsPaths(): string[] {
   return paths;
 }
 
+function parseAcpEndpoints(raw: unknown, source: string): AcpEndpoint[] {
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    logger.warn(`Ignoring non-array acpEndpoints in ${source}`);
+    return [];
+  }
+  const out: AcpEndpoint[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object") continue;
+    const e = entry as Record<string, unknown>;
+    const id = typeof e.id === "string" ? e.id.trim() : "";
+    const name = typeof e.name === "string" ? e.name.trim() : "";
+    const model = typeof e.model === "string" ? e.model.trim() : "";
+    const baseUrl = typeof e.baseUrl === "string" ? e.baseUrl.trim().replace(/\/+$/, "") : "";
+    if (!id || !model || !baseUrl) {
+      logger.warn(
+        `Ignoring incomplete acpEndpoints entry in ${source} (need id, model, baseUrl)`,
+      );
+      continue;
+    }
+    out.push({
+      id,
+      name: name || `${model} (${id})`,
+      // Alias-resolved in loadClaudeSettings after env layers are merged.
+      model,
+      baseUrl,
+    });
+  }
+  return out;
+}
+
+/** Merge endpoint lists by id; later layers replace earlier ones with the same id. */
+function mergeAcpEndpoints(into: AcpEndpoint[], layer: AcpEndpoint[]): AcpEndpoint[] {
+  if (layer.length === 0) return into;
+  const byId = new Map<string, AcpEndpoint>();
+  for (const e of into) byId.set(e.id, e);
+  for (const e of layer) byId.set(e.id, e);
+  // Preserve first-seen order, append newly introduced ids at the end.
+  const order: string[] = [];
+  const seen = new Set<string>();
+  for (const e of into) {
+    if (!seen.has(e.id)) {
+      order.push(e.id);
+      seen.add(e.id);
+    }
+  }
+  for (const e of layer) {
+    if (!seen.has(e.id)) {
+      order.push(e.id);
+      seen.add(e.id);
+    }
+  }
+  return order.map((id) => byId.get(id)!);
+}
+
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "").toLowerCase();
+}
+
 function readSettingsFile(path: string): LoadedClaudeSettings {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
   } catch {
-    return { env: {} }; // absent is the normal case, not an error
+    return { env: {}, acpEndpoints: [] }; // absent is the normal case, not an error
   }
   // PowerShell's default UTF-8 writer prefixes a BOM. JSON.parse rejects it,
   // which used to drop the whole settings file and then fail session/load
@@ -91,7 +161,7 @@ function readSettingsFile(path: string): LoadedClaudeSettings {
     logger.warn(
       `Ignoring malformed Claude Code settings at ${path}: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return { env: {} };
+    return { env: {}, acpEndpoints: [] };
   }
   const env: Record<string, string> = {};
   if (parsed.env && typeof parsed.env === "object") {
@@ -105,20 +175,33 @@ function readSettingsFile(path: string): LoadedClaudeSettings {
     env,
     model: typeof parsed.model === "string" ? parsed.model : undefined,
     effortLevel: typeof parsed.effortLevel === "string" ? parsed.effortLevel : undefined,
+    // resolveModelAlias needs env; parse with raw model strings first, alias after merge.
+    acpEndpoints: parseAcpEndpoints(parsed.acpEndpoints, path).map((e) => ({
+      ...e,
+      // Alias resolution deferred in loadClaudeSettings once env is merged.
+      model: e.model,
+    })),
   };
 }
 
-/** Merged Claude Code settings (env + model + effortLevel). Cached. */
+/** Merged Claude Code settings (env + model + effortLevel + acpEndpoints). Cached. */
 export function loadClaudeSettings(): LoadedClaudeSettings {
   if (cachedSettings) return cachedSettings;
-  const merged: LoadedClaudeSettings = { env: {} };
+  const merged: LoadedClaudeSettings = { env: {}, acpEndpoints: [] };
   for (const path of settingsPaths()) {
     const layer = readSettingsFile(path);
     Object.assign(merged.env, layer.env);
     if (layer.model !== undefined) merged.model = layer.model;
     if (layer.effortLevel !== undefined) merged.effortLevel = layer.effortLevel;
+    merged.acpEndpoints = mergeAcpEndpoints(merged.acpEndpoints, layer.acpEndpoints);
   }
+  // Publish before alias resolution so resolveModelAlias → getClaudeEnv can
+  // read the merged env without re-entering the load loop.
   cachedSettings = merged;
+  merged.acpEndpoints = merged.acpEndpoints.map((e) => ({
+    ...e,
+    model: resolveModelAlias(e.model),
+  }));
   return merged;
 }
 
@@ -161,7 +244,8 @@ export function resolveModelAlias(model: string): string {
 
 /**
  * Default model for new sessions, matching Claude Code / settings precedence:
- * CLAUDE_ACP_MODEL → ANTHROPIC_MODEL → top-level settings.model (alias-resolved).
+ * CLAUDE_ACP_MODEL → ANTHROPIC_MODEL → top-level settings.model (alias-resolved)
+ * → first acpEndpoints[].model.
  */
 export function getDefaultModelFromSettings(): string {
   const fromAcp = getClaudeEnv("CLAUDE_ACP_MODEL");
@@ -173,9 +257,76 @@ export function getDefaultModelFromSettings(): string {
   const topLevel = loadClaudeSettings().model;
   if (topLevel) return resolveModelAlias(topLevel);
 
+  const endpoints = getAcpEndpoints();
+  if (endpoints.length > 0) return endpoints[0].model;
+
   throw new Error(
     "No model configured: set env.ANTHROPIC_MODEL (or CLAUDE_ACP_MODEL / settings.model) in ~/.claude/settings.json",
   );
+}
+
+/** Configured labeled backends (Windows/Ubuntu Strata, etc.). Empty when unused. */
+export function getAcpEndpoints(): AcpEndpoint[] {
+  return loadClaudeSettings().acpEndpoints;
+}
+
+export function findAcpEndpoint(id: string): AcpEndpoint | undefined {
+  if (!id) return undefined;
+  return getAcpEndpoints().find((e) => e.id === id);
+}
+
+/**
+ * Map a picker value to the backend model id. Endpoint ids resolve to their
+ * `model`; plain model ids / aliases pass through resolveModelAlias.
+ */
+export function resolveBackendModel(pickerValue: string): string {
+  const ep = findAcpEndpoint(pickerValue);
+  if (ep) return ep.model;
+  return resolveModelAlias(pickerValue);
+}
+
+/**
+ * Default picker value when acpEndpoints is configured: prefer the endpoint
+ * whose baseUrl matches a leftover settings.env ANTHROPIC_BASE_URL (migration
+ * aid — process.env is ignored so a stale shell export cannot pin the dead
+ * dual-boot host), else the first entry.
+ */
+export function getDefaultEndpointId(): string | undefined {
+  const endpoints = getAcpEndpoints();
+  if (endpoints.length === 0) return undefined;
+  // settings.env only — not process.env (getClaudeEnv would also read the shell).
+  const base = loadClaudeSettingsEnv()["ANTHROPIC_BASE_URL"];
+  if (base) {
+    const want = normalizeBaseUrl(base);
+    const match = endpoints.find((e) => normalizeBaseUrl(e.baseUrl) === want);
+    if (match) return match.id;
+  }
+  return endpoints[0].id;
+}
+
+/**
+ * Spawn-env overrides for a picker selection. Sets ANTHROPIC_BASE_URL / MODEL
+ * (and CLAUDE_LLAMA_SERVER_URL when slot-cache is on). Returns null when the
+ * value is not an acpEndpoints id.
+ *
+ * Claude Code applies settings.json `env` over inherited process env — so
+ * ANTHROPIC_BASE_URL must NOT remain in settings.env when using acpEndpoints,
+ * or the CLI will ignore these overrides.
+ */
+export function buildEndpointSpawnEnv(
+  pickerValue: string | undefined,
+): Record<string, string> | null {
+  if (!pickerValue) return null;
+  const ep = findAcpEndpoint(pickerValue);
+  if (!ep) return null;
+  const out: Record<string, string> = {
+    ANTHROPIC_BASE_URL: ep.baseUrl,
+    ANTHROPIC_MODEL: ep.model,
+  };
+  if (getClaudeEnv("CLAUDE_SLOT_CACHE_ENABLED") === "true") {
+    out.CLAUDE_LLAMA_SERVER_URL = ep.baseUrl;
+  }
+  return out;
 }
 
 /**
