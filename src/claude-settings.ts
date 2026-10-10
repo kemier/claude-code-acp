@@ -24,6 +24,11 @@ export type AcpEndpoint = {
   name: string;
   model: string;
   baseUrl: string;
+  /** Subagent model for sessions on this endpoint; injected as
+   * CLAUDE_CODE_SUBAGENT_MODEL, overriding the global settings.env value
+   * per endpoint. Lets a proxy endpoint route subagents to a different
+   * machine (e.g. Mac Ollama) than the session's main model provider. */
+  subagentModel?: string;
 };
 
 /** Shape of the parts of settings.json we care about. */
@@ -110,6 +115,10 @@ function parseAcpEndpoints(raw: unknown, source: string): AcpEndpoint[] {
       // Alias-resolved in loadClaudeSettings after env layers are merged.
       model,
       baseUrl,
+      // Alias-resolved like model, below.
+      subagentModel: typeof e.subagentModel === "string" && e.subagentModel.trim()
+        ? e.subagentModel.trim()
+        : undefined,
     });
   }
   return out;
@@ -201,6 +210,7 @@ export function loadClaudeSettings(): LoadedClaudeSettings {
   merged.acpEndpoints = merged.acpEndpoints.map((e) => ({
     ...e,
     model: resolveModelAlias(e.model),
+    subagentModel: e.subagentModel ? resolveModelAlias(e.subagentModel) : e.subagentModel,
   }));
   return merged;
 }
@@ -323,6 +333,13 @@ export function buildEndpointSpawnEnv(
     ANTHROPIC_BASE_URL: ep.baseUrl,
     ANTHROPIC_MODEL: ep.model,
   };
+  // NOTE: the CLI applies settings.env OVER inherited process env (see the
+  // static-ANTHROPIC_BASE_URL warning in agent.ts). For this per-endpoint
+  // override to stick, settings.env must NOT set CLAUDE_CODE_SUBAGENT_MODEL —
+  // keep it out of the env block and let the endpoint decide per session.
+  if (ep.subagentModel) {
+    out.CLAUDE_CODE_SUBAGENT_MODEL = ep.subagentModel;
+  }
   if (getClaudeEnv("CLAUDE_SLOT_CACHE_ENABLED") === "true") {
     out.CLAUDE_LLAMA_SERVER_URL = ep.baseUrl;
   }
