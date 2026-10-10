@@ -63,7 +63,11 @@ describe("model switch context window", () => {
     const idx = src.indexOf("async setSessionConfigOption(");
     expect(idx).toBeGreaterThan(0);
     const body = src.slice(idx, idx + 8000);
-    expect(body).toContain('reEmitUsageOnModelSwitch(sessionId, connection, store, prevModel, String(value))');
+    // The call is multi-line and resolves the picker value to the backend
+    // model id before re-emitting, so pin the call site and the resolution
+    // separately rather than one exact one-line string.
+    expect(body).toContain("reEmitUsageOnModelSwitch(");
+    expect(body).toContain("resolveBackendModel(String(value)),");
     expect(body).toContain('configId === "model" && prevModel !== value');
   });
 

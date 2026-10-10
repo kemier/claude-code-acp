@@ -280,17 +280,21 @@ describe("ClaudeCodeAgent", () => {
 
       // The image block must be forwarded as an Anthropic image block. The
       // text block carries the <collaboration_mode> Default-mode preamble the
-      // adapter prepends (so the model knows it may self-enter Plan mode) +
-      // the user's question; assert the question is a suffix and the image
-      // block is intact.
-      const [textBlock, imageBlock] = withContentCalls[0].content;
+      // adapter prepends (so the model knows it may self-enter Plan mode), the
+      // user's question, and — for a non-vision model — the appended
+      // "[Attached image #1 …]" note; assert the question is present and the
+      // image block is intact.
+      const [textBlock] = withContentCalls[0].content;
       expect(textBlock.type).toBe("text");
-      expect(textBlock.text.endsWith("What's in this picture?")).toBe(true);
+      // The question is no longer a suffix: when the resolved model is not
+      // vision-capable the adapter appends an "[Attached image #1 …]" note
+      // after the user text so the model knows the take is there but unseen.
+      expect(textBlock.text).toContain("What's in this picture?");
       expect(textBlock.text).toContain("<collaboration_mode>");
-      expect(imageBlock).toEqual({
-        type: "image",
-        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
-      });
+      // Text-only model in this harness: the image is degraded to that note
+      // (degradeImageBlocksForTextOnlyModel), NOT forwarded as an image block.
+      expect(withContentCalls[0].content.some((b: any) => b.type === "image")).toBe(false);
+      expect(textBlock.text).toContain("[Attached image #1");
     });
 
     it("should route text-only prompts through the stream-json stdin path", async () => {
