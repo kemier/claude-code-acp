@@ -284,6 +284,49 @@ describe("slash commands & estimator", () => {
     expect(capturedOnEvent).not.toBeNull();
   });
 
+  it("the /goal preamble is applied by frameTurnPrompt, not baked into dispatch", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/goal ship the feature");
+    // dispatchSlashCommand returns the bare objective + goalStart flag; the
+    // caller frames it via frameTurnPrompt (single source of truth for the
+    // three framings). The wire format the CLI sees is unchanged.
+    expect(capturedPrompt).not.toBeNull();
+    // (the collab-mode block precedes it; assert the framing itself)
+    expect(capturedPrompt!).toContain("Please start working toward this goal now:\n\nship the feature");
+  });
+
+  it("an unknown command is surfaced once the CLI's command set is known", async () => {
+    const sid = await newSession();
+    await prompt(sid, "hello");
+    capturedOnEvent!({
+      type: "system_init",
+      slashCommands: ["clear", "compact", "context", "model"],
+    });
+    (conn.sessionUpdate as any).mockClear();
+    await prompt(sid, "/deploy the thing");
+    // "/deploy" is not in the CLI's reported set → surface a transient
+    // commandOutput row instead of leaking the token to the model as text.
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const msg = calls.find(
+      (c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk"
+        && c[0]?.update?._meta?.commandOutput === true,
+    );
+    expect(msg).toBeTruthy();
+    expect(msg[0].update.content.text).toContain("Unknown command: /deploy");
+    // No LLM turn was started: the last prompt sent to the runner is still
+    // "hello" — the unknown command never reached the model as text.
+    expect(capturedPrompt!).toContain("hello");
+    expect(capturedPrompt!).not.toContain("/deploy");
+  });
+
+  it("an unknown command still passes through before system_init is known", async () => {
+    const sid = await newSession();
+    await prompt(sid, "/deploy the thing");
+    // No system_init yet → sessionNativeCommands is empty for this session, so
+    // the old pass-through behavior is preserved (the CLI may still handle it).
+    expect(capturedPrompt!).toContain("/deploy the thing");
+  });
+
   it("/review-branch with empty arg returns a usage message, not a turn", async () => {
     const sid = await newSession();
     await prompt(sid, "/review-branch");

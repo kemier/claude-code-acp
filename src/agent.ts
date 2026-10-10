@@ -578,6 +578,13 @@ const NATIVE_TURN_SAFE_COMMANDS = new Set([
 /** Per-session goal state. */
 const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number }>();
 
+/** Slash commands the CLI itself reported at system_init, per session. The
+ * unknown-command surface in dispatchSlashCommand consults this: a command the
+ * CLI knows about passes through (the CLI handles it); one it does not is
+ * surfaced instead of leaking "/deploy"-style text to the model. Absent until
+ * system_init arrives — while absent, the old pass-through behavior is kept. */
+const sessionNativeCommands = new Map<string, Set<string>>();
+
 /**
  * Publish the current goal snapshot to the IDE via session_info_update with
  * _meta.codex.goal. This mirrors codex-acp's publishGoalSnapshot so the
@@ -758,6 +765,37 @@ const DEFAULT_MAX_OUTPUT_TOKENS = 32_000;
 // point because the wrappers nest.
 const REPLAY_PROMPT_FRAMING_RE =
   /^(?:\[Follow-up instruction from user\]\n|\[Goal:[^\]]*\]\n\n|Please start working toward this goal now:\n\n)+/;
+
+/** Single source of truth for the three turn framings. The wrappers produced
+ * here must stay in lockstep with REPLAY_PROMPT_FRAMING_RE above: whatever we
+ * send to the CLI, the replay strip must be able to undo. The three framing
+ * sites (main turn, steer drain, goal-start turn) used to hand-roll these
+ * strings and drifted apart.
+ *
+ *   plain         — the body as typed.
+ *   goal-context  — an active goal prepended as context to a normal prompt.
+ *   goal-start    — the /goal preamble: begin working toward the objective now.
+ *   steer         — a drained steer framed as a follow-up, goal context first.
+ *
+ * goal-context is a no-op when the session has no active (non-paused) goal. */
+function frameTurnPrompt(
+  sessionId: string,
+  body: string,
+  kind: "plain" | "goal-context" | "goal-start" | "steer",
+): string {
+  const goal = sessionGoals.get(sessionId);
+  const goalText = goal && !goal.paused ? goal.text : null;
+  switch (kind) {
+    case "goal-start":
+      return `Please start working toward this goal now:\n\n${body}`;
+    case "goal-context":
+      return goalText ? `[Goal: ${goalText}]\n\n${body}` : body;
+    case "steer":
+      return `[Follow-up instruction from user]\n${goalText ? `[Goal: ${goalText}]\n\n${body}` : body}`;
+    default:
+      return body;
+  }
+}
 
 // The <collaboration_mode> developer block is prepended to effectivePrompt in
 // executePrompt (plan-mode instruction injection) and is therefore SENT to the
@@ -2409,7 +2447,7 @@ export function createClaudeCodeAgent(
    *
    * Returns:
    *   - { handled: false }            — not a slash command (or unknown); caller should send it as a plain prompt.
-   *   - { handled: true, startTurn? } — command handled. If startTurn is set, the caller should start an LLM turn with that prompt (the /goal case). Otherwise the command was fully serviced (read-only, /clear, /compact, /goal clear|pause|resume) and the caller should do nothing further.
+   *   - { handled: true, startTurn?, goalStart? } — command handled. If startTurn is set, the caller should start an LLM turn with it; goalStart marks a /goal objective whose preamble the caller applies via frameTurnPrompt (startTurn is then the bare objective), while other startTurns (e.g. /review's built prompt) are sent as-is. Otherwise the command was fully serviced (read-only, /clear, /compact, /goal clear|pause|resume) and the caller should do nothing further.
    */
   async function dispatchSlashCommand(
     sessionId: string,
@@ -2417,7 +2455,7 @@ export function createClaudeCodeAgent(
     runner: ClaudeRunner,
     store: SessionStore,
     text: string,
-  ): Promise<{ handled: boolean; startTurn?: string }> {
+  ): Promise<{ handled: boolean; startTurn?: string; goalStart?: boolean }> {
     const command = parseSlashCommand(text);
     if (!command) return { handled: false };
     const { name, rest } = command;
@@ -2933,12 +2971,34 @@ export function createClaudeCodeAgent(
        } as any,
      });
       await publishGoalSnapshot(sessionId, connection);
-     // Caller should start an LLM turn pursuing the goal.
-     return { handled: true, startTurn: `Please start working toward this goal now:\n\n${argument}` };
+     // Caller should start an LLM turn pursuing the goal. The preamble is
+     // applied by frameTurnPrompt (goal-start kind), not baked in here.
+     return { handled: true, startTurn: argument, goalStart: true };
     }
 
-    // Unknown slash command — let the caller send it as a plain prompt
-    // (Claude CLI may handle it natively).
+    // Unknown slash command. If the CLI reported it at system_init, let it
+    // through — the CLI handles it natively. If we HAVE the native set and the
+    // name is not in it, surface the mistake instead of leaking "/deploy"-style
+    // text to the model as a bare prompt. While the native set is still unknown
+    // (no system_init yet), keep the old pass-through behavior.
+    const natives = sessionNativeCommands.get(sessionId);
+    if (natives && !natives.has(name)) {
+      const known = BUILTIN_COMMANDS.map((b) => `/${b.name}`).join(", ");
+      await connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: `Unknown command: /${name}. Built-in commands: ${known}.`,
+          },
+          messageId: nextCommandMessageId(),
+          // Transient SNAPSHOT, not conversation — see nextCommandMessageId above.
+          _meta: { commandOutput: true },
+        } as any,
+      });
+      return { handled: true };
+    }
     return { handled: false };
   }
 
@@ -3277,27 +3337,33 @@ export function createClaudeCodeAgent(
     // dispatchSlashCommand() so prompt() and the steer-drain loop behave
     // identically. Read-only commands and /clear|/compact|/goal clear|pause
     // |resume are fully serviced and return immediately. /goal <objective>
-    // returns a goalPrompt to start an LLM turn with.
+    // returns startTurn (the bare objective) + goalStart to start an LLM turn
+    // with, framed by frameTurnPrompt.
     const dispatchResult = await dispatchSlashCommand(sessionId, connection, runner, store, bodyText);
     // When /goal sets a new objective, this holds the prompt to send to the
     // LLM to start working on it immediately.
-    const goalPrompt = dispatchResult.startTurn ?? null;
+    const startTurn = dispatchResult.startTurn ?? null;
+    const goalStart = dispatchResult.goalStart === true;
     // A fully-serviced command (read-only, /clear, /compact, /goal subcmds)
     // needs no main LLM turn — but we still drain any steers queued during it
     // (e.g. steers queued while /compact was summarizing) and run the
     // auto-compact check, so we skip the main turn rather than returning early.
-    const skipMainTurn = dispatchResult.handled && !goalPrompt;
+    const skipMainTurn = dispatchResult.handled && !startTurn;
     const command = dispatchResult.handled ? parseSlashCommand(bodyText) : null;
 
     // If there's an active (non-paused) goal, prepend it to the prompt.
-   // goalPrompt is set when /goal just set a new objective — use it directly.
-   // For subsequent prompts, prepend the goal as context.
+   // A command's startTurn starts the LLM turn directly: /goal's objective
+   // gets the goal-start preamble via frameTurnPrompt (goalStart flag), while
+   // other startTurns (e.g. /review's built prompt) are sent as-is. For
+   // subsequent prompts, prepend the active goal as context.
    const activeGoal = sessionGoals.get(sessionId);
-   let effectivePrompt = bodyText;
-   if (goalPrompt) {
-     effectivePrompt = goalPrompt;
+   let effectivePrompt: string;
+   if (startTurn) {
+     effectivePrompt = frameTurnPrompt(sessionId, startTurn, goalStart ? "goal-start" : "plain");
    } else if (activeGoal && !activeGoal.paused && !command) {
-     effectivePrompt = `[Goal: ${activeGoal.text}]\n\n${bodyText}`;
+     effectivePrompt = frameTurnPrompt(sessionId, bodyText, "goal-context");
+   } else {
+     effectivePrompt = bodyText;
    }
 
     // Inject collaboration mode (plan mode) instructions
@@ -3415,6 +3481,11 @@ export function createClaudeCodeAgent(
       // Handle system/init — extract native Claude CLI slash commands and
       // surface them to vscode-acp via available_commands_update.
       if (event.type === "system_init" && event.slashCommands && event.slashCommands.length > 0) {
+        // Remember the CLI's own command set for the unknown-command surface
+        // (dispatchSlashCommand). Full list, unfiltered: the pass-through test
+        // asks "does the CLI know this name", and skills/agents are invocable
+        // as /<name> at the CLI layer even if they are not ACP commands.
+        sessionNativeCommands.set(sessionId, new Set(event.slashCommands));
         // The CLI's slash_commands list is the UNION of its builtins, skills,
         // and agents (plus plugin commands). Two of those categories are not
         // "commands" in the ACP sense, so exclude them before merging:
@@ -4243,10 +4314,12 @@ const drainSteerQueue = async (): Promise<void> => {
         if (steerDispatch.handled) {
           logger.info(`Steer drain: handled slash command for session ${sessionId}`);
           if (steerDispatch.startTurn) {
-            // /goal <objective> — start an LLM turn pursuing it.
+            // /goal <objective> — start an LLM turn pursuing it, framed with
+            // the same goal-start preamble as the main-turn path.
+            const goalTurnPrompt = frameTurnPrompt(sessionId, steerDispatch.startTurn, steerDispatch.goalStart ? "goal-start" : "plain");
             try {
-              ctxEstimator.addText(steerDispatch.startTurn);
-              await runner.continueSessionStreaming(claudeSid, steerDispatch.startTurn, onEvent, sessionId, runModel, runEffort, store.getMcpServers(sessionId));
+              ctxEstimator.addText(goalTurnPrompt);
+              await runner.continueSessionStreaming(claudeSid, goalTurnPrompt, onEvent, sessionId, runModel, runEffort, store.getMcpServers(sessionId));
               await Promise.all(permissionPromises);
             } catch (goalErr) {
               logger.error(`Steer drain goal turn failed: ${goalErr instanceof Error ? goalErr.message : String(goalErr)}`);
@@ -4279,13 +4352,10 @@ const drainSteerQueue = async (): Promise<void> => {
           break;
         }
 
-        // Prepend goal to steer messages too
-        const basePrompt = activeGoal && !activeGoal.paused
-          ? `[Goal: ${activeGoal.text}]\n\n${steerText}`
-          : steerText;
-        // Frame as a follow-up so the model treats this as a new user
-        // instruction rather than a description of interrupted state.
-        let steerPrompt = `[Follow-up instruction from user]\n${basePrompt}`;
+        // Frame as a follow-up (goal context first, via the shared helper) so
+        // the model treats this as a new user instruction rather than a
+        // description of interrupted state.
+        let steerPrompt = frameTurnPrompt(sessionId, steerText, "steer");
         ctxEstimator.addText(steerPrompt);
 
         // Image-bearing steers: deliver via the stream-json content path
