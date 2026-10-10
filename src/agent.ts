@@ -3120,6 +3120,28 @@ export function createClaudeCodeAgent(
       // text (which is what previously got concatenated onto the prior reply).
       if (!skipCompleted) {
         await emitCompactionLifecycle(connection, sessionId, compactionId, "completed");
+        // Repaint the client's context ring with the post-compaction estimate.
+        // The ring is fed ONLY by usage_update frames, and manual /compact has
+        // no continuation turn that would send one — without this frame the
+        // ring keeps the pre-compaction value from the last usage_update, so
+        // the user sees the "compacted" notice while the ring never drops.
+        // The estimator was just reset+reseeded with the summary, so its
+        // estimate IS the fresh session's context. Auto-compact re-sends its
+        // own frame after the continuation; this one carries the same value
+        // and the client debounces, so the duplicate is harmless.
+        const postWindow = getContextWindowForModel(resolveSessionModel(store, sessionId, modelOverride));
+        if (estimator && postWindow > 0) {
+          connection.sessionUpdate({
+            sessionId,
+            update: {
+              sessionUpdate: "usage_update",
+              used: Math.min(estimator.getEstimatedTokens(), postWindow),
+              size: postWindow,
+            } as any,
+          }).catch(() => {
+            // Best effort — a dropped frame just leaves the ring stale.
+          });
+        }
       }
       // Re-push the plan snapshot. The client wipes its plan bar when it
       // processes the compaction "completed" lifecycle frame (its history
