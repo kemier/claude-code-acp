@@ -4309,6 +4309,24 @@ const drainSteerQueue = async (): Promise<void> => {
         queue.unshift(steerItem);
         break;
       }
+      // Defer BEFORE announcing delivery: a steered message is a FOLLOW-UP
+      // instruction that must wait for any subagent still marked in_progress
+      // (result fired before its tool_result). This check used to sit below
+      // the echo, so a deferred steer still emitted the delivered-echo below
+      // below — the client's release signal then read "delivered" and cleared
+      // its queue, while the steer was unshifted back and the drain broke.
+      // Net effect: the bubble appeared but no turn started, and the steer
+      // was lost until the user re-typed it. Checking here means we only
+      // announce a steer we are actually going to run.
+      const stillPending = sessionPendingAgents.get(sessionId);
+      if (stillPending && stillPending.size > 0) {
+        logger.info(
+          `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
+        );
+        // Put it back at the front so it drains once the subagent resolves.
+        queue.unshift(steerItem);
+        break;
+      }
       deliveredAny = true;
       // Echo now that this message is actually going to the model, so the
       // client's release signal means delivered rather than received.
@@ -4359,19 +4377,8 @@ const drainSteerQueue = async (): Promise<void> => {
         // CLI can't inject mid-turn, so we resume the session here. To stop
         // the model from misreading the prior turn's (possibly subagent-
         // produced) output as an interruption it must diagnose, frame the
-        // steer as a fresh instruction. Also, if a subagent is somehow still
-        // marked in_progress (result fired before its tool_result), defer
-        // the drain rather than yanking the session into a new context.
-        const stillPending = sessionPendingAgents.get(sessionId);
-        if (stillPending && stillPending.size > 0) {
-          logger.info(
-            `Steer drain deferred for session ${sessionId}: ${stillPending.size} subagent(s) still in_progress`,
-          );
-          // Put it back at the front so it drains once the subagent resolves.
-          queue.unshift(steerItem);
-          break;
-        }
-
+        // steer as a fresh instruction. (The subagent-defer check runs above,
+        // before the echo, so a deferred steer is never announced as delivered.)
         // Frame as a follow-up (goal context first, via the shared helper) so
         // the model treats this as a new user instruction rather than a
         // description of interrupted state.

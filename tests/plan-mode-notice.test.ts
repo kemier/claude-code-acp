@@ -107,7 +107,10 @@ describe("steer echo timing", () => {
   it("the drain echoes each message as it goes to the model", () => {
     const at = src.indexOf("const drainSteerQueue = async ()");
     expect(at).toBeGreaterThan(0);
-    const body = src.slice(at, at + 2000);
+    // Window widened from 2000→3400: the subagent-defer guard now runs ABOVE
+    // the echo (so a deferred steer is never announced as delivered), which
+    // pushed the user_message_chunk echo past the old 2000-char window.
+    const body = src.slice(at, at + 3400);
     expect(body).toContain("sessionUpdate: 'user_message_chunk'");
     expect(body.indexOf("deliveredAny = true;")).toBeLessThan(body.indexOf("user_message_chunk"));
     expect(body).toContain(".catch(()");
