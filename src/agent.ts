@@ -6112,5 +6112,34 @@ const drainSteerQueue = async (): Promise<void> => {
       }
       logger.warn(`Unknown notification method: ${method}`);
     },
+
+    /**
+     * Handle ACP extension *requests* (vs. notifications). Currently supports
+     * `_codex/session/goal_control` — the goal chip's pause/clear buttons in
+     * vscode-acp send this as a request (SessionManager.goalControl), not a
+     * notification, so without an extMethod handler the SDK falls through to
+     * method-not-found and the buttons are dead. Mirrors pi-acp's handler:
+     * mutate the same sessionGoals entry the /goal slash command owns, then
+     * republish the snapshot so the chip re-renders. Unknown methods are a
+     * no-op (return {}) so probing clients don't break.
+     */
+    async extMethod(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+      if (method === "_codex/session/goal_control") {
+        const sessionId = params.sessionId as string;
+        const action = params.action as string;
+        const goal = sessionGoals.get(sessionId);
+        if (action === "pause" && goal) {
+          goal.paused = true;
+          goal.pausedAt = Date.now();
+          await publishGoalSnapshot(sessionId, connection);
+        } else if (action === "clear" && goal) {
+          sessionGoals.delete(sessionId);
+          await publishGoalSnapshot(sessionId, connection);
+        }
+        return {};
+      }
+      // Unknown extension method — no-op rather than throw, matching pi-acp.
+      return {};
+    },
   };
 }

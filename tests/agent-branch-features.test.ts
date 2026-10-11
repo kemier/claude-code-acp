@@ -366,6 +366,42 @@ describe("/ps, /skills, /status", () => {
   });
 });
 
+describe("goal_control extension method (chip buttons)", () => {
+  // Helper: read the latest published goal snapshot from session_info_update
+  // calls (the chip's data source), keyed by _meta.codex.goal.
+  function latestGoal(conn: AgentSideConnection) {
+    const calls = (conn.sessionUpdate as any).mock.calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "session_info_update");
+    return calls.length ? (calls[calls.length - 1][0].update as any)._meta?.codex?.goal : null;
+  }
+
+  it("goal_control pause flips the snapshot to paused", async () => {
+    const { conn, agent, sid } = await setup();
+    await prompt(agent, sid, "/goal ship the feature");
+    await agent.extMethod("_codex/session/goal_control", { sessionId: sid, action: "pause" });
+    expect(latestGoal(conn)?.status).toBe("paused");
+  });
+
+  it("goal_control clear removes the goal (null snapshot)", async () => {
+    const { conn, agent, sid } = await setup();
+    await prompt(agent, sid, "/goal ship the feature");
+    await agent.extMethod("_codex/session/goal_control", { sessionId: sid, action: "clear" });
+    expect(latestGoal(conn)).toBe(null);
+  });
+
+  it("goal_control on a session with no goal is a no-op (no throw)", async () => {
+    const { conn, agent, sid } = await setup();
+    await agent.extMethod("_codex/session/goal_control", { sessionId: sid, action: "pause" });
+    expect(latestGoal(conn)).toBe(null);
+  });
+
+  it("unknown extension method returns {} rather than throwing", async () => {
+    const { agent, sid } = await setup();
+    const r = await agent.extMethod("_some/unknown_method", { sessionId: sid });
+    expect(r).toEqual({});
+  });
+});
+
 describe("/compact (doCompact)", () => {
   it("summarizes, clears the session, and starts fresh with the summary", async () => {
     const { conn, agent, sid } = await setup();
