@@ -2611,6 +2611,26 @@ export function createClaudeCodeAgent(
       const clearedEstimator = sessionEstimators.get(sessionId);
       if (clearedEstimator) clearedEstimator.reset();
       sessionLastUsage.delete(sessionId);
+      // The ring is fed ONLY by usage_update frames, and /clear has no
+      // continuation turn that would send one — without this frame the ring
+      // keeps the pre-clear value from the last usage_update, so the user sees
+      // "Conversation cleared" while the ring never drops until the NEXT real
+      // prompt. The estimator was just reset, so its estimate IS the fresh
+      // session's context (~0). Mirror the manual-/compact emission so the ring
+      // shows the cleared state immediately.
+      const clearedWindow = getContextWindowForModel(resolveSessionModel(store, sessionId));
+      if (clearedWindow > 0) {
+        connection.sessionUpdate({
+          sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            used: Math.min(clearedEstimator ? clearedEstimator.getEstimatedTokens() : 0, clearedWindow),
+            size: clearedWindow,
+          } as any,
+        }).catch(() => {
+          // Best effort — a dropped frame just leaves the ring stale.
+        });
+      }
       await connection.sessionUpdate({
         sessionId,
         update: {

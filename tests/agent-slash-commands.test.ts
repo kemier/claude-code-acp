@@ -378,6 +378,26 @@ describe("slash commands & estimator", () => {
       .map((c: any) => c[0].update.content.text);
     expect(messages.some((m: string) => m.includes("Conversation cleared"))).toBe(true);
     expect(capturedOnEvent).toBeNull();
+
+    // Regression: /clear must repaint the context ring immediately. The ring is
+    // fed ONLY by usage_update frames, and /clear has no continuation turn that
+    // would send one — without this frame the ring kept the pre-clear value
+    // until the NEXT real prompt. The estimator was just reset, so the fresh
+    // session's estimate is ~0: the frame must carry a small `used` and a real
+    // `size` (the context window), so the ring visibly drops at the notice.
+    const usageFrames = calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "usage_update")
+      .map((c: any) => c[0].update as any);
+    // The /clear frame is the LAST one (the pre-clear prompt emitted its own).
+    const clearUsage = usageFrames[usageFrames.length - 1];
+    expect(clearUsage).toBeTruthy();
+    expect(clearUsage.size).toBeGreaterThan(0);
+    // The pre-clear "hello" turn emitted its own frame (result event), so there
+    // are at least two: pin that the /clear frame is strictly LOWER — the ring
+    // dropped at the notice instead of holding the pre-clear value.
+    expect(usageFrames.length).toBeGreaterThanOrEqual(2);
+    const preClearUsage = usageFrames[usageFrames.length - 2];
+    expect(clearUsage.used).toBeLessThan(preClearUsage.used);
   });
 
   it("does not double-count assistant text emitted as both streaming delta and final block", async () => {    const sid = await newSession();
