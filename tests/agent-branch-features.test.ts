@@ -67,6 +67,8 @@ let nextUsage: { input_tokens: number; output_tokens: number } = {
   input_tokens: 10,
   output_tokens: 5,
 };
+// Queued verdicts for the goal evaluator (shift per call); empty → "MET".
+let evalVerdicts: string[] = [];
 // Controls runner.isRunning() so tests can simulate "a turn is in flight" at
 // steer time (handleSteer drops steers for idle sessions). Set true before
 // steering, false before the draining prompt.
@@ -155,6 +157,15 @@ vi.mock("../src/claude-runner.js", () => {
         this.continueSessionStreaming(_sid, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
     );
     this.setSessionPermissionMode = vi.fn();
+    // Goal evaluator: verdicts are pulled from evalVerdicts (shift) so a test
+    // can drive NOT MET → re-seed → MET → clear deterministically; empty
+    // queue defaults to MET (clears on first check, no runaway recursion).
+    this.evaluateGoalCondition = vi.fn().mockImplementation(
+      async (_sid: string, _q: string) => ({
+        text: evalVerdicts.length ? evalVerdicts.shift()! : "MET",
+        sessionId: "claude-uuid-abc",
+      })
+    );
   });
   return { ClaudeRunner: MockClaudeRunner };
 });
@@ -176,6 +187,7 @@ async function setup() {
   recorded = [];
   nextStreamText = "streamed response";
   nextUsage = { input_tokens: 10, output_tokens: 5 };
+  evalVerdicts = [];
   running = false;
   streamGate = null;
   streamGatePromise = new Promise(() => {});
@@ -207,6 +219,16 @@ function messages(conn: AgentSideConnection): string[] {
   return (conn.sessionUpdate as any).mock.calls
     .filter((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk")
     .map((c: any) => c[0].update.content.text);
+}
+
+// Latest published goal snapshot (the chip's data source), or null if cleared.
+// Filter to updates that actually carry a goal key (value may be null) so a
+// trailing updatedAt/plan session_info_update doesn't shadow the goal state.
+function latestGoal(conn: AgentSideConnection) {
+  const calls = (conn.sessionUpdate as any).mock.calls
+    .filter((c: any) => c[0]?.update?.sessionUpdate === "session_info_update")
+    .filter((c: any) => (c[0].update as any)?._meta?.codex?.goal !== undefined);
+  return calls.length ? (calls[calls.length - 1][0].update as any)._meta?.codex?.goal : null;
 }
 
 describe("model & effort pickers", () => {
@@ -367,14 +389,6 @@ describe("/ps, /skills, /status", () => {
 });
 
 describe("goal_control extension method (chip buttons)", () => {
-  // Helper: read the latest published goal snapshot from session_info_update
-  // calls (the chip's data source), keyed by _meta.codex.goal.
-  function latestGoal(conn: AgentSideConnection) {
-    const calls = (conn.sessionUpdate as any).mock.calls
-      .filter((c: any) => c[0]?.update?.sessionUpdate === "session_info_update");
-    return calls.length ? (calls[calls.length - 1][0].update as any)._meta?.codex?.goal : null;
-  }
-
   it("goal_control pause flips the snapshot to paused", async () => {
     const { conn, agent, sid } = await setup();
     await prompt(agent, sid, "/goal ship the feature");
@@ -399,6 +413,61 @@ describe("goal_control extension method (chip buttons)", () => {
     const { agent, sid } = await setup();
     const r = await agent.extMethod("_some/unknown_method", { sessionId: sid });
     expect(r).toEqual({});
+  });
+});
+
+describe("adapter goal evaluator loop", () => {
+  // The evaluator runs as a background promise chained on pendingDrainPromises;
+  // a follow-up prompt() chains on it, so awaiting the next prompt observes the
+  // eval turn. evalVerdicts drives the Haiku verdict deterministically. The
+  // loop is opt-in via CLAUDE_ACP_GOAL_EVAL=1 (default off → existing goal
+  // tests stay honest that /goal is a single prepend turn).
+
+  it("default OFF: /goal does not auto-evaluate or re-seed", async () => {
+    const { conn, agent, sid } = await setup();
+    // Flag unset → no evaluator call, no re-seed, goal stays active.
+    await prompt(agent, sid, "/goal ship the feature");
+    await prompt(agent, sid, "next");
+    expect(
+      recorded.some((c) => c.prompt.includes("Continue working toward the goal"))
+    ).toBe(false);
+    expect(latestGoal(conn)?.status).toBe("active");
+  });
+
+  it("MET verdict clears the goal (null snapshot, no re-seed turn)", async () => {
+    const { conn, agent, sid } = await setup();
+    process.env.CLAUDE_ACP_GOAL_EVAL = "1";
+    try {
+      evalVerdicts = ["MET"];
+      await prompt(agent, sid, "/goal ship the feature");
+      await prompt(agent, sid, "next");
+      // Goal cleared → latest snapshot null.
+      expect(latestGoal(conn)).toBe(null);
+      // No re-seed follow-up was scheduled.
+      expect(
+        recorded.some((c) => c.prompt.includes("Continue working toward the goal"))
+      ).toBe(false);
+    } finally {
+      delete process.env.CLAUDE_ACP_GOAL_EVAL;
+    }
+  });
+
+  it("NOT MET verdict re-seeds one follow-up turn pursuing the goal", async () => {
+    const { conn, agent, sid } = await setup();
+    process.env.CLAUDE_ACP_GOAL_EVAL = "1";
+    try {
+      evalVerdicts = ["NOT MET: tests still failing"];
+      await prompt(agent, sid, "/goal ship the feature");
+      await prompt(agent, sid, "next");
+      // A re-seed continue turn was scheduled with the evaluator's reason.
+      const reseed = recorded.find(
+        (c) => c.kind === "continue" && c.prompt.includes("Continue working toward the goal")
+      );
+      expect(reseed).toBeDefined();
+      expect(reseed!.prompt).toContain("tests still failing");
+    } finally {
+      delete process.env.CLAUDE_ACP_GOAL_EVAL;
+    }
   });
 });
 

@@ -576,7 +576,14 @@ const NATIVE_TURN_SAFE_COMMANDS = new Set([
 ]);
 
 /** Per-session goal state. */
-const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number }>();
+const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number; status?: "active" | "paused" | "complete" | "budgetLimited" }>();
+
+/** Turns the adapter-side goal evaluator has spent pursuing a goal, per
+ * session. Bounded by GOAL_EVAL_TURN_CAP so an impossible condition can't
+ * loop forever (mirrors native /goal's "or stop after N turns" safety net).
+ * Reset when a goal is set; cleared when it clears. */
+const goalEvalTurns = new Map<string, number>();
+const GOAL_EVAL_TURN_CAP = 20;
 
 /** Slash commands the CLI itself reported at system_init, per session. The
  * unknown-command surface in dispatchSlashCommand consults this: a command the
@@ -598,7 +605,10 @@ async function publishGoalSnapshot(
  const snapshot = goal
    ? {
        objective: goal.text,
-       status: goal.paused ? "paused" as const : "active" as const,
+       // goal.status is set by the adapter-side evaluator loop (complete /
+       // budgetLimited); otherwise derive from paused. vscode-acp's chip maps
+       // complete→"(done)", budgetLimited→"(budget)".
+       status: goal.status ?? (goal.paused ? "paused" as const : "active" as const),
       tokenBudget: null,
        tokensUsed: goal.tokensUsed,
        timeUsedSeconds: goal.paused && goal.pausedAt
@@ -2966,6 +2976,8 @@ export function createClaudeCodeAgent(
         return { handled: true };
       }
      sessionGoals.set(sessionId, { text: argument, paused: false, createdAt: Date.now(), pausedAt: null, tokensUsed: 0, timeUsedSeconds: 0 });
+     // Fresh goal → reset the evaluator turn budget.
+     goalEvalTurns.set(sessionId, 0);
      // Send user_message_chunk so the IDE shows the /goal command as a user
      // message bubble before the agent's "Goal set:" response. Without this,
      // the "Goal set:" text and the LLM's first response appear as two agent
@@ -4923,7 +4935,11 @@ const drainSteerQueue = async (): Promise<void> => {
         logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
       });
       pendingDrainPromises.set(sessionId, drainPromise);
-      void drainPromise.finally(() => pendingDrainPromises.delete(sessionId));
+      // Conditional: the goal evaluator may have replaced this entry with its
+      // own promise (chained on this drain); only clear if still ours.
+      void drainPromise.finally(() => {
+        if (pendingDrainPromises.get(sessionId) === drainPromise) pendingDrainPromises.delete(sessionId);
+      });
 
       // ─── Auto-compact check ───────────────────────────────────────────
       // Uses the same threshold Claude Code CLI computes (context window,
@@ -5103,6 +5119,77 @@ const drainSteerQueue = async (): Promise<void> => {
       _activeGoal.tokensUsed += _turnTokens;
       _activeGoal.timeUsedSeconds += _turnElapsed;
       await publishGoalSnapshot(sessionId, connection);
+    }
+
+    // ─── Adapter-side goal evaluator loop ──────────────────────────────
+    // Native /goal (CLI ≥2.1.139) runs its own evaluator, but the adapter
+    // intercepts /goal before the CLI sees it, so that loop never fires in
+    // ACP mode. Re-implement it here: after each turn, ask the Haiku-tier
+    // model (routed through the proxy → Mac small model via
+    // ANTHROPIC_DEFAULT_HAIKU_MODEL) whether the condition holds. If not,
+    // re-seed ONE follow-up turn pursuing it; if met, clear the goal.
+    // Scheduled as a background promise chained on pendingDrainPromises —
+    // exactly like the post-turn steer drain — so executePrompt returns
+    // end_turn immediately and the Stop button keeps switching to Send.
+    // The follow-up recurses through executePrompt, so it re-arms this
+    // evaluator at its own end (self-sustaining) and reuses the full turn
+    // machinery (framing, steer drain, compaction). Bounded by
+    // GOAL_EVAL_TURN_CAP so an impossible condition can't loop forever.
+    // Skipped when the turn errored (nothing to judge) or the goal is
+    // paused/complete. Opt-in via CLAUDE_ACP_GOAL_EVAL=1 so the default
+    // adapter behavior is unchanged for setups that don't ask for it.
+    if (process.env.CLAUDE_ACP_GOAL_EVAL === "1" && _activeGoal && !_activeGoal.paused && _activeGoal.status !== "complete" && !turnErrored) {
+      const evalTurns = goalEvalTurns.get(sessionId) ?? 0;
+      if (evalTurns >= GOAL_EVAL_TURN_CAP) {
+        _activeGoal.status = "budgetLimited";
+        await publishGoalSnapshot(sessionId, connection);
+      } else {
+        goalEvalTurns.set(sessionId, evalTurns + 1);
+        const claudeSidForEval = store.getClaudeSessionId(sessionId);
+        if (claudeSidForEval) {
+          const priorEval = pendingDrainPromises.get(sessionId) ?? Promise.resolve();
+          const evalPromise = priorEval.then(async () => {
+            try {
+              const question =
+                `You are a strict goal evaluator. The user's goal condition is:\n` +
+                `"""${_activeGoal.text}"""\n` +
+                `Based ONLY on the conversation so far, decide whether that condition is fully satisfied. ` +
+                `Reply exactly "MET" if it is satisfied, otherwise "NOT MET: <one short reason>". ` +
+                `Do not take any action or call any tool.`;
+              const verdict = await runner.evaluateGoalCondition(claudeSidForEval, question);
+              const v = (verdict.text || "").trim().toLowerCase();
+              const met = v.startsWith("met") || (/\bmet\b/.test(v) && !/not met/.test(v));
+              if (met) {
+                // Native /goal clears the goal once the condition is met.
+                sessionGoals.delete(sessionId);
+                goalEvalTurns.delete(sessionId);
+                await publishGoalSnapshot(sessionId, connection);
+                logger.info(`Goal evaluator: condition MET for session ${sessionId} — goal cleared`);
+              } else {
+                const reason = (verdict.text || "the condition is not yet satisfied").trim();
+                const reseed = frameTurnPrompt(
+                  sessionId,
+                  `Continue working toward the goal. The evaluator judged the condition not yet met: ${reason}`,
+                  "goal-start",
+                );
+                logger.info(`Goal evaluator: NOT MET for session ${sessionId} (turn ${evalTurns + 1}/${GOAL_EVAL_TURN_CAP}) — re-seeding follow-up`);
+                // Same promptGen as this turn so a Stop/cancel during the
+                // auto-continuation latches at this generation and halts the
+                // loop (the before-start cancelled check sees it).
+                await executePrompt(sessionId, reseed, runModel, runEffort, [], promptGen);
+              }
+            } catch (evalErr) {
+              logger.error(`Goal evaluator failed for session ${sessionId}: ${evalErr instanceof Error ? evalErr.message : String(evalErr)}`);
+            }
+          });
+          pendingDrainPromises.set(sessionId, evalPromise);
+          // Conditional: the recursed executePrompt may already have chained
+          // the next evaluator onto this entry; only clear if still ours.
+          void evalPromise.finally(() => {
+            if (pendingDrainPromises.get(sessionId) === evalPromise) pendingDrainPromises.delete(sessionId);
+          });
+        }
+      }
     }
     saveSessionSlot(sessionId);
     return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };

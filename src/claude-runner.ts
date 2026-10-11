@@ -354,6 +354,41 @@ export class ClaudeRunner {
     return this.runJson(args);
   }
 
+  /**
+   * One-shot goal-condition check on the resumed session, answered by the
+   * Haiku-tier model. `--model haiku` resolves through ANTHROPIC_DEFAULT_HAIKU_MODEL
+   * (settings.json), which the proxy routes per alias — e.g. qwen38-4b-nothink
+   * → Mac Ollama — so the evaluator runs on the small model while the main
+   * turn stays on the big one. --max-turns 1 keeps it a pure text verdict:
+   * no tools, no streaming, invisible to the client.
+   */
+  async evaluateGoalCondition(
+    claudeSessionId: string,
+    question: string
+  ): Promise<ClaudeResult> {
+    const args = [
+      "-p",
+      question,
+      "--resume",
+      claudeSessionId,
+      "--output-format",
+      "json",
+      "--model",
+      "haiku",
+      "--max-turns",
+      "1",
+      // Read-only verdict: the evaluator must never mutate or hang on a
+      // permission prompt. --permission-mode plan hard-blocks mutating tools
+      // (and is mutually exclusive with --dangerously-skip-permissions, which
+      // we deliberately omit). --disallowedTools mirrors the ACP web-tool gate.
+      "--permission-mode",
+      "plan",
+      "--disallowedTools",
+      "WebSearch",
+    ];
+    return this.runJson(args);
+  }
+
   async startSessionStreaming(
     cwd: string,
     prompt: string,
