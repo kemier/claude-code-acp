@@ -727,7 +727,7 @@ describe("Subagent (Task tool) lifecycle", () => {
     scriptedEvents = [];
   });
 
-  it("emits in_progress on Task tool_use, completed at turn end (not on tool_result)", async () => {
+  it("emits in_progress on Task tool_use, stays in_progress at turn end (no force-complete lie)", async () => {
     const { updates } = await runWithEvents(
       [
         {
@@ -748,19 +748,15 @@ describe("Subagent (Task tool) lifecycle", () => {
     );
     // First: in_progress when the subagent starts.
     expect(toolCalls[0].status).toBe("in_progress");
-    // The tool_result launch ack must NOT produce a completed flip — only two
-    // frames exist (the in_progress emit + the turn-end flush).
-    expect(toolCalls).toHaveLength(2);
-    // Last: the turn-end flush flips the same toolCallId to completed. The
-    // flip arrives as a tool_call_update (not tool_call) so the client updates
-    // the existing row instead of creating a duplicate.
-    const flip = toolCalls[toolCalls.length - 1];
-    expect(flip.status).toBe("completed");
-    expect(flip.sessionUpdate).toBe("tool_call_update");
-    expect(flip.toolCallId).toBe(toolCalls[0].toolCallId);
+    // The launch ack must NOT produce a completed flip, and the turn-end flush
+    // must NOT force-complete either (anthropics/claude-code#47936: never
+    // report completed for a subagent that did not choose to stop). Only the
+    // in_progress emit exists; the spinner stays live and the auto follow-up's
+    // <task-notification> completes it honestly.
+    expect(toolCalls).toHaveLength(1);
   });
 
-  it("stays in_progress across the launch-ack tool_result, then completes at turn end", async () => {
+  it("stays in_progress across the launch-ack tool_result, stays live at turn end", async () => {
     const { updates } = await runWithEvents(
       [
         {
@@ -775,12 +771,9 @@ describe("Subagent (Task tool) lifecycle", () => {
     const toolCalls = updates.filter(
       (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
     );
-    // in_progress emit + turn-end flush = 2 frames.
-    expect(toolCalls).toHaveLength(2);
+    // in_progress emit only — no turn-end force-complete frame.
+    expect(toolCalls).toHaveLength(1);
     expect(toolCalls[0].status).toBe("in_progress");
-    expect(toolCalls[1].status).toBe("completed");
-    expect(toolCalls[1].sessionUpdate).toBe("tool_call_update");
-    expect(toolCalls[1].toolCallId).toBe(toolCalls[0].toolCallId);
   });
 
   it("non-subagent tools emit in_progress at tool_use, flip to completed on tool_result", async () => {
@@ -874,8 +867,9 @@ describe("Subagent (Task tool) lifecycle", () => {
 
   it("does not flip on a <task-notification> naming a different subagent", async () => {
     // Only the subagent whose description appears in the notification resolves.
-    // A notification for an unrelated agent must leave this one pending until
-    // the turn-end flush.
+    // A notification for an unrelated agent must leave this one pending — and
+    // pending means LIVE: no turn-end force-complete (the spinner stays and the
+    // auto follow-up's notification completes it honestly).
     const { updates } = await runWithEvents(
       [
         {
@@ -898,10 +892,9 @@ describe("Subagent (Task tool) lifecycle", () => {
     const toolCalls = updates.filter(
       (u: any) => u.sessionUpdate === "tool_call" || u.sessionUpdate === "tool_call_update",
     );
-    // in_progress emit + turn-end flush = 2 frames. No mid-turn flip because
-    // the notification named a different description.
-    expect(toolCalls).toHaveLength(2);
+    // in_progress emit only — the unrelated notification must not flip it, and
+    // the turn-end flush must not force-complete it either.
+    expect(toolCalls).toHaveLength(1);
     expect(toolCalls[0].status).toBe("in_progress");
-    expect(toolCalls[1].status).toBe("completed");
   });
 });

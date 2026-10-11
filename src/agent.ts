@@ -4728,58 +4728,31 @@ const drainSteerQueue = async (): Promise<void> => {
       // Wait for all pending permission requests to resolve
       await Promise.all(permissionPromises);
 
-      // Bounded wait for pending subagents: the CLI ended the turn before all
-      // subagent <task-notification> messages arrived. Real Claude awaits
-      // subagents before ending the turn; GLM/EricAI does not. Wait up to
-      // `pendingAgentWaitMs` (default 15s) for the remaining notifications —
-      // they often arrive within 1‑5s of the turn end. Only fall back to
-      // marking completed if the wait times out.
-      {
-        const pendingAgentsTmp = sessionPendingAgents.get(sessionId);
-        if (pendingAgentsTmp && pendingAgentsTmp.size > 0) {
-          const waitDeadline = Date.now() + pendingAgentWaitMs;
-          while (Date.now() < waitDeadline) {
-            const stillPending = sessionPendingAgents.get(sessionId);
-            if (!stillPending || stillPending.size === 0) break;
-            // eslint-disable-next-line no-await-in-loop
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        }
-      }
-
-      // Post-turn subagent flush. Subagents whose <task-notification>
-      // arrived mid-turn were already flipped to "completed" and removed
-      // from sessionPendingAgents by the user-event handler above. Anything
-      // STILL pending here means the CLI ended the turn (end_turn) before
-      // the subagent's result was injected back into the conversation —
-      // i.e. a premature end_turn (observed with GLM/EricAI; real Claude
-      // awaits subagents before ending the turn). Mark this "completed" as
-      // a fallback so the UI spinner doesn't hang forever, and log the
-      // anomaly so the lost result is visible: the main agent lacks the
-      // subagent's output and may need a follow-up ("go on") to retrieve it
-      // — at which point the <task-notification> lands and is matched there.
+      // ── Post-turn subagent flush (honest, no force-complete) ───────────
+      // Subagents whose <task-notification> arrived mid-turn were already
+      // flipped to "completed" and removed from sessionPendingAgents by the
+      // user-event handler above. Anything STILL pending here means the CLI
+      // ended the turn (end_turn) before the subagent's result was injected
+      // back — a premature end_turn. The proxy throttles the subagent model
+      // (model-concurrency: 1), so a queued subagent's slot wait routinely
+      // exceeds any short bounded wait; force-marking it "completed" was a
+      // LIE (the UI showed green ✓ for work still running — anthropics/
+      // claude-code#47936 says the SDK must not report completed for a
+      // subagent that did not choose to stop). Instead: leave the subagent
+      // in_progress (spinner stays live) and KEEP it in sessionPendingAgents
+      // so the auto follow-up turn below — the native re-invocation — gets
+      // the <task-notification> and the user-event matcher flips it to
+      // completed honestly. No bounded wait: the main agent raises end_turn
+      // itself and does not stall on subagents.
       const pendingAgents = sessionPendingAgents.get(sessionId);
       if (pendingAgents && pendingAgents.size > 0) {
         const pendingCount = pendingAgents.size;
         logger.info(
           `Turn ended with ${pendingCount} subagent(s) still pending ` +
             `(no <task-notification> before end_turn) for session ${sessionId} ` +
-            `— marking completed as fallback; result was likely lost.`,
+            `— leaving in_progress (spinner live); the auto follow-up will ` +
+            `incorporate their results when the <task-notification> lands.`,
         );
-        for (const info of pendingAgents.values()) {
-          connection
-            .sessionUpdate({
-              sessionId,
-              update: {
-                sessionUpdate: "tool_call_update",
-                toolCallId: info.acpCallId,
-                status: "completed",
-              } as any,
-            })
-            .catch(() => {});
-        }
-        pendingAgents.clear();
-        sessionPendingAgents.delete(sessionId);
 
         // ── Auto follow-up for late subagent results ────────────────────
         // The turn ended before the subagent(s) reported back. The Claude

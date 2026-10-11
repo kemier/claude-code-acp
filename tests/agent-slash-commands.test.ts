@@ -125,6 +125,21 @@ vi.mock("../src/claude-runner.js", () => {
           onEvent({ type: "result", stopReason: "end_turn", usage: { input_tokens: 10, output_tokens: 5 } });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
+        // The auto-follow-up turn is where the CLI injects the finished
+        // subagent's <task-notification> (the adapter leaves the subagent
+        // in_progress at end_turn; the notification lands on the NEXT turn and
+        // the user-event matcher flips it to completed). Emit it here so the
+        // pending entry resolves and the post-turn steer drain can run.
+        if (_prompt.includes("[Auto]") && _prompt.includes("background subagent(s) finished")) {
+          onEvent({
+            type: "user",
+            text:
+              '<task-notification>\n<task-id>tu_subagent</task-id>\n' +
+              '<status>completed</status>\n' +
+              '<summary>Agent "investigate" completed</summary>\n' +
+              '</task-notification>',
+          });
+        }
         // Sentinel prompt to simulate a Claude CLI `local` command result
         // (/heapdump, /context): the CLI services it itself with no LLM turn,
         // returning the output as the `result` of a single `result` event with
