@@ -625,9 +625,14 @@ async function publishGoalSnapshot(
        status: goal.status ?? (goal.paused ? "paused" as const : "active" as const),
       tokenBudget: null,
        tokensUsed: goal.tokensUsed,
-       timeUsedSeconds: goal.paused && goal.pausedAt
-         ? Math.floor((goal.pausedAt - goal.createdAt) / 1000)
-         : Math.floor((Date.now() - goal.createdAt) / 1000),
+       // Accumulated goal WORK, not wall-clock since creation. The per-turn
+       // accumulators (agent.ts:5140 normal end, :4663/:5248 cancelled turns)
+       // already add each turn's elapsed; the old `now - createdAt` form counted
+       // idle gaps between prompts as goal time (the "time added from previous"
+       // symptom) and clobbered that accumulator. Pause needs no special case:
+       // accumulation happens only at turn end, and pause cancels a turn (counted
+       // once at :5248).
+       timeUsedSeconds: goal.timeUsedSeconds,
        createdAt: Math.floor(goal.createdAt / 1000),
       controlMethod: "_codex/session/goal_control",
      }
