@@ -3861,7 +3861,11 @@ export function createClaudeCodeAgent(
    //   value (sum of all API calls) is inflated on multi-call turns and
    //   triggers compaction way too early (e.g. 340k for a 27k context).
    //   Our estimate tracks actual conversation growth and is accurate.
-   if (event.type === "result") {
+   if (event.type === "result" && !event.isSidechain) {
+    // A subagent's own conversation ends with its own result line (flagged
+    // isSidechain by the runner). It must NOT overwrite the parent turn's
+    // stop reason / error flag / usage accounting — the parent's own result
+    // (parent_tool_use_id null) is the authoritative end_turn signal.
     // Capture the stop reason / error flag for the prompt return path.
     // This runs even when the result carries no usage (some error results
     // omit it), so an error_max_turns / failed turn is never silently
@@ -3948,15 +3952,28 @@ export function createClaudeCodeAgent(
     }
    }
      if ((event as any).type === "thinking" && (event as any).text) {
-       ctxEstimator.addText((event as any).text);
-       connection.sessionUpdate({
-         sessionId,
-         update: {
-           sessionUpdate: "agent_thought_chunk",
-           content: { type: "text", text: (event as any).text },
-         } as any,
-       });
+       // A subagent's own thinking lives in its sidechain — do not render it
+       // as an agent_thought_chunk in the parent's chat.
+       if (!event.isSidechain) {
+         ctxEstimator.addText((event as any).text);
+         connection.sessionUpdate({
+           sessionId,
+           update: {
+             sessionUpdate: "agent_thought_chunk",
+             content: { type: "text", text: (event as any).text },
+           } as any,
+         });
+       }
      } else if (event.type === "text_delta" && event.text) {
+       // A subagent's own assistant text lives in its sidechain — the parent
+       // conversation never sees it (only the launch ack and the eventual
+       // <task-notification> do). Emitting it here leaked the subagent's
+       // reasoning into the main chat as agent_message_chunk. Drop the whole
+       // branch for sidechain deltas: no UI emit, no context-estimator add
+       // (subagent content never enters this conversation's prompt), and no
+       // streamedTextThisMessage flag (that dedup state belongs to the
+       // parent's own messages).
+       if (!event.isSidechain) {
        // In --verbose mode Claude CLI emits BOTH streaming content_block_delta
        // text AND the final assistant message block's full text. To avoid
        // double-counting assistant content in the context estimate, we count
@@ -3992,6 +4009,7 @@ export function createClaudeCodeAgent(
              messageId: currentMessageId ?? undefined,
            },
          });
+       }
        }
      } else if (event.type === "tool_use" && event.toolName) {
        ctxEstimator.addToolCall(event.toolName, event.toolInput);

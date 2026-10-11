@@ -1395,7 +1395,10 @@ export class ClaudeRunner {
       parsed.type === "content_block_delta" &&
       parsed.delta?.type === "text_delta"
     ) {
-      onEvent({ type: "text_delta", text: parsed.delta.text });
+      // Sidechain flag from the WRAPPER (parent_tool_use_id) — a subagent's
+      // streaming text must be told apart from the main conversation's so
+      // agent.ts can drop it instead of leaking it as agent_message_chunk.
+      onEvent({ type: "text_delta", text: parsed.delta.text, isSidechain: envelopeSidechain });
       return;
     }
 
@@ -1434,7 +1437,9 @@ export class ClaudeRunner {
       });
      for (const block of parsed.message.content) {
        if (block.type === "text") {
-         onEvent({ type: "text_delta", text: block.text, fromAssistantBlock: true });
+         // Carry the sidechain flag: a subagent's final-block text must not
+         // leak into the parent's chat as agent_message_chunk.
+         onEvent({ type: "text_delta", text: block.text, fromAssistantBlock: true, isSidechain });
        } else if (block.type === "tool_use") {
          onEvent({
            type: "tool_use",
@@ -1494,7 +1499,9 @@ export class ClaudeRunner {
       parsed.type === "content_block_delta" &&
       parsed.delta?.type === "thinking_delta"
     ) {
-      onEvent({ type: "thinking", text: parsed.delta.thinking });
+      // Sidechain flag from the WRAPPER — a subagent's own thinking must not
+      // render as an agent_thought_chunk in the parent's chat.
+      onEvent({ type: "thinking", text: parsed.delta.thinking, isSidechain: envelopeSidechain });
       return;
     }
 
