@@ -44,6 +44,12 @@ interface SessionData {
   title?: string;
   updatedAt: string;
   configOverrides: Record<string, unknown>;
+  /**
+   * Adapter-side goal state, persisted so a Reload Window (adapter restart)
+   * can rehydrate sessionGoals in loadSession — otherwise a resumed session's
+   * active goal silently vanishes and the evaluator loop never re-arms.
+   */
+  goal?: { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number; status?: "active" | "paused" | "complete" | "budgetLimited" };
 }
 
 /**
@@ -283,6 +289,30 @@ export class SessionStore {
       throw new Error(`Session ${sessionId} not found`);
     }
     session.configOverrides[key] = value;
+    session.updatedAt = new Date().toISOString();
+    this.persistSessions();
+  }
+
+  getGoal(sessionId: string): SessionData["goal"] {
+    return this.sessions.get(sessionId)?.goal;
+  }
+
+  /** Persist the adapter-side goal so a Reload Window can rehydrate it. */
+  setGoal(sessionId: string, goal: SessionData["goal"]): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`Session ${sessionId} not found`);
+    }
+    session.goal = goal;
+    session.updatedAt = new Date().toISOString();
+    this.persistSessions();
+  }
+
+  clearGoal(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    if (session.goal === undefined) return;
+    delete session.goal;
     session.updatedAt = new Date().toISOString();
     this.persistSessions();
   }

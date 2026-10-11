@@ -418,6 +418,20 @@ describe("goal_control extension method (chip buttons)", () => {
     const r = await agent.extMethod("_some/unknown_method", { sessionId: sid });
     expect(r).toEqual({});
   });
+
+  it("goal state is persisted to disk so a process restart can restore it", async () => {
+    // Store-API round-trip (the restart-critical invariant; the live check
+    // covers the cross-process restore). setup.ts redirects the store dir to
+    // a temp path so this never touches the developer's live sessions.
+    const { SessionStore } = await import("../src/session-store.js");
+    const s = new SessionStore();
+    const sid = "goal-persist-test";
+    s.create(sid, "/tmp/proj", []);
+    s.setGoal(sid, { text: "ship the feature", paused: false, createdAt: 1, pausedAt: null, tokensUsed: 0, timeUsedSeconds: 0 });
+    expect(s.getGoal(sid)?.text).toBe("ship the feature");
+    s.clearGoal(sid);
+    expect(s.getGoal(sid)).toBeUndefined();
+  });
 });
 
 describe("adapter goal evaluator loop", () => {

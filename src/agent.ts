@@ -577,6 +577,9 @@ const NATIVE_TURN_SAFE_COMMANDS = new Set([
 
 /** Per-session goal state. */
 const sessionGoals = new Map<string, { text: string; paused: boolean; createdAt: number; pausedAt: number | null; tokensUsed: number; timeUsedSeconds: number; status?: "active" | "paused" | "complete" | "budgetLimited" }>();
+/** The live SessionStore, captured at creation so publishGoalSnapshot (module
+ * scope) can persist goal state without threading store through 13 call sites. */
+let goalStore: SessionStore | undefined;
 
 /** Turns the adapter-side goal evaluator has spent pursuing a goal, per
  * session. Bounded by GOAL_EVAL_TURN_CAP so an impossible condition can't
@@ -600,8 +603,19 @@ const sessionNativeCommands = new Map<string, Set<string>>();
 async function publishGoalSnapshot(
   sessionId: string,
   connection: AgentSideConnection,
+  store?: SessionStore,
 ): Promise<void> {
   const goal = sessionGoals.get(sessionId);
+  // Persist goal state so a Reload Window (adapter restart) can rehydrate it
+  // in loadSession — otherwise a resumed session's active goal vanishes and
+  // the evaluator loop never re-arms (chip stuck active, banner never done).
+  const s = store ?? goalStore;
+  if (s && s.has(sessionId)) {
+    try {
+      if (goal) s.setGoal(sessionId, goal);
+      else s.clearGoal(sessionId);
+    } catch { /* persistence is best-effort; never break the snapshot emit */ }
+  }
  const snapshot = goal
    ? {
        objective: goal.text,
@@ -1938,6 +1952,7 @@ export function createClaudeCodeAgent(
 ): Agent {
   const pendingAgentWaitMs = options.pendingAgentWaitMs ?? 15000;
   const store = new SessionStore();
+  goalStore = store;
   const runner = new ClaudeRunner();
   const cancelledSessions = new Set<string>();
   // A queued steer carries its text PLUS any image content blocks the client
@@ -2611,6 +2626,11 @@ export function createClaudeCodeAgent(
       store.clearPersistedSession(cwd);
       store.setClaudeSessionId(sessionId, "");
       sessionGoals.delete(sessionId);
+      // /clear wipes the conversation — drop the persisted goal too, or a
+      // later resume would rehydrate a goal for a conversation that no longer
+      // exists. (The other goal-delete sites publish a null snapshot, which
+      // clears persistence via publishGoalSnapshot's store branch.)
+      store.clearGoal(sessionId);
       sessionTodos.delete(sessionId);
       // /clear drops the whole conversation, so the rehydrated background
       // commands and the "restored session" notice go with it.
@@ -5387,6 +5407,20 @@ const drainSteerQueue = async (): Promise<void> => {
        if (incoming.length > 0) {
          store.setMcpServers(sessionId, incoming);
        }
+     }
+
+     // Rehydrate the adapter-side goal from the persisted store. sessionGoals
+     // is in-memory only, so after a Reload Window (adapter restart) a resumed
+     // session's active goal would vanish — the chip would show a stale
+     // snapshot but the evaluator loop would never re-arm. Restore it and
+     // republish so the chip reflects the restored state. The evaluator turn
+     // budget intentionally resets to 0 on resume (a fresh GOAL_EVAL_TURN_CAP).
+     const persistedGoal = store.getGoal(sessionId);
+     if (persistedGoal && !sessionGoals.has(sessionId)) {
+       sessionGoals.set(sessionId, persistedGoal);
+       goalEvalTurns.set(sessionId, 0);
+       logger.info(`Load session ${sessionId}: restored goal "${persistedGoal.text}" (status ${persistedGoal.status ?? "active"})`);
+       await publishGoalSnapshot(sessionId, connection, store);
      }
 
      // If the sessionId being loaded is itself a Claude CLI transcript UUID
