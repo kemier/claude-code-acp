@@ -5480,25 +5480,37 @@ const drainSteerQueue = async (): Promise<void> => {
       const replayCwd = store.getCwd(sessionId)!;
       const projectDir = `${homedir()}/.claude/projects/${encodeClaudeProjectSlug(replayCwd)}`;
       if (!claudeSessionId) {
-        // Sessions created before full-record persistence have no mapping. Fall
-        // back to the most recent transcript for this directory so the resumed
-        // conversation still renders instead of coming up blank.
-        try {
-          const { readdirSync, statSync, existsSync } = await import("node:fs");
-          if (existsSync(projectDir)) {
-            const newest = readdirSync(projectDir)
-              .filter((f) => f.endsWith(".jsonl"))
-              .map((f) => ({ f, m: statSync(`${projectDir}/${f}`).mtimeMs }))
-              .sort((a, b) => b.m - a.m)[0];
-            if (newest) {
-              claudeSessionId = newest.f.replace(/\.jsonl$/, "");
-              logger.info(
-                `No Claude session mapped for ${sessionId}; replaying newest transcript ${claudeSessionId}`
-              );
+        if (claudeSessionId === "") {
+          // /clear deliberately emptied the mapping (setClaudeSessionId(sessionId,
+          // "")). The conversation was wiped, so a resume must replay NOTHING —
+          // falling back to the newest transcript here re-renders exactly the
+          // turns the user just cleared. Only a genuinely-unknown mapping
+          // (undefined — sessions written before full-record persistence) may
+          // fall back to the newest transcript for this directory.
+          logger.info(
+            `Load session ${sessionId}: conversation was cleared; skipping transcript replay`
+          );
+        } else {
+          // Sessions created before full-record persistence have no mapping. Fall
+          // back to the most recent transcript for this directory so the resumed
+          // conversation still renders instead of coming up blank.
+          try {
+            const { readdirSync, statSync, existsSync } = await import("node:fs");
+            if (existsSync(projectDir)) {
+              const newest = readdirSync(projectDir)
+                .filter((f) => f.endsWith(".jsonl"))
+                .map((f) => ({ f, m: statSync(`${projectDir}/${f}`).mtimeMs }))
+                .sort((a, b) => b.m - a.m)[0];
+              if (newest) {
+                claudeSessionId = newest.f.replace(/\.jsonl$/, "");
+                logger.info(
+                  `No Claude session mapped for ${sessionId}; replaying newest transcript ${claudeSessionId}`
+                );
+              }
             }
+          } catch {
+            // Fall through — nothing to replay.
           }
-        } catch {
-          // Fall through — nothing to replay.
         }
       }
       if (claudeSessionId) {
