@@ -24,6 +24,10 @@ beforeEach(() => {
   process.env.CLAUDE_SETTINGS_DIR = fakeSettingsDir;
   process.env.ANTHROPIC_MODEL = "glm-5.2";
   process.env.CLAUDE_ACP_AVAILABLE_MODELS = ERICAI_MODELS;
+  // The evaluator loop is opt-in; the developer's live settings.json may
+  // export CLAUDE_ACP_GOAL_EVAL=1 into the harness env, which vitest inherits.
+  // Default tests to OFF; the loop tests set it explicitly.
+  delete process.env.CLAUDE_ACP_GOAL_EVAL;
   clearClaudeSettingsCache();
 });
 
@@ -441,8 +445,8 @@ describe("adapter goal evaluator loop", () => {
       evalVerdicts = ["MET"];
       await prompt(agent, sid, "/goal ship the feature");
       await prompt(agent, sid, "next");
-      // Goal cleared → latest snapshot null.
-      expect(latestGoal(conn)).toBe(null);
+      // Goal marked complete → chip shows "(done)", not cleared.
+      expect(latestGoal(conn)?.status).toBe("complete");
       // No re-seed follow-up was scheduled.
       expect(
         recorded.some((c) => c.prompt.includes("Continue working toward the goal"))

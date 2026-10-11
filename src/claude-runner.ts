@@ -364,7 +364,8 @@ export class ClaudeRunner {
    */
   async evaluateGoalCondition(
     claudeSessionId: string,
-    question: string
+    question: string,
+    modelOverride?: string
   ): Promise<ClaudeResult> {
     const args = [
       "-p",
@@ -374,7 +375,7 @@ export class ClaudeRunner {
       "--output-format",
       "json",
       "--model",
-      "haiku",
+      modelOverride || "haiku",
       "--max-turns",
       "1",
       // Read-only verdict: the evaluator must never mutate or hang on a

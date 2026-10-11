@@ -5156,15 +5156,29 @@ const drainSteerQueue = async (): Promise<void> => {
                 `Based ONLY on the conversation so far, decide whether that condition is fully satisfied. ` +
                 `Reply exactly "MET" if it is satisfied, otherwise "NOT MET: <one short reason>". ` +
                 `Do not take any action or call any tool.`;
-              const verdict = await runner.evaluateGoalCondition(claudeSidForEval, question);
+              let verdict: { text: string } | null = null;
+              try {
+                verdict = await runner.evaluateGoalCondition(claudeSidForEval, question);
+              } catch (evalErr) {
+                // The Haiku-slot alias may not resolve on the session's
+                // current endpoint (e.g. direct :8080 backends that don't
+                // serve the Mac Ollama alias). Retry with the session's own
+                // model — the one the working turns just used — so the loop
+                // functions on every endpoint, not only the proxy.
+                logger.info(
+                  `Goal evaluator: Haiku slot failed (${evalErr instanceof Error ? evalErr.message : String(evalErr)}); retrying with session model`,
+                );
+                verdict = await runner.evaluateGoalCondition(claudeSidForEval, question, runModel);
+              }
               const v = (verdict.text || "").trim().toLowerCase();
               const met = v.startsWith("met") || (/\bmet\b/.test(v) && !/not met/.test(v));
               if (met) {
-                // Native /goal clears the goal once the condition is met.
-                sessionGoals.delete(sessionId);
+                // Keep the goal with status=complete so the chip shows
+                // "(done)" — deleting it hid the achievement state.
+                _activeGoal.status = "complete";
                 goalEvalTurns.delete(sessionId);
                 await publishGoalSnapshot(sessionId, connection);
-                logger.info(`Goal evaluator: condition MET for session ${sessionId} — goal cleared`);
+                logger.info(`Goal evaluator: condition MET for session ${sessionId} — goal marked complete`);
               } else {
                 const reason = (verdict.text || "the condition is not yet satisfied").trim();
                 const reseed = frameTurnPrompt(
