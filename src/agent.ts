@@ -3534,6 +3534,13 @@ export function createClaudeCodeAgent(
     // painted a bubble it immediately superseded: the empty bubble that
     // flashed and vanished at every text→tool boundary.
     let streamedTextThisMessage = false;
+    // Did THIS turn deliver any assistant text to the UI at all? A turn that
+    // ends on tool calls with no streamed text carries its summary only in the
+    // result event's text — the CLI prints it, but the adapter used to drop it,
+    // so the panel showed tool calls + end_turn and the summary appeared only
+    // after Reload Window (session/load replay renders it from the transcript).
+    // The result handler surfaces that text when this flag stayed false.
+    let turnStreamedText = false;
     const onEvent = (event: StreamEvent) => {
       // Handle system/init — extract native Claude CLI slash commands and
       // surface them to vscode-acp via available_commands_update.
@@ -3900,7 +3907,30 @@ export function createClaudeCodeAgent(
       }).catch(() => {
         // Best effort — a missing command-output row must not fail the turn.
       });
+    } else if (!isCliLocalTurn && !event.isError && !turnStreamedText &&
+        typeof event.text === "string" && event.text.trim()) {
+      // The turn ended on tool calls with NO streamed assistant text — its
+      // summary lives only in the result event's text. The CLI prints it, but
+      // the adapter used to drop it, so the panel showed tool calls + end_turn
+      // and the summary appeared only after Reload Window (session/load replay
+      // renders it from the transcript). Surface it as the turn's final
+      // assistant bubble. This also covers the harness "no visible output"
+      // retry: the retry is a second turn inside the same prompt, and the
+      // flag below resets per result so each turn is judged on its own.
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: event.text },
+          messageId: `msg_${++messageCounter}`,
+        } as any,
+      }).catch(() => {
+        // Best effort — a missing summary must not fail the turn.
+      });
     }
+    // Start the next turn's streamed-text tracking fresh (a result ends a
+    // turn; the harness retry is a new turn within the same prompt).
+    turnStreamedText = false;
     // Record the context window Claude Code resolved for this model.
     if (event.contextWindow && event.contextWindow > 0) {
       const cwModel = resolveSessionModel(store, sessionId, runModel);
@@ -3999,6 +4029,9 @@ export function createClaudeCodeAgent(
        const dropAsDuplicate = event.fromAssistantBlock && streamedTextThisMessage;
        if (event.fromAssistantBlock) streamedTextThisMessage = false;
        if (!dropAsDuplicate) {
+         // This turn delivered text to the UI — the result handler must not
+         // re-surface result.text as a second summary bubble.
+         turnStreamedText = true;
          connection.sessionUpdate({
            sessionId,
            update: {
