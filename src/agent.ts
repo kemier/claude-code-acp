@@ -3523,6 +3523,13 @@ export function createClaudeCodeAgent(
     // is set we surface that text as a commandOutput row so it is not
     // silently dropped. See isCliLocalCommandPrompt / CLI_LOCAL_COMMAND_NAMES.
     const isCliLocalTurn = isCliLocalCommandPrompt(bodyText);
+    // A new user prompt means any subagents still marked in_progress from a
+    // prior turn are stale — their <task-notification> either already arrived
+    // (and was consumed) or will never come (CLI process restarted, session
+    // resumed). Clearing here prevents the post-turn flush from firing a false
+    // auto-follow-up for subagents that are no longer running.
+    sessionPendingAgents.delete(sessionId);
+    autoFollowUpCount.delete(sessionId);
     // Claude CLI emits per-token text deltas only when launched with
     // --include-partial-messages (claude-runner passes it), and wraps them in
     // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
@@ -5472,6 +5479,12 @@ const drainSteerQueue = async (): Promise<void> => {
 
      const currentMode = store.getMode(sessionId) ?? DEFAULT_MODE;
      logger.info(`Load session: ${sessionId}`);
+
+     // A resumed session's prior subagents are gone (CLI process restarted).
+     // Clear any stale pending-agent entries so the post-turn flush doesn't
+     // fire a false auto-follow-up on the next turn.
+     sessionPendingAgents.delete(sessionId);
+     autoFollowUpCount.delete(sessionId);
 
       // Replay conversation history from Claude CLI's JSONL transcript.
       // The transcript lives at ~/.claude/projects/<encoded-cwd>/<claude-session-id>.jsonl
