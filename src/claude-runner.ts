@@ -305,7 +305,21 @@ export class ClaudeRunner {
         .map((t) => t.trim())
         .filter(Boolean)
         .join(",");
-      if (dropped) {
+      // In plan mode the model cannot exit via a tool call: EnterPlanMode /
+      // ExitPlanMode are interactive-TUI-only and are disabled under headless
+      // `claude -p` — but the model still ATTEMPTS them (the tool row flashes
+      // in the UI with an empty result before it falls back to prose). Plan
+      // mode is driven by the client's collaboration_mode picker, not a tool
+      // call, so drop both from the tool surface while in plan mode to stop
+      // the wasted call. (In non-plan modes ExitPlanMode is moot and
+      // EnterPlanMode is a no-op the picker already handles, so leave them
+      // available there to avoid surprising a model that wants to propose
+      // planning.)
+      if (this.sessionPermissionMode === "read-only") {
+        const planDrops = ["EnterPlanMode", "ExitPlanMode"];
+        const merged = dropped ? [dropped, ...planDrops].join(",") : planDrops.join(",");
+        extra.push("--disallowedTools", merged);
+      } else if (dropped) {
         extra.push("--disallowedTools", dropped);
       }
     }

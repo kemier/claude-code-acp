@@ -15,6 +15,7 @@ vi.mock("node:fs", () => ({
   readFileSync: vi.fn(() => "{}"),
   writeFileSync: vi.fn(),
   mkdirSync: vi.fn(),
+  mkdtempSync: vi.fn(() => "/tmp/claude-acp-test"),
 }));
 
 // Mock validation - agent unit tests should not hit filesystem
@@ -278,21 +279,65 @@ describe("ClaudeCodeAgent", () => {
       expect(withContentCalls).toHaveLength(1);
       expect(capturedRunnerCalls.some((c) => c.kind === "start")).toBe(false);
 
-      // The image block must be forwarded as an Anthropic image block. The
-      // text block carries the <collaboration_mode> Default-mode preamble the
-      // adapter prepends (so the model knows it may self-enter Plan mode), the
-      // user's question, and — for a non-vision model — the appended
-      // "[Attached image #1 …]" note; assert the question is present and the
-      // image block is intact.
-      const [textBlock] = withContentCalls[0].content;
+      // The image block is forwarded as an Anthropic image block. This harness
+      // sets NO model override, so the resolved model is `undefined` →
+      // modelSupportsVision(undefined) is `true` (native Claude = vision-capable
+      // default), so the image is NOT degraded and is forwarded intact. The
+      // degrade path (degradeImageBlocksForTextOnlyModel) only fires for an
+      // explicit text-only model override — see the dedicated text-only test
+      // below. The text block carries the <collaboration_mode> Default-mode
+      // preamble the adapter prepends + the user's question.
+      const [textBlock, imageBlock] = withContentCalls[0].content;
       expect(textBlock.type).toBe("text");
-      // The question is no longer a suffix: when the resolved model is not
-      // vision-capable the adapter appends an "[Attached image #1 …]" note
-      // after the user text so the model knows the take is there but unseen.
       expect(textBlock.text).toContain("What's in this picture?");
       expect(textBlock.text).toContain("<collaboration_mode>");
-      // Text-only model in this harness: the image is degraded to that note
-      // (degradeImageBlocksForTextOnlyModel), NOT forwarded as an image block.
+      // Vision-capable harness model: the image block is forwarded, NOT degraded.
+      expect(imageBlock).toEqual({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+      });
+    });
+
+    it("should degrade an image prompt to a text note on an explicit text-only model", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+      // Pin an explicit text-only model so the degrade path (not the
+      // vision-capable default) is exercised. The name matches no entry in
+      // VISION_MODEL_NAME_PATTERN, so modelSupportsVision → false.
+      agent.setSessionConfigOption({
+        sessionId: session.sessionId,
+        configId: "model",
+        value: "gpt-3.5-turbo",
+      } as any);
+
+      const result = await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [
+          { type: "text", text: "What's in this picture?" },
+          {
+            type: "image",
+            data: "aGVsbG8=",
+            mimeType: "image/png",
+          },
+        ],
+      });
+
+      expect(result.stopReason).toBe("end_turn");
+      const withContentCalls = capturedRunnerCalls.filter(
+        (c) => c.kind === "startWithContent"
+      );
+      expect(withContentCalls).toHaveLength(1);
+      const [textBlock] = withContentCalls[0].content;
+      expect(textBlock.type).toBe("text");
+      expect(textBlock.text).toContain("What's in this picture?");
+      // Text-only model: the image is degraded to that note, NOT forwarded.
       expect(withContentCalls[0].content.some((b: any) => b.type === "image")).toBe(false);
       expect(textBlock.text).toContain("[Attached image #1");
     });
