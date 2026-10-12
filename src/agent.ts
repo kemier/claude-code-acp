@@ -2007,6 +2007,14 @@ export function createClaudeCodeAgent(
   // could re-trigger). See `ericli-subagent-late-arrival-turn-trigger`.
   const autoFollowUpCount = new Map<string, number>();
   const AUTO_FOLLOW_UP_CAP = 3;
+  // Degenerate empty-turn retry guard: when a turn returns end_turn with
+  // zero tokens, no text, and no tool call, the CLI was answering a synthetic
+  // control frame rather than the user's prompt. Re-deliver the same turn
+  // once (bounded) so the user does not get a silent empty bubble. Mirrors
+  // ericli's MAX_REFUSAL_RETRIES but smaller — each retry here is a full
+  // subprocess turn, not an in-loop continue.
+  const emptyTurnRetries = new Map<string, number>();
+  const MAX_EMPTY_TURN_RETRIES = 1;
   // Sessions whose steer queue is currently being drained. drainSteerQueue()
   // awaits LLM turns, so without this a second call (pre-turn vs post-turn vs
   // post-compaction) could run concurrently and interleave two consumers over
@@ -3530,6 +3538,7 @@ export function createClaudeCodeAgent(
     // auto-follow-up for subagents that are no longer running.
     sessionPendingAgents.delete(sessionId);
     autoFollowUpCount.delete(sessionId);
+    emptyTurnRetries.delete(sessionId);
     // Claude CLI emits per-token text deltas only when launched with
     // --include-partial-messages (claude-runner passes it), and wraps them in
     // a `stream_event` envelope that claude-runner unwraps. It ALSO emits the
@@ -3548,6 +3557,17 @@ export function createClaudeCodeAgent(
     // after Reload Window (session/load replay renders it from the transcript).
     // The result handler surfaces that text when this flag stayed false.
     let turnStreamedText = false;
+    // Did THIS turn emit any non-sidechain tool call? A turn that produced
+    // only a tool call is not degenerate even if it streamed no text and
+    // reported zero tokens — the tool call IS the progress. Used by the
+    // empty-turn guard to avoid retrying a tool-only turn.
+    let turnHadToolCall = false;
+    // Captured at the result branch (before the per-turn reset) so the
+    // empty-turn guard can evaluate the fingerprint using the values from
+    // the turn that just ended, not the (already-reset) state of the next
+    // turn.
+    let lastTurnStreamedText = false;
+    let lastTurnHadToolCall = false;
     const onEvent = (event: StreamEvent) => {
       // Handle system/init — extract native Claude CLI slash commands and
       // surface them to vscode-acp via available_commands_update.
@@ -3875,7 +3895,59 @@ export function createClaudeCodeAgent(
    //   value (sum of all API calls) is inflated on multi-call turns and
    //   triggers compaction way too early (e.g. 340k for a 27k context).
    //   Our estimate tracks actual conversation growth and is accurate.
-   if (event.type === "result" && !event.isSidechain) {
+   // Handle the CLI's OWN native compaction (system/compact_boundary).
+  //
+  // The Claude Code CLI runs its own auto-compact — nothing in this adapter
+  // disables it (it is gated only by DISABLE_COMPACT / DISABLE_AUTO_COMPACT /
+  // the autoCompactEnabled setting, none of which we pass). So it can compact
+  // a session out from under us mid-turn: the next API call reports a tiny
+  // input_tokens, the adapter forwards that usage_update, and the client's
+  // context ring drops with no visible cause. The CLI does announce it (the
+  // frame carries compact_metadata with pre/post token counts); this branch
+  // relays that announcement as the same lifecycle our own doCompact emits, so
+  // the client clears the panel and shows its notice instead of a silent drop.
+  //
+  // A subagent (.isSidechain) compacts ITS OWN conversation — relaying that
+  // would wipe the parent panel, so it is ignored, exactly as the result
+  // branch below ignores a sidechain result.
+  if (event.type === "compact_boundary" && !event.isSidechain) {
+    // The pre-compaction count is stale — the CLI just rewrote the
+    // conversation. Drop it so a later fallback path cannot repaint the old
+    // figure, and reseed the estimator with the CLI's own post_* measurement
+    // (raw tokens, no character guessing) so the ring repaints at the notice
+    // rather than at the next API call. Mirrors doCompact's reset+reseed.
+    sessionLastUsage.delete(sessionId);
+    ctxEstimator.reset();
+    if (typeof event.compactPostTokens === "number" && event.compactPostTokens > 0) {
+      ctxEstimator.setRealTokens(event.compactPostTokens);
+    }
+    // Completion-only relay: the CLI emits no separate "start" boundary, and
+    // the client synthesises the in-progress state when it sees `completed`.
+    // Reuses doCompact's id counter so the two paths can never collide.
+    // Fire-and-forget: onEvent is sync (the runner does not await it), and the
+    // helper already swallows its own errors.
+    void emitCompactionLifecycle(
+      connection,
+      sessionId,
+      `compaction_${++compactionCounter}`,
+      "completed",
+    );
+    const postWindow = getContextWindowForModel(runModelResolved);
+    if (postWindow > 0) {
+      const used = event.compactPostTokens ?? ctxEstimator.getEstimatedTokens();
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          used: Math.min(used, postWindow),
+          size: postWindow,
+        } as any,
+      }).catch(() => {
+        // Best effort — a dropped frame just leaves the ring stale.
+      });
+    }
+  }
+  if (event.type === "result" && !event.isSidechain) {
     // A subagent's own conversation ends with its own result line (flagged
     // isSidechain by the runner). It must NOT overwrite the parent turn's
     // stop reason / error flag / usage accounting — the parent's own result
@@ -3936,8 +4008,12 @@ export function createClaudeCodeAgent(
       });
     }
     // Start the next turn's streamed-text tracking fresh (a result ends a
-    // turn; the harness retry is a new turn within the same prompt).
+    // turn; the harness retry is a new turn within the same prompt). Capture
+    // the just-finished turn's state first so the empty-turn guard can use it.
+    lastTurnStreamedText = turnStreamedText;
+    lastTurnHadToolCall = turnHadToolCall;
     turnStreamedText = false;
+    turnHadToolCall = false;
     // Record the context window Claude Code resolved for this model.
     if (event.contextWindow && event.contextWindow > 0) {
       const cwModel = resolveSessionModel(store, sessionId, runModel);
@@ -4053,6 +4129,7 @@ export function createClaudeCodeAgent(
        }
      } else if (event.type === "tool_use" && event.toolName) {
        ctxEstimator.addToolCall(event.toolName, event.toolInput);
+       if (!event.isSidechain) turnHadToolCall = true;
        const toolCallId = nextToolCallId();
        logger.debug(`Tool call: ${event.toolName}`);
        // TaskCreate/TaskUpdate/TaskList maintain a todo list — mirror it
@@ -5164,6 +5241,102 @@ const drainSteerQueue = async (): Promise<void> => {
           },
        }).catch(() => {});
      }
+
+    // ── Degenerate empty-turn guard ────────────────────────────────────────
+    // The Claude CLI can return a turn that produced nothing: stopReason
+    // "end_turn", input_tokens=0, output_tokens=0, no text, no tool call.
+    // This happens when the model answers a synthetic control frame (e.g. the
+    // [Auto] N subagents finished injection) with the literal "No response
+    // requested." — the CLI treats it as a successful turn, so turnErrored
+    // stays false and the adapter forwards a silent end_turn. The user sees an
+    // empty bubble and the button flips back, forcing a second "go on".
+    //
+    // Fingerprint: end_turn + no streamed text + no tool call this turn +
+    // zero total tokens. On match, re-deliver the same turn once (bounded by
+    // MAX_EMPTY_TURN_RETRIES, reset per prompt so a single user prompt cannot
+    // cascade). If the retry is also empty, surface a visible notice instead
+    // of a silent bubble.
+    //
+    // Guarded out: cancelled turns (stopReason "cancelled"), CLI-local slash
+    // commands (isCliLocalTurn — the CLI services them without an LLM call),
+    // and turns that already errored (handled above).
+    {
+      const isEmptyTurn =
+        turnStopReason === "end_turn" &&
+        !lastTurnStreamedText &&
+        !lastTurnHadToolCall &&
+        !isCliLocalTurn &&
+        ((lastUsage as any)?.input_tokens ?? 0) + ((lastUsage as any)?.output_tokens ?? 0) === 0;
+      if (isEmptyTurn) {
+        const retries = emptyTurnRetries.get(sessionId) ?? 0;
+        if (retries < MAX_EMPTY_TURN_RETRIES) {
+          emptyTurnRetries.set(sessionId, retries + 1);
+          logger.warn(
+            `Degenerate empty turn (end_turn, 0 tokens, no text, no tool call) — ` +
+              `retry ${retries + 1}/${MAX_EMPTY_TURN_RETRIES} for session ${sessionId}`,
+          );
+          const claudeSid = store.getClaudeSessionId(sessionId);
+          const retryContent: import("./claude-runner.js").StdinContentBlock[] = [
+            { type: "text", text: effectivePrompt },
+            ...promptImages,
+          ];
+          let retrySucceeded = false;
+          if (claudeSid) {
+            try {
+              await runner.continueSessionStreamingWithContent(
+                claudeSid,
+                retryContent,
+                onEvent,
+                sessionId,
+                runModel,
+                runEffort,
+                store.getMcpServers(sessionId),
+              );
+              // After the retry, the result branch updated lastTurnStreamedText
+              // and lastTurnHadToolCall. If the retry also produced an empty
+              // turn, both will be false and lastUsage will be zero.
+              retrySucceeded =
+                turnStopReason !== "end_turn" ||
+                lastTurnStreamedText ||
+                lastTurnHadToolCall ||
+                ((lastUsage as any)?.input_tokens ?? 0) + ((lastUsage as any)?.output_tokens ?? 0) > 0;
+            } catch (retryErr) {
+              logger.error(
+                `Empty-turn retry failed for session ${sessionId}: ` +
+                  `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`,
+              );
+            }
+          } else {
+            logger.warn(
+              `Empty-turn retry skipped: no Claude session id for ${sessionId}`,
+            );
+          }
+          if (!retrySucceeded) {
+            // Retry was also empty: surface a visible notice.
+            await connection
+              .sessionUpdate({
+                sessionId,
+                update: {
+                  sessionUpdate: "agent_message_chunk",
+                  content: {
+                    type: "text",
+                    text:
+                      `The agent returned an empty response (no text, no tool calls). ` +
+                      `Send a follow-up prompt to continue.`,
+                  },
+                  messageId: nextCommandMessageId(),
+                  _meta: { commandOutput: true },
+                } as any,
+              })
+              .catch(() => {});
+            logger.info(
+              `Empty-turn guard: retry also empty for session ${sessionId} — surfaced a visible notice.`,
+            );
+          }
+        }
+      }
+    }
+
     // Account token usage and elapsed time toward the active goal.
     const _activeGoal = sessionGoals.get(sessionId);
     if (_activeGoal && !_activeGoal.paused) {

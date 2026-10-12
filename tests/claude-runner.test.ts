@@ -297,6 +297,43 @@ describe("ClaudeRunner", () => {
     });
   });
 
+  describe("compact_boundary parsing", () => {
+    it("forwards the CLI's compact_boundary frame as a typed event", async () => {
+      const lines = [
+        JSON.stringify({
+          type: "system",
+          subtype: "compact_boundary",
+          compact_metadata: { trigger: "auto", pre_tokens: 190000, post_tokens: 18000 },
+        }),
+        JSON.stringify({ type: "result", result: "ok", session_id: "sess-cb" }),
+      ];
+      mockSpawn.mockReturnValue(createStreamMockProcess(lines));
+
+      const events: StreamEvent[] = [];
+      await runner.startSessionStreaming("/tmp", "hi", (e) => events.push(e));
+
+      const cb = events.find((e) => e.type === "compact_boundary");
+      expect(cb).toBeDefined();
+      expect(cb!.compactTrigger).toBe("auto");
+      expect(cb!.compactPreTokens).toBe(190000);
+      expect(cb!.compactPostTokens).toBe(18000);
+      expect(cb!.isSidechain).toBe(false);
+    });
+
+    it("drops a compact_boundary with no compact_metadata", async () => {
+      const lines = [
+        JSON.stringify({ type: "system", subtype: "compact_boundary" }),
+        JSON.stringify({ type: "result", result: "ok", session_id: "sess-cb2" }),
+      ];
+      mockSpawn.mockReturnValue(createStreamMockProcess(lines));
+
+      const events: StreamEvent[] = [];
+      await runner.startSessionStreaming("/tmp", "hi", (e) => events.push(e));
+
+      expect(events.some((e) => e.type === "compact_boundary")).toBe(false);
+    });
+  });
+
   describe("cancel", () => {
     it("should kill a running process", () => {
       const proc = createMockProcess("{}", 0);

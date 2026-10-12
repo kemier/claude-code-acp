@@ -63,7 +63,7 @@ export type StdinContentBlock =
   | { type: string; [key: string]: unknown };
 
 export interface StreamEvent {
-  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user" | "tool_progress";
+  type: "text_delta" | "tool_use" | "result" | "permission_request" | "thinking" | "system_init" | "message_delta" | "assistant" | "user" | "tool_progress" | "compact_boundary";
  text?: string;
  toolName?: string;
  toolInput?: unknown;
@@ -144,6 +144,20 @@ export interface StreamEvent {
    * updates to the parent's tool calls.
    */
   toolSidechain?: boolean;
+  /**
+   * For compact_boundary events: whether the CLI compacted on its own (`auto`)
+   * or because the user asked (`manual`), straight from the frame's
+   * `compact_metadata.trigger`.
+   */
+  compactTrigger?: "manual" | "auto";
+  /** For compact_boundary events: context size before the compaction. */
+  compactPreTokens?: number;
+  /**
+   * For compact_boundary events: context size after. This is the CLI's own
+   * measurement of the fresh conversation, so it seeds the estimator directly
+   * (no character guessing) when the ring is repainted.
+   */
+  compactPostTokens?: number;
 }
 
 const SENSITIVE_FLAGS = new Set(["-p", "--print"]);
@@ -1360,6 +1374,36 @@ export class ClaudeRunner {
         ? parsed.agents.filter((c: any) => typeof c === "string")
         : [];
       onEvent({ type: "system_init", slashCommands, terminalSlashCommands, skillNames, agentNames });
+      return;
+    }
+
+    // Handle system/compact_boundary — the CLI's own compaction report.
+    //
+    // The Claude Code CLI runs its OWN auto-compact (it is disabled only by
+    // DISABLE_COMPACT / DISABLE_AUTO_COMPACT / the autoCompactEnabled setting,
+    // none of which this adapter passes), so it can compact a session out from
+    // under us: the next API call comes back with a tiny prompt count and the
+    // client's context ring drops with no explanation. The CLI does announce it
+    // — this frame carries {"compact_metadata":{trigger,pre_tokens,post_tokens,
+    // …}} — but nothing here matched the subtype, so the announcement was
+    // discarded and the compaction was invisible to the ACP surface.
+    // Forwarding it lets agent.ts relay the same lifecycle the adapter's own
+    // doCompact emits, so the client clears the panel and shows its notice.
+    // Matched BEFORE the stream_event unwrap below: this is a top-level line.
+    if (parsed.type === "system" && parsed.subtype === "compact_boundary") {
+      const md = parsed.compact_metadata;
+      // Mirror the CLI's own guard ([sdkMessageAdapter] drops the frame
+      // without compact_metadata) — a bare boundary with no metadata carries
+      // nothing we can size the ring from.
+      if (md && typeof md === "object") {
+        onEvent({
+          type: "compact_boundary",
+          compactTrigger: md.trigger === "manual" ? "manual" : "auto",
+          ...(typeof md.pre_tokens === "number" ? { compactPreTokens: md.pre_tokens } : {}),
+          ...(typeof md.post_tokens === "number" ? { compactPostTokens: md.post_tokens } : {}),
+          isSidechain: parsed.parent_tool_use_id != null,
+        });
+      }
       return;
     }
 
