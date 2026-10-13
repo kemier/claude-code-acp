@@ -1070,13 +1070,22 @@ export function isAutoCompactEnabled(): boolean {
 // ─── Auto-compact ───────────────────────────────────────────────────────────
 // Trigger compaction when token usage reaches the same threshold Claude Code
 // CLI would use (see getAutoCompactThreshold above), so the two layers agree.
-// The CLI checks mid-turn; Claude CLI manages turns internally here, so we
-// check between turns — after the prompt finishes but before the next user
-// prompt is processed. The compaction replaces the
-// old Claude session with a fresh one seeded with a summary.
+// The CLI checks mid-turn. A long tool loop can cross the threshold before
+// the turn returns, so message_delta also interrupts the live CLI (see
+// midTurnCompactArmed). The between-turn check still runs after the prompt
+// finishes. Compaction replaces the old Claude session with a fresh one
+// seeded with a summary.
 // Track the last reported usage per session so the auto-compact check
 // can run after the turn finishes.
 const sessionLastUsage = new Map<string, { input_tokens: number; output_tokens: number }>();
+// Sessions whose in-flight CLI was SIGINT'd because live usage crossed the
+// auto-compact threshold. Stops a second interrupt while that process exits,
+// and tells doCompact to drop the dying process instead of reusing it.
+const midTurnCompactArmed = new Set<string>();
+// Set for the whole of doCompact, including the "start" emit. The summarizer
+// re-sends the full pre-compact prompt, so a usage callback on that call
+// must not interrupt it.
+const compactionBusy = new Set<string>();
 
 /**
  * Re-emit a usage_update when the session's model is switched mid-conversation.
@@ -2654,6 +2663,8 @@ export function createClaudeCodeAgent(
       const clearedEstimator = sessionEstimators.get(sessionId);
       if (clearedEstimator) clearedEstimator.reset();
       sessionLastUsage.delete(sessionId);
+      midTurnCompactArmed.delete(sessionId);
+      compactionBusy.delete(sessionId);
       // The ring is fed ONLY by usage_update frames, and /clear has no
       // continuation turn that would send one — without this frame the ring
       // keeps the pre-clear value from the last usage_update, so the user sees
@@ -3174,6 +3185,8 @@ export function createClaudeCodeAgent(
     // Emitted for BOTH manual /compact and auto-compact — the client tells them
     // apart by whether it already set `isCompacting` from the user's command.
     const compactionId = `compaction_${++compactionCounter}`;
+    compactionBusy.add(sessionId);
+    try {
     await emitCompactionLifecycle(connection, sessionId, compactionId, "start");
     // Ask the LLM to produce a concise summary of the conversation. The summary
     // seeds a FRESH session (see startSessionStreaming below), so anything the
@@ -3196,7 +3209,16 @@ export function createClaudeCodeAgent(
     const compactPrompt =
       "Please provide a concise summary of our conversation so far, including key decisions, context, and any pending tasks. This summary will be used to continue the conversation with reduced context." +
       todoBlock;
-    try {
+      // Mid-turn compact already SIGINT'd this process. Its next stdout result
+      // is that interrupt, so reusing it returns an empty summary and the
+      // fresh-session call then runs with no events. Drop it and summarize
+      // through a new process that --resumes the same session id.
+      if (midTurnCompactArmed.has(sessionId)) {
+        runner.discardLiveSession(sessionId);
+        logger.info(
+          `Dropped interrupted Claude process before summarizing session ${sessionId}`,
+        );
+      }
       const result = await runner.continueSessionStreaming(
         claudeSid,
         compactPrompt,
@@ -3206,14 +3228,30 @@ export function createClaudeCodeAgent(
         effectiveEffort,
         store.getMcpServers(sessionId),
       );
+      const summary = (result.text ?? "").trim();
+      if (!summary) {
+        throw new Error(
+          "Compaction summary was empty; the interrupted turn did not produce one",
+        );
+      }
       // Now clear the old session and start fresh with the summary.
       const cwd = store.getCwd(sessionId)!;
       store.clearPersistedSession(cwd);
       store.setClaudeSessionId(sessionId, "");
+      const summarySeed =
+        `Previous conversation summary:\n\n${summary}\n\nPlease continue from this context.`;
+      let freshPromptTokens = 0;
       const newResult = await runner.startSessionStreaming(
         cwd,
-        `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
-        () => {},
+        summarySeed,
+        (event) => {
+          if (event.type !== "message_delta" || !event.usage || event.isSidechain) return;
+          const real =
+            (event.usage.input_tokens ?? 0) +
+            (event.usage.cache_read_input_tokens ?? 0) +
+            (event.usage.cache_creation_input_tokens ?? 0);
+          if (real > 0) freshPromptTokens = real;
+        },
         sessionId,
         modelOverride,
         effectiveEffort,
@@ -3236,9 +3274,8 @@ export function createClaudeCodeAgent(
       const estimator = sessionEstimators.get(sessionId);
       if (estimator) {
         estimator.reset();
-        estimator.addText(
-          `Previous conversation summary:\n\n${result.text}\n\nPlease continue from this context.`,
-        );
+        estimator.addText(summarySeed);
+        if (freshPromptTokens > 0) estimator.setRealTokens(freshPromptTokens);
       }
       // Completion drives the client's history clear + transient notice. The
       // client renders the notice text itself, so nothing is sent as assistant
@@ -3293,7 +3330,7 @@ export function createClaudeCodeAgent(
         }
       }
       logger.info(`Compaction succeeded for session ${sessionId}`);
-      return { compactionId, summary: result.text };
+      return { compactionId, summary };
     } catch (compactErr) {
       const detail = compactErr instanceof Error ? compactErr.message : String(compactErr);
       logger.error(`Compaction failed for session ${sessionId}: ${detail}`);
@@ -3301,6 +3338,9 @@ export function createClaudeCodeAgent(
       // error instead of leaving a stuck "Compacting conversation..." banner.
       await emitCompactionLifecycle(connection, sessionId, compactionId, "failed", detail);
       return false;
+    } finally {
+      compactionBusy.delete(sessionId);
+      midTurnCompactArmed.delete(sessionId);
     }
   }
 
@@ -3372,11 +3412,21 @@ export function createClaudeCodeAgent(
    * with the fresh <collaboration_mode> block) can chain a turn on the
    * per-session lock.
    */
+  // A previous turn armed a mid-turn compact and then returned cancelled
+  // before doCompact ran. Drop the SIGINT'd CLI so this prompt does not
+  // write into it. doCompact itself discards when it still owns the flag.
+  const releaseArmedMidTurnCompact = (sessionId: string): void => {
+    if (!midTurnCompactArmed.has(sessionId)) return;
+    runner.discardLiveSession(sessionId);
+    midTurnCompactArmed.delete(sessionId);
+  };
+
   const executePrompt = async (sessionId: string, bodyText: string, modelOverride: string | undefined, effectiveEffort: string | undefined, promptImages: import("./claude-runner.js").StdinContentBlock[] = [], promptGen: number = 0): Promise<PromptResponse> => {
     // Mark this session as having a prompt in flight for the entire executePrompt
     // body (LLM turn + steer drain + auto-compact + return). Cleared when the
     // lock chain settles (below). See sessionPromptInFlight.
     sessionPromptInFlight.add(sessionId);
+    releaseArmedMidTurnCompact(sessionId);
     // Record which generation is now the in-flight one, so a concurrent cancel()
     // targets precisely this prompt (not a later queued one).
     inFlightGen.set(sessionId, promptGen);
@@ -3665,6 +3715,32 @@ export function createClaudeCodeAgent(
         ctxEstimator.setRealTokens(realPrompt);
         lastRealOutputTokens = event.usage.output_tokens ?? lastRealOutputTokens;
         sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
+        // Auto-compact used to wait until the turn returned. A long tool loop
+        // can sit past the threshold for the whole turn. Interrupt this CLI
+        // (not a user cancel: cancelledSessions stays clear) so the post-turn
+        // check compacts and continues the same prompt. runner.cancel resolves
+        // the turn; it does not latch a user cancel.
+        if (
+          !compactionBusy.has(sessionId) &&
+          !midTurnCompactArmed.has(sessionId) &&
+          !isCancelledForGen(sessionId, promptGen) &&
+          isAutoCompactEnabled()
+        ) {
+          const threshold = getAutoCompactThreshold(runModelResolved);
+          if (realPrompt >= threshold) {
+            midTurnCompactArmed.add(sessionId);
+            sessionLastUsage.set(sessionId, {
+              input_tokens: realPrompt,
+              output_tokens: lastRealOutputTokens,
+            });
+            const contextWindow = getContextWindowForModel(runModelResolved);
+            logger.info(
+              `Mid-turn auto-compact for session ${sessionId}: ${realPrompt} >= ${threshold} ` +
+                `(${contextWindow > 0 ? ((realPrompt / contextWindow) * 100).toFixed(1) : "?"}% of ${contextWindow})`,
+            );
+            runner.cancel(sessionId);
+          }
+        }
       }
     }
     // Handle user event (tool results / injected text) — accumulate for
@@ -5036,6 +5112,7 @@ const drainSteerQueue = async (): Promise<void> => {
 
       // Check if this session was cancelled while running
       if (isCancelledForGen(sessionId, promptGen)) {
+        releaseArmedMidTurnCompact(sessionId);
         cancelledSessions.delete(sessionId);
         cancelledGen.delete(sessionId);
         if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);
@@ -5443,6 +5520,7 @@ const drainSteerQueue = async (): Promise<void> => {
     webToolWatchdogs.delete(sessionId);
     // Check if cancelled
     if (isCancelledForGen(sessionId, promptGen)) {
+      releaseArmedMidTurnCompact(sessionId);
       cancelledSessions.delete(sessionId);
       cancelledGen.delete(sessionId);
       if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);

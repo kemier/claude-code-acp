@@ -28,12 +28,24 @@ interface LiveClaudeSession {
   claudeSessionId: string;
   /** model + effort + permission mode captured at spawn. A mismatch forces --resume. */
   spawnKey: string;
+  /** cwd of the spawn. A replacement --resume must use the same directory. */
+  cwd?: string;
   turn: {
     resolve: (result: ClaudeResult) => void;
     reject: (err: Error) => void;
     onEvent: (event: StreamEvent) => void;
     resultText: string;
     sessionId: string;
+    /**
+     * Whose stdout the next `result` belongs to. A resumed CLI drains queued
+     * `<task-notification>` turns before the user message just written to
+     * stdin, and each of those turns emits its own `result`. Treating that
+     * result as ours drops every later tool call.
+     * - `awaiting`: nothing of this prompt seen yet
+     * - `injected`: inside a drained task-notification turn
+     * - `own`: the submitted prompt has started
+     */
+    phase: "awaiting" | "injected" | "own";
   } | null;
   buffer: string;
   stderrText: string;
@@ -846,6 +858,21 @@ export class ClaudeRunner {
     return true;
   }
 
+  /**
+   * Forget the long-lived CLI for this session. The next prompt spawns with
+   * `--resume` instead of writing into a process that was just SIGINT'd.
+   * Mid-turn auto-compact does that: cancel() interrupts the live turn, and
+   * the summarizer must not reuse the dying process.
+   */
+  discardLiveSession(trackingId: string): void {
+    const live = this.liveSessions.get(trackingId);
+    if (live?.cwd) this.lastLiveCwd.set(trackingId, live.cwd);
+    this.dropLiveSession(trackingId);
+  }
+
+  /** cwd of the last process held for a tracking id, including one just discarded. */
+  private lastLiveCwd = new Map<string, string>();
+
   /** Kill an idle persistent CLI. In-flight turns are cancelled via cancel(). */
   private dropLiveSession(trackingId: string): void {
     const live = this.liveSessions.get(trackingId);
@@ -872,6 +899,7 @@ export class ClaudeRunner {
         onEvent,
         resultText: "",
         sessionId: live.claudeSessionId,
+        phase: "awaiting",
       };
       this.runningProcesses.set(live.trackingId, live.proc);
       live.proc.stdin!.write(this.userMessageLine(content));
@@ -907,6 +935,8 @@ export class ClaudeRunner {
       );
       return this.pushLiveTurn(existing, opts.content, opts.onEvent);
     }
+    const cwd = opts.cwd ?? existing?.cwd ?? this.lastLiveCwd.get(opts.trackingId);
+    if (cwd) this.lastLiveCwd.set(opts.trackingId, cwd);
     if (existing) this.dropLiveSession(opts.trackingId);
 
     const args = this.buildStreamJsonArgsWithMcp(
@@ -917,7 +947,7 @@ export class ClaudeRunner {
     );
     logger.debug(`spawn persistent: claude ${maskArgs(args)}`);
     const proc = spawn(this.resolveClaudeBin(), args, {
-      cwd: opts.cwd,
+      cwd,
       env: this.sanitizeEnv(),
       stdio: ["pipe", "pipe", "pipe"],
       // POSIX: own process group so cancel() can signal(-pgid) the whole
@@ -933,6 +963,7 @@ export class ClaudeRunner {
       trackingId: opts.trackingId,
       claudeSessionId: opts.resumeId ?? "",
       spawnKey,
+      cwd,
       turn: null,
       buffer: "",
       stderrText: "",
@@ -1007,6 +1038,70 @@ export class ClaudeRunner {
     return this.pushLiveTurn(live, opts.content, opts.onEvent);
   }
 
+  /**
+   * Classify a stdout `user` line. A resumed CLI writes a drained
+   * `<task-notification>` as its own user message and then a `result`,
+   * before echoing the prompt we submitted. Tool results belong to the
+   * main conversation's own turn.
+   */
+  private streamUserKind(parsed: any): "notification" | "prompt" | "tool_result" | null {
+    if (parsed?.type !== "user" || parsed.parent_tool_use_id != null) return null;
+    const content = parsed.message?.content;
+    const blocks = Array.isArray(content)
+      ? content
+      : typeof content === "string"
+        ? [{ type: "text", text: content }]
+        : [];
+    let text = "";
+    let sawText = false;
+    let sawTool = false;
+    for (const block of blocks) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "tool_result") sawTool = true;
+      if (block.type === "text" && typeof block.text === "string") {
+        sawText = true;
+        text += block.text;
+      }
+    }
+    if (text.trimStart().startsWith("<task-notification>")) return "notification";
+    if (sawTool && !sawText) return "tool_result";
+    if (sawText) return "prompt";
+    return null;
+  }
+
+  /** Parent-turn model output. Sidechain lines belong to a subagent. */
+  private isParentAssistantActivity(parsed: any): boolean {
+    if (!parsed || parsed.parent_tool_use_id != null) return false;
+    if (parsed.type === "assistant") return true;
+    if (parsed.type === "stream_event" && parsed.event && typeof parsed.event === "object") {
+      const inner = parsed.event.type;
+      return inner === "content_block_start" || inner === "content_block_delta";
+    }
+    return false;
+  }
+
+  private noteLiveTurnPhase(
+    turn: NonNullable<LiveClaudeSession["turn"]>,
+    parsed: any,
+  ): void {
+    if (parsed?.parent_tool_use_id != null) return;
+    const kind = this.streamUserKind(parsed);
+    if (kind === "notification" && turn.phase !== "own") {
+      turn.phase = "injected";
+      return;
+    }
+    // A prompt echo while a notification turn is still open is the submitted
+    // message waiting behind that turn. Arming "own" here would let the
+    // notification's result close the prompt.
+    if (kind === "prompt" && turn.phase === "awaiting") {
+      turn.phase = "own";
+      return;
+    }
+    if (turn.phase !== "injected" && this.isParentAssistantActivity(parsed)) {
+      turn.phase = "own";
+    }
+  }
+
   /** Parse one stdout line from a persistent CLI. A `result` ends the turn; the process stays up. */
   private consumeLiveLine(live: LiveClaudeSession, line: string): void {
     let parsed: any;
@@ -1016,15 +1111,38 @@ export class ClaudeRunner {
       return;
     }
     const turn = live.turn;
-    if (turn) this.processStreamLine(parsed, turn.onEvent);
+    if (turn) this.noteLiveTurnPhase(turn, parsed);
+    // A drained task-notification ends with its own `result` before our
+    // prompt starts. Forwarding that result makes the prompt look finished.
+    const drainedNotificationResult =
+      !!turn &&
+      parsed.type === "result" &&
+      parsed.parent_tool_use_id == null &&
+      turn.phase === "injected";
+    if (turn && !drainedNotificationResult) this.processStreamLine(parsed, turn.onEvent);
     if (parsed.session_id) {
       live.claudeSessionId = parsed.session_id;
       if (turn) turn.sessionId = parsed.session_id;
     }
-    if (parsed.result !== undefined && turn) {
+    if (
+      parsed.result !== undefined &&
+      turn &&
+      !drainedNotificationResult &&
+      parsed.parent_tool_use_id == null
+    ) {
       turn.resultText = parsed.result;
     }
+    if (drainedNotificationResult && turn) {
+      turn.phase = "awaiting";
+      logger.info(
+        `Ignoring result for a drained task-notification on ${live.trackingId}; the submitted prompt has not started`,
+      );
+      return;
+    }
     if (parsed.type === "result" && turn) {
+      // A subagent's own conversation ends with a result that carries
+      // parent_tool_use_id. That is not the parent prompt finishing.
+      if (parsed.parent_tool_use_id != null) return;
       turn.sessionId = parsed.session_id ?? turn.sessionId;
       turn.resultText = parsed.result ?? turn.resultText;
       // Clear the turn BEFORE resolving so a follow-up prompt queued on the

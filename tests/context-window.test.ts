@@ -187,6 +187,17 @@ describe("effective window and threshold", () => {
     // threshold (176947) + maxOutput (32000) = 208947 > 196608 -> overflow.
     expect(threshold + getMaxOutputTokens()).toBeGreaterThan(GLM_WINDOW);
   });
+
+  it("treats 91% of a 262144 window as over a 90% override, and 86% as under", () => {
+    // A live turn sat at ~91% (239889/262144) after a previous completion at
+    // 86% (225701). The 90% override must put the threshold between those two.
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "262144";
+    process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = "90";
+    const threshold = getAutoCompactThreshold("qwen3.8-flash-next-coder-iq1_m");
+    expect(threshold).toBe(Math.floor((262144 * 90) / 100));
+    expect(239889 >= threshold).toBe(true);
+    expect(225701 >= threshold).toBe(false);
+  });
 });
 
 describe("auto-compact kill switches", () => {
