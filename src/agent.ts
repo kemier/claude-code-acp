@@ -4920,6 +4920,35 @@ export function createClaudeCodeAgent(
                 if (_matchNames.size === 0) sessionPendingToolNames.delete(sessionId);
               }
             }
+            // Also flip the original subagent in_progress row on approval.
+            // Subagents are in sessionPendingAgents (not sessionPendingToolNames),
+            // so the match above never fires for them.
+            if (isApproved) {
+              const pendingAgents = sessionPendingAgents.get(sessionId);
+              if (pendingAgents) {
+                const permDesc =
+                  typeof (toolInput as Record<string, unknown>).description === "string"
+                    ? (toolInput as Record<string, unknown>).description
+                    : null;
+                if (permDesc) {
+                  for (const [tuId, info] of pendingAgents) {
+                    if (info.description === permDesc) {
+                      connection
+                        .sessionUpdate({
+                          sessionId,
+                          update: {
+                            sessionUpdate: "tool_call_update",
+                            toolCallId: info.acpCallId,
+                            status: "completed",
+                          } as any,
+                        })
+                        .catch(() => {});
+                      break;
+                    }
+                  }
+                }
+              }
+            }
           })
           .catch((err) => {
             logger.error(
