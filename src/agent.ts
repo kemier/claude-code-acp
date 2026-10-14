@@ -6257,47 +6257,74 @@ const drainSteerQueue = async (): Promise<void> => {
         // the OLD block already in the transcript, and a bare user-level
         // "you're in Default now" notice cannot override that strong prior.
         //
-        // On a genuine flip while a turn is in flight, CANCEL the running turn
-        // and re-prompt with the fresh mode's <collaboration_mode> block so the
-        // model immediately perceives the switch and continues in THIS turn.
-        // applyModeChange has already updated sessionCollaborationModes to
-        // `nextCollab`, so executePrompt builds the correct block for the new
-        // mode. We pass buildMidTurnModeChangeNotice(prevWasPlan) as bodyText —
-        // executePrompt prepends the (now-correct) <collaboration_mode> block
-        // on top of it, so the model sees both the authoritative mode
-        // declaration AND an explicit "just switched, do not wait" nudge.
+        // On a genuine flip while a turn is in flight, the DIRECTION decides the
+        // carrier — the two spawns enforce differently:
         //
-        // This mirrors codex-acp's plan-entry interrupt
-        // (CodexAcpServer.applyCollaborationModeChange → interruptSessionTurn):
-        // codex interrupts on plan ENTRY; we interrupt on EITHER genuine flip
-        // (plan→default AND default→plan) so the model always acts on the
-        // current mode without waiting for the user to open a new turn.
+        // • default→plan INTERRUPTS (SIGINT + re-spawn): the running Default
+        //   spawn carries --dangerously-skip-permissions, which overrides
+        //   --permission-mode plan only at SPAWN time — a running turn keeps
+        //   full edit access, so revoking it mid-turn requires a fresh spawn.
+        //   The re-prompt carries buildMidTurnModeChangeNotice(true) under the
+        //   fresh (now-Plan) block executePrompt prepends, so the model sees
+        //   both the authoritative mode declaration AND an explicit "just
+        //   switched, do not wait" nudge.
+        // • plan→default QUEUES the notice on the steer queue: the running
+        //   Plan spawn is ALREADY read-only, so nothing must be revoked — and
+        //   SIGINT would truncate the plan summary the model is still
+        //   streaming (the killed CLI never writes the partial assistant
+        //   message to the resume transcript, so the re-prompt had no plan to
+        //   continue from: premature end_turn + cut-off plan). drainSteerQueue
+        //   chains a follow-up turn at end_turn with the new mode's flags, and
+        //   the model implements with the FULL plan in its transcript.
+        //
+        // (codex-acp interrupts on plan ENTRY only — same asymmetry.)
         const inFlight =
           runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId);
         if (shouldAnnounceModeChange(previousCollabMode, nextCollab) && inFlight) {
-          // The re-prompt's notice describes the NEW mode (the one the turn is
-          // about to run in), NOT the previous one. buildMidTurnModeChangeNotice
-          // takes "is the new mode plan?" — so a Default→Plan flip passes true
-          // ("no more edits") and a Plan→Default flip passes false ("implement
-          // now"). (An earlier revision passed prevWasPlan, the PREVIOUS mode,
-          // which inverted both directions.)
           const newModeIsPlan = nextCollab === PLAN_COLLABORATION_MODE;
-          // Resolve the same model/effort overrides the running turn used, so
-          // the re-prompt does not silently change model or effort.
-          const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-          const repromptEffort = resolveEffort(store, sessionId);
-          logger.info(
-            `Session ${sessionId} mode flip ${previousCollabMode ?? "(none)"} → ${nextCollab} ` +
-              `with a turn in flight — cancelling and re-prompting with the fresh ` +
-              `${newModeIsPlan ? "Plan" : "Default"} <collaboration_mode> block.`,
-          );
-          // SIGINT the running turn and re-prompt with the fresh block.
-          //
-          // Wait for the re-prompt to actually START the LLM turn (not just be
-          // enqueued) before returning, so the client's config_option_update
-          // reflects a turn that is genuinely running in the new mode.
-          await interruptForPlanMode(sessionId, newModeIsPlan, repromptModel, repromptEffort);
-          logger.info(`Session ${sessionId} mode-change re-prompt completed`);
+          if (newModeIsPlan) {
+            // The re-prompt's notice describes the NEW mode (the one the turn
+            // will run in), NOT the previous one.
+            // Resolve the same model/effort overrides the running turn used, so
+            // the re-prompt does not silently change model or effort.
+            const repromptModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
+            const repromptEffort = resolveEffort(store, sessionId);
+            logger.info(
+              `Session ${sessionId} mode flip ${previousCollabMode ?? "(none)"} → ${nextCollab} ` +
+                `with a turn in flight — cancelling and re-prompting with the fresh ` +
+                `Plan <collaboration_mode> block.`,
+            );
+            // SIGINT the running turn and re-prompt with the fresh block.
+            //
+            // Wait for the re-prompt to actually START the LLM turn (not just be
+            // enqueued) before returning, so the client's config_option_update
+            // reflects a turn that is genuinely running in the new mode.
+            await interruptForPlanMode(sessionId, true, repromptModel, repromptEffort);
+            logger.info(`Session ${sessionId} mode-change re-prompt completed`);
+          } else if (!cancelledSessions.has(sessionId)) {
+            // plan→default: queue the notice (see comment above). Mirror
+            // handleSteer's cancel guard: a turn being cancelled discards the
+            // queue anyway (drainSteerQueue), and the user pressing Stop means
+            // they do not want the implementation turn.
+            if (!steerQueues.has(sessionId)) {
+              steerQueues.set(sessionId, []);
+            }
+            const queue = steerQueues.get(sessionId)!;
+            // A second flip in the same turn replaces the earlier notice —
+            // only the latest mode matters.
+            for (let i = queue.length - 1; i >= 0; i -= 1) {
+              if (queue[i].text.startsWith("<collaboration_mode>")) {
+                queue.splice(i, 1);
+              }
+            }
+            queue.push({ text: buildMidTurnModeChangeNotice(false), images: [] });
+            logger.info(
+              `Session ${sessionId} mode flip ${previousCollabMode ?? "(none)"} → ${nextCollab} ` +
+                `with a turn in flight — queued the Default <collaboration_mode> ` +
+                `notice as a steer; the read-only turn keeps streaming and the ` +
+                `drain chains the implementation turn at end_turn.`,
+            );
+          }
         }
       } else {
         // Capture the previous model BEFORE the override is set, so a model

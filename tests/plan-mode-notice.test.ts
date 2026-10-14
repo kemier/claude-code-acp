@@ -35,24 +35,26 @@ describe("collaboration mode change mid-turn", () => {
     expect(shouldAnnounceModeChange("plan", "plan")).toBe(false);
   });
 
-  it("cancels the running turn and re-prompts with the fresh block on a mid-turn flip", () => {
+  it("default→plan interrupts; plan→default queues the notice (no SIGINT, no truncated plan)", () => {
     const src = fs.readFileSync(path.resolve(process.cwd(), "src/agent.ts"), "utf8");
     const idx = src.indexOf("} else if (configId === COLLABORATION_MODE_CONFIG_ID) {");
     expect(idx).toBeGreaterThan(0);
-    const body = src.slice(idx, idx + 5000);
+    const body = src.slice(idx, idx + 7000);
     // Same in-flight test handleSteer uses.
     expect(body).toContain("runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId)");
     // Genuine-flip gate (unchanged).
     expect(body).toContain("shouldAnnounceModeChange(previousCollabMode, nextCollab)");
-    // The re-prompt notice describes the NEW mode (the one the turn will run in),
-    // NOT the previous one. A Default→Plan flip passes true ("no more edits");
-    // a Plan→Default flip passes false ("implement now"). (An earlier revision
-    // passed prevWasPlan, inverting both directions — the model was told to
-    // implement right after being put in plan mode.)
+    // Direction split: entering Plan interrupts (the running Default spawn
+    // keeps edit access until re-spawned); leaving Plan does NOT — SIGINT
+    // truncated the streaming plan summary and lost it from the resume
+    // transcript (the reported premature-end_turn bug).
     expect(body).toContain("const newModeIsPlan = nextCollab === PLAN_COLLABORATION_MODE;");
-    expect(body).toContain("await interruptForPlanMode(sessionId, newModeIsPlan, repromptModel, repromptEffort);");
-    // It no longer pushes onto the steer queue for this path.
-    expect(body).not.toContain("steerQueues");
+    expect(body).toContain("if (newModeIsPlan) {");
+    expect(body).toContain("await interruptForPlanMode(sessionId, true, repromptModel, repromptEffort);");
+    // Leaving Plan rides the steer queue — drainSteerQueue chains the
+    // implementation turn at end_turn with the FULL plan in context.
+    expect(body).toContain("steerQueues");
+    expect(body).toContain("buildMidTurnModeChangeNotice(false)");
   });
 
   it("the shared interruptForPlanMode core SIGINTs the running turn and re-prompts with the fresh block", () => {
