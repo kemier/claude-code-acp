@@ -1,5 +1,7 @@
 # claude-code-acp
 
+> Public release. Published publicly under the MIT License (see [LICENSE](LICENSE)).
+
 [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) bridge for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI.
 
 Use Claude Code with your **Pro / Max subscription** from any ACP-compatible client — Zed, JetBrains IDEs, and more.
