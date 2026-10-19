@@ -110,6 +110,15 @@ describe("stripReplayPromptFraming (unit)", () => {
     ).toBe("ship it");
   });
 
+  it("strips inlined editor selections so the resumed bubble stays the user's words", () => {
+    const replayed =
+      '<ide_selection path="/workspace/cta_scheduler.cu" lines="8">\n' +
+      "__device__ void schedule() {}\n" +
+      "</ide_selection>\n\n" +
+      "讲一下这段的原理";
+    expect(stripReplayPromptFraming(replayed)).toBe("讲一下这段的原理");
+  });
+
   it("only strips leading framing; prose and interior text stay intact", () => {
     const mid = "first line\n[Follow-up instruction from user]\nnot leading, keep me";
     expect(stripReplayPromptFraming(mid)).toBe(mid);

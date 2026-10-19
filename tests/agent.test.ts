@@ -117,8 +117,8 @@ describe("ClaudeCodeAgent", () => {
       });
 
       expect(
-        result.agentCapabilities?.promptCapabilities as unknown as { image: boolean }
-      ).toMatchObject({ image: true });
+        result.agentCapabilities?.promptCapabilities as unknown as { image: boolean; embeddedContext: boolean }
+      ).toMatchObject({ image: true, embeddedContext: true });
     });
 
     it("should advertise no auth methods", async () => {
@@ -296,6 +296,39 @@ describe("ClaudeCodeAgent", () => {
         type: "image",
         source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
       });
+    });
+
+    it("inlines an editor selection resource into the CLI prompt", async () => {
+      await agent.initialize({
+        protocolVersion: 1,
+        clientCapabilities: {},
+        clientInfo: { name: "test", version: "1.0" },
+      });
+      const session = await agent.newSession({
+        cwd: "/tmp",
+        mcpServers: [],
+      });
+
+      await agent.prompt({
+        sessionId: session.sessionId,
+        prompt: [
+          {
+            type: "resource",
+            resource: {
+              uri: "file:///workspace/cta_scheduler.cu#L8:8",
+              text: "__device__ void schedule() {}",
+            },
+          },
+          { type: "text", text: "讲一下这段的原理" },
+        ] as any,
+      });
+
+      const call = capturedRunnerCalls.find((c) => c.kind === "startWithContent");
+      expect(call).toBeDefined();
+      const body = (call!.content as Array<{ text?: string }>)[0].text ?? "";
+      expect(body).toContain('<ide_selection path="/workspace/cta_scheduler.cu" lines="8">');
+      expect(body).toContain("__device__ void schedule() {}");
+      expect(body).toContain("讲一下这段的原理");
     });
 
     it("should degrade an image prompt to a text note on an explicit text-only model", async () => {

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import {
   PROTOCOL_VERSION,
   RequestError,
@@ -121,6 +122,125 @@ function normalizeMcpServers(servers: any[]): McpServerConfig[] {
 let commandMessageCounter = 0;
 function nextCommandMessageId(): string {
   return `cmd_msg_${++commandMessageCounter}`;
+}
+
+/**
+ * One ACP prompt block, narrowed to the fields this adapter reads.
+ * `resource` carries inline text when the client was told `embeddedContext`
+ * is supported. `resource_link` is a path the model can open itself.
+ */
+export interface PromptContextBlock {
+  type: string;
+  text?: string;
+  name?: string;
+  uri?: string | null;
+  resource?: { uri?: string | null; text?: string };
+}
+
+function xmlAttr(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
+}
+
+/** `file://` path plus the `#Lstart:end` fragment Zed/vscode-acp put on a selection. */
+function fileUriParts(uri: string): { path: string; directory: boolean; start: number; end: number } | null {
+  if (!uri.startsWith("file:")) return null;
+  try {
+    const url = new URL(uri);
+    const path = fileURLToPath(url).replace(/[\\/]+$/, "");
+    const directory = url.pathname.endsWith("/");
+    const fragment = decodeURIComponent(url.hash.replace(/^#/, ""));
+    const range = /^L(\d+)(?::(\d+))?$/.exec(fragment);
+    if (!range) {
+      return { path, directory, start: 0, end: 0 };
+    }
+    const start = Number(range[1]);
+    const end = range[2] ? Number(range[2]) : start;
+    return { path, directory, start, end };
+  } catch {
+    return null;
+  }
+}
+
+function formatEmbeddedResource(uri: string | null | undefined, text: string): string {
+  const file = uri ? fileUriParts(uri) : null;
+  if (file && !file.directory && file.start > 0) {
+    const lines = file.start === file.end ? String(file.start) : `${file.start}-${file.end}`;
+    return `<ide_selection path="${xmlAttr(file.path)}" lines="${lines}">\n${text}\n</ide_selection>`;
+  }
+  if (file && !file.directory) {
+    return `<file path="${xmlAttr(file.path)}">\n${text}\n</file>`;
+  }
+  if (file && file.directory) {
+    return `<directory path="${xmlAttr(file.path)}">\n${text}\n</directory>`;
+  }
+  // Clipboard, terminal, diagnostics, and memory already carry their own tags.
+  return text;
+}
+
+function formatResourceLink(name: string | undefined, uri: string | null | undefined): string {
+  const file = uri ? fileUriParts(uri) : null;
+  if (file && !file.directory && file.start > 0) {
+    const lines = file.start === file.end ? String(file.start) : `${file.start}-${file.end}`;
+    return `<ide_selection path="${xmlAttr(file.path)}" lines="${lines}" />`;
+  }
+  if (file && file.directory) {
+    return `<directory path="${xmlAttr(file.path)}" />`;
+  }
+  if (file) {
+    const label = name ? ` name="${xmlAttr(name)}"` : "";
+    return `<file path="${xmlAttr(file.path)}"${label} />`;
+  }
+  if (uri && name) return `[Attached: ${name} ${uri}]`;
+  if (uri) return `[Attached: ${uri}]`;
+  if (name) return `[Attached: ${name}]`;
+  return "";
+}
+
+/**
+ * Flatten an ACP prompt into the single string the Claude CLI receives.
+ *
+ * The CLI has no content-block channel for editor context. Keeping only
+ * `type: "text"` dropped every selection, `@file`, and `@folder`: the chat
+ * pill still said "Selected code: …" while the model was told nothing was
+ * attached. Inline `resource` text (the selection body) and keep a
+ * `resource_link` as a path the model can Read.
+ *
+ * Order matches the client: broader context, then the selection, then the
+ * user's sentence.
+ */
+export function promptBlocksToText(blocks: ReadonlyArray<PromptContextBlock>): string {
+  const parts: string[] = [];
+  for (const block of blocks) {
+    if (block.type === "text") {
+      if (typeof block.text === "string" && block.text.length > 0) {
+        parts.push(block.text);
+      }
+      continue;
+    }
+    if (block.type === "resource") {
+      const resource = block.resource;
+      if (resource && typeof resource.text === "string" && resource.text.length > 0) {
+        parts.push(formatEmbeddedResource(resource.uri, resource.text));
+      }
+      continue;
+    }
+    if (block.type === "resource_link") {
+      const line = formatResourceLink(block.name, block.uri);
+      if (line) parts.push(line);
+    }
+  }
+  return parts.join("\n\n");
+}
+
+/** Text blocks only, in order. Slash commands are detected from this, not from attached context. */
+function promptProse(blocks: ReadonlyArray<PromptContextBlock>): string {
+  return blocks
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("\n");
 }
 
 /**
@@ -861,6 +981,13 @@ export function stripReplayPromptFraming(text: string): string {
   do {
     prev = cur;
     cur = cur.replace(REPLAY_PROMPT_FRAMING_RE, "");
+    // Editor selections and @file/@folder links are inlined into the CLI
+    // prompt (see promptBlocksToText). The chat already shows them as pills;
+    // replaying the tags would paste the selected source into the user bubble.
+    cur = cur.replace(
+      /<ide_selection\b[^>]*>[\s\S]*?<\/ide_selection>\s*|<(?:file|directory)\b[^>]*\/>\s*|<(?:file|directory)\b[^>]*>[\s\S]*?<\/(?:file|directory)>\s*/g,
+      "",
+    );
     // Strip a leading <collaboration_mode> block, then re-apply the framing
     // strip — the mode block and the steer/goal framing can nest (a steered
     // prompt carries BOTH: <collaboration_mode>…</collaboration_mode>\n\n
@@ -5587,7 +5714,12 @@ const drainSteerQueue = async (): Promise<void> => {
             // acpImageBlocksToStdinBlocks + the WithContent runner methods).
             image: true,
             audio: false,
-            embeddedContext: false,
+            // Selections, @file, clipboard, and terminal output arrive as
+            // `resource` blocks with inline text. prompt() folds that text
+            // into the CLI prompt (promptBlocksToText). Without this flag the
+            // client sends a path-only resource_link and the model never sees
+            // the selected code.
+            embeddedContext: true,
           },
           mcpCapabilities: {
             http: false,
@@ -6386,13 +6518,12 @@ const drainSteerQueue = async (): Promise<void> => {
       // claude -p spawn gets the stored --permission-mode.
       runner.setSessionPermissionMode(store.getMode(sessionId) ?? DEFAULT_MODE);
 
-      // Extract text from content blocks
-      let text = prompt
-        .filter((block): block is { type: "text"; text: string } =>
-          block.type === "text"
-        )
-        .map((block) => block.text)
-        .join("\n");
+      // Fold resource / resource_link into the CLI string. A slash command is
+      // detected from the user's text blocks alone: context is prepended, and
+      // a leading <ide_selection> would hide "/ps" from parseSlashCommand.
+      const prose = promptProse(prompt);
+      const merged = promptBlocksToText(prompt);
+      let text = prose.trim().startsWith("/") ? prose : merged;
 
       if (!text.trim()) {
         throw RequestError.invalidParams("Empty prompt text");
