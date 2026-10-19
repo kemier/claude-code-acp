@@ -4100,15 +4100,10 @@ export function createClaudeCodeAgent(
    //   Our estimate tracks actual conversation growth and is accurate.
    // Handle the CLI's OWN native compaction (system/compact_boundary).
   //
-  // The Claude Code CLI runs its own auto-compact — nothing in this adapter
-  // disables it (it is gated only by DISABLE_COMPACT / DISABLE_AUTO_COMPACT /
-  // the autoCompactEnabled setting, none of which we pass). So it can compact
-  // a session out from under us mid-turn: the next API call reports a tiny
-  // input_tokens, the adapter forwards that usage_update, and the client's
-  // context ring drops with no visible cause. The CLI does announce it (the
-  // frame carries compact_metadata with pre/post token counts); this branch
-  // relays that announcement as the same lifecycle our own doCompact emits, so
-  // the client clears the panel and shows its notice instead of a silent drop.
+  // The spawned CLI has DISABLE_AUTO_COMPACT set (see ClaudeRunner.sanitizeEnv)
+  // so this is a fallback for a CLI that still compacts (prompt-too-long, or a
+  // process started before that env). It announces with compact_boundary only
+  // — no start — so the client shows the notice without a "Compacting…" spinner.
   //
   // A subagent (.isSidechain) compacts ITS OWN conversation — relaying that
   // would wipe the parent panel, so it is ignored, exactly as the result

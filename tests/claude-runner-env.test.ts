@@ -107,4 +107,55 @@ describe("ClaudeRunner env preservation (ericai-proxy branch)", () => {
     delete process.env.ANTHROPIC_BASE_URL;
     delete process.env.ANTHROPIC_MODEL;
   });
+
+  it("disables CLI auto-compact on the child so ACP owns the threshold", async () => {
+    const savedAuto = process.env.DISABLE_AUTO_COMPACT;
+    const savedAll = process.env.DISABLE_COMPACT;
+    delete process.env.DISABLE_AUTO_COMPACT;
+    delete process.env.DISABLE_COMPACT;
+
+    const runner = new ClaudeRunner({
+      model: undefined,
+      allowedTools: [],
+      maxTurns: undefined,
+      timeout: 300000,
+      dangerouslySkipPermissions: false,
+    });
+    mockSpawn.mockReturnValue(
+      createMockProcess(JSON.stringify({ result: "ok", session_id: "s1" }))
+    );
+    await runner.startSession("/tmp", "test");
+
+    const spawnEnv = (mockSpawn.mock.calls[0][2] as any).env;
+    expect(spawnEnv.DISABLE_AUTO_COMPACT).toBe("1");
+    expect(spawnEnv.DISABLE_COMPACT).toBeUndefined();
+
+    if (savedAuto === undefined) delete process.env.DISABLE_AUTO_COMPACT;
+    else process.env.DISABLE_AUTO_COMPACT = savedAuto;
+    if (savedAll === undefined) delete process.env.DISABLE_COMPACT;
+    else process.env.DISABLE_COMPACT = savedAll;
+  });
+
+  it("leaves an explicit DISABLE_AUTO_COMPACT from the user alone", async () => {
+    const savedAuto = process.env.DISABLE_AUTO_COMPACT;
+    process.env.DISABLE_AUTO_COMPACT = "0";
+
+    const runner = new ClaudeRunner({
+      model: undefined,
+      allowedTools: [],
+      maxTurns: undefined,
+      timeout: 300000,
+      dangerouslySkipPermissions: false,
+    });
+    mockSpawn.mockReturnValue(
+      createMockProcess(JSON.stringify({ result: "ok", session_id: "s1" }))
+    );
+    await runner.startSession("/tmp", "test");
+
+    const spawnEnv = (mockSpawn.mock.calls[0][2] as any).env;
+    expect(spawnEnv.DISABLE_AUTO_COMPACT).toBe("0");
+
+    if (savedAuto === undefined) delete process.env.DISABLE_AUTO_COMPACT;
+    else process.env.DISABLE_AUTO_COMPACT = savedAuto;
+  });
 });

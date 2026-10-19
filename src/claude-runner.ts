@@ -741,6 +741,19 @@ export class ClaudeRunner {
     if (local && env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS === undefined) {
       env.CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS = "1";
     }
+    // The CLI applies CLAUDE_AUTOCOMPACT_PCT_OVERRIDE to
+    // (window - min(maxOutput, 20000)), then also subtracts a 13k buffer, so
+    // a 90% setting compacts at ~83% of the ring and only then emits
+    // compact_boundary (completed, no in_progress). ACP compacts at that
+    // percent of the full window and emits start before the summary, which is
+    // what shows "Compacting conversation...". Turn the CLI's automatic pass
+    // off on the child only. This process's env is unchanged, so
+    // isAutoCompactEnabled() still follows settings. An explicit
+    // DISABLE_AUTO_COMPACT / DISABLE_COMPACT from the user is left alone.
+    // Manual /compact stays available: only DISABLE_COMPACT turns that off.
+    if (env.DISABLE_COMPACT === undefined && env.DISABLE_AUTO_COMPACT === undefined) {
+      env.DISABLE_AUTO_COMPACT = "1";
+    }
     return env;
   }
 
@@ -1497,14 +1510,10 @@ export class ClaudeRunner {
 
     // Handle system/compact_boundary — the CLI's own compaction report.
     //
-    // The Claude Code CLI runs its OWN auto-compact (it is disabled only by
-    // DISABLE_COMPACT / DISABLE_AUTO_COMPACT / the autoCompactEnabled setting,
-    // none of which this adapter passes), so it can compact a session out from
-    // under us: the next API call comes back with a tiny prompt count and the
-    // client's context ring drops with no explanation. The CLI does announce it
-    // — this frame carries {"compact_metadata":{trigger,pre_tokens,post_tokens,
-    // …}} — but nothing here matched the subtype, so the announcement was
-    // discarded and the compaction was invisible to the ACP surface.
+    // sanitizeEnv sets DISABLE_AUTO_COMPACT on the child so the CLI does not
+    // compact at ~83% of the ring. This remains for a CLI that still compacts
+    // (prompt-too-long, or a process spawned before that env). The frame
+    // carries {"compact_metadata":{trigger,pre_tokens,post_tokens,…}}.
     // Forwarding it lets agent.ts relay the same lifecycle the adapter's own
     // doCompact emits, so the client clears the panel and shows its notice.
     // Matched BEFORE the stream_event unwrap below: this is a top-level line.
