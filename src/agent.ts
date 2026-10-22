@@ -1378,15 +1378,23 @@ class TurnContextEstimator {
   }
 }
 
-/** Send a usage_update with the estimated context size (real-time, mid-turn). */
+/**
+ * Send a usage_update with the context the next request will carry.
+ *
+ * `trailingOutput` is the output of the call whose prompt `estimator` is
+ * holding. That output is not in the prompt count yet; the following request
+ * appends it. Omitting it left the ring on the previous input (for example
+ * 80%) after a max_tokens reply had already filled the window.
+ */
 function sendEstimatedUsage(
   estimator: TurnContextEstimator,
   connection: AgentSideConnection,
   sessionId: string,
   modelId: string | undefined,
+  trailingOutput = 0,
 ): void {
   const contextWindow = getContextWindowForModel(modelId);
-  const estimated = estimator.getEstimatedTokens();
+  const estimated = estimator.getEstimatedTokens() + Math.max(0, trailingOutput);
   // Cap at contextWindow so the UI never shows >100%.
   const capped = Math.min(estimated, contextWindow);
   connection.sessionUpdate({
@@ -3797,16 +3805,26 @@ export function createClaudeCodeAgent(
           (event.usage.input_tokens ?? 0) +
           (event.usage.cache_read_input_tokens ?? 0) +
           (event.usage.cache_creation_input_tokens ?? 0);
-        ctxEstimator.setRealTokens(real);
-        lastRealOutputTokens = event.usage.output_tokens ?? 0;
+        // A synthetic error ("Prompt is too long") reports 0/0. Adopting that
+        // output would wipe the real call's output and the ring would drop
+        // back to the input-only figure. setRealTokens already ignores a
+        // non-positive prompt.
         if (real > 0) {
+          ctxEstimator.setRealTokens(real);
+          lastRealOutputTokens = event.usage.output_tokens ?? 0;
           peakPromptTokens = real;
           if (typeof event.usage.output_tokens === "number") {
             peakOutputTokens = event.usage.output_tokens;
           }
         }
       }
-      sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
+      sendEstimatedUsage(
+        ctxEstimator,
+        connection,
+        sessionId,
+        runModelResolved,
+        ctxEstimator.hasRealTokens() ? lastRealOutputTokens : 0,
+      );
       // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`        // event fires at the START of the final assistant block (after the
       // per-token content_block_delta stream for the same message already
       // arrived). Resetting here would wipe the flag right before the
@@ -3833,12 +3851,21 @@ export function createClaudeCodeAgent(
         if (typeof event.usage.output_tokens === "number") {
           peakOutputTokens = event.usage.output_tokens;
         }
-        sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
+        sendEstimatedUsage(
+          ctxEstimator,
+          connection,
+          sessionId,
+          runModelResolved,
+          lastRealOutputTokens,
+        );
         // Auto-compact used to wait until the turn returned. A long tool loop
         // can sit past the threshold for the whole turn. Interrupt this CLI
         // (not a user cancel: cancelledSessions stays clear) so the post-turn
         // check compacts and continues the same prompt. runner.cancel resolves
         // the turn; it does not latch a user cancel.
+        // Compare prompt + this call's output. The output is what the next
+        // request will carry; the prompt alone can sit at 80% while the
+        // reply has already filled the window.
         if (
           !compactionBusy.has(sessionId) &&
           !midTurnCompactArmed.has(sessionId) &&
@@ -3846,7 +3873,8 @@ export function createClaudeCodeAgent(
           isAutoCompactEnabled()
         ) {
           const threshold = getAutoCompactThreshold(runModelResolved);
-          if (realPrompt >= threshold) {
+          const occupied = realPrompt + lastRealOutputTokens;
+          if (occupied >= threshold) {
             midTurnCompactArmed.add(sessionId);
             sessionLastUsage.set(sessionId, {
               input_tokens: realPrompt,
@@ -3854,8 +3882,8 @@ export function createClaudeCodeAgent(
             });
             const contextWindow = getContextWindowForModel(runModelResolved);
             logger.info(
-              `Mid-turn auto-compact for session ${sessionId}: ${realPrompt} >= ${threshold} ` +
-                `(${contextWindow > 0 ? ((realPrompt / contextWindow) * 100).toFixed(1) : "?"}% of ${contextWindow})`,
+              `Mid-turn auto-compact for session ${sessionId}: ${occupied} >= ${threshold} ` +
+                `(${contextWindow > 0 ? ((occupied / contextWindow) * 100).toFixed(1) : "?"}% of ${contextWindow})`,
             );
             runner.cancel(sessionId);
           }
@@ -4244,9 +4272,12 @@ export function createClaudeCodeAgent(
       ? lastRealOutputTokens
       : outputTokens;
     sessionLastUsage.set(sessionId, { input_tokens: estimatedTokens, output_tokens: trailingOutput });
-    // For the UI: use our real-time estimate (more accurate than cumulative).
-    // Cap at contextWindow so it never shows >100%.
-    const cappedUsed = Math.min(estimatedTokens, contextWindow);
+    // The ring shows the next request's context: this call's prompt plus its
+    // output. The result event's own usage is cumulative across the turn, so
+    // it is not added again — trailingOutput is the last real call's output.
+    // Before any real per-call count, keep the character estimate alone.
+    const ringOutput = ctxEstimator.hasRealTokens() ? lastRealOutputTokens : 0;
+    const cappedUsed = Math.min(estimatedTokens + ringOutput, contextWindow);
      connection.sessionUpdate({
        sessionId,
        update: {
@@ -5280,6 +5311,7 @@ const drainSteerQueue = async (): Promise<void> => {
       // and honors the CLI's DISABLE_AUTO_COMPACT / DISABLE_COMPACT switches,
       // so enabling or tuning compaction in one place affects both layers.
       const lastUsageEntry = sessionLastUsage.get(sessionId);
+      let didAutoCompact = false;
       if (lastUsageEntry && isAutoCompactEnabled()) {
         const threshold = getAutoCompactThreshold(runModelResolved);
         const used = lastUsageEntry.input_tokens + lastUsageEntry.output_tokens;
@@ -5316,6 +5348,7 @@ const drainSteerQueue = async (): Promise<void> => {
          // ring doesn't show the stale count; the continuation's own
          // usage_update (below) repaints it with the fresh session's size.
          if (compactResult && typeof compactResult === 'object') {
+           didAutoCompact = true;
            sessionLastUsage.delete(sessionId);
            const _postCompactEstimate = ctxEstimator.getEstimatedTokens();
            const _postCompactWindow = getContextWindowForModel(runModelResolved);
@@ -5378,15 +5411,17 @@ const drainSteerQueue = async (): Promise<void> => {
                  );
              store.setClaudeSessionId(sessionId, continueResult.sessionId);
              await Promise.all(permissionPromises);
-             // Update usage after continuation
+             // Update usage after continuation. Include that call's output
+             // so the ring does not fall back to the prompt-only figure.
              const contEstimate = ctxEstimator.getEstimatedTokens();
+             const contOutput = ctxEstimator.hasRealTokens() ? lastRealOutputTokens : 0;
              const contContextWindow = getContextWindowForModel(runModelResolved);
-             sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: 0 });
+             sessionLastUsage.set(sessionId, { input_tokens: contEstimate, output_tokens: contOutput });
              await connection.sessionUpdate({
                sessionId,
                update: {
                  sessionUpdate: "usage_update",
-                 used: Math.min(contEstimate, contContextWindow),
+                 used: Math.min(contEstimate + contOutput, contContextWindow),
                  size: contContextWindow,
                } as any,
              }).catch(() => {});
@@ -5421,6 +5456,7 @@ const drainSteerQueue = async (): Promise<void> => {
       // smaller output cap (the 32k cap is what the preflight rejected)
       // and resume the same prompt.
       if (
+        !didAutoCompact &&
         turnErrored &&
         isPromptTooLongMessage(turnErrorText) &&
         isAutoCompactEnabled() &&

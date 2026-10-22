@@ -488,8 +488,30 @@ describe("slash commands & estimator", () => {
       (c: any) => c[0]?.update?.sessionUpdate === "usage_update",
     );
     expect(usage).toBeTruthy();
-    // 118035 + 200 + 100 = 118335 real prompt tokens, reported verbatim.
-    expect(usage[0].update.used).toBe(118335);
+    // 118035 + 200 + 100 prompt, plus this call's 1271 output. The ring is
+    // the next request's context, not the prompt that was just sent.
+    expect(usage[0].update.used).toBe(119606);
+  });
+
+  it("keeps the completed call's output on the ring after a zero-token error", async () => {
+    const sid = await newSession();
+    await prompt(sid, "hello");
+    (conn.sessionUpdate as any).mockClear();
+    capturedOnEvent!({
+      type: "message_delta",
+      usage: { input_tokens: 100_000, output_tokens: 20_000 },
+    });
+    capturedOnEvent!({
+      type: "assistant",
+      apiCallIndex: 1,
+      usage: { input_tokens: 0, output_tokens: 0 },
+    });
+    const usedValues: number[] = (conn.sessionUpdate as any).mock.calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "usage_update")
+      .map((c: any) => c[0].update.used as number);
+    expect(usedValues.length).toBeGreaterThanOrEqual(2);
+    expect(usedValues[0]).toBe(120_000);
+    expect(usedValues[usedValues.length - 1]).toBe(120_000);
   });
 
   it("ignores subagent (sidechain) usage — it is a separate context window", async () => {
