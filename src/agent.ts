@@ -52,7 +52,6 @@ import {
 import { isAbsolute as isAbsolutePath, relative as relativePath, resolve as resolvePath, join as joinPath } from "node:path";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 
 function generateSessionId(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -770,76 +769,6 @@ async function publishGoalSnapshot(
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
 /**
- * Vision capability from the model id. Unknown ids on a native Claude path
- * default to true (empty id); text-only names fail the pattern.
- */
-const VISION_MODEL_NAME_PATTERN =
-  /(^|[^a-z])(claude|gpt-4o|gpt-4\.1|gpt-5|gemini|qwen.*vl|qwen3\.8-27b|llava|glm-4v|glm-4\.5v|phi-3-vision|o1|o3|o4|deepseek-vl|kimi-vl)/i;
-
-/**
- * True when the model serving this session can accept image inputs.
- * Name-pattern only — local/dev does not query an EricAI model catalog.
- */
-export function modelSupportsVision(modelId: string | undefined): boolean {
-  const id = String(modelId ?? "").toLowerCase();
-  if (!id) return true;
-  return VISION_MODEL_NAME_PATTERN.test(id);
-}
-
-const MIME_TO_EXT: Record<string, string> = {
-  "image/png": "png",
-  "image/jpeg": "jpg",
-  "image/jpg": "jpg",
-  "image/gif": "gif",
-  "image/webp": "webp",
-  "image/bmp": "bmp",
-  "image/svg+xml": "svg",
-};
-
-/**
- * Graceful degradation for image prompts when the serving model is text-only
- * (e.g. a proxy base-url override routes "Claude" to a non-multimodal backend).
- * Instead of letting the upstream error on the image blocks, persist each image
- * to a temp file and return a text note describing what was attached and where
- * it lives on disk. The prompt proceeds text-only; the model/user can switch to
- * a vision model and re-attach, or use a tool that routes to one.
- *
- * Mirrors codex-acp's degradeImagePromptForTextOnlyModel and ericli's
- * writePromptImagesToTemp + buildNonVisionImageReminder: never lose the user's
- * input, degrade instead of fail.
- */
-export function degradeImageBlocksForTextOnlyModel(
-  images: Array<{ source: { media_type: string; data: string } }>,
-  sessionId: string,
-): { note: string; tempPaths: string[] } {
-  const tempPaths: string[] = [];
-  const notes: string[] = [];
-  for (let i = 0; i < images.length; i++) {
-    const img = images[i];
-    const mimeType = img.source?.media_type;
-    const data = img.source?.data;
-    let tempPath: string | null = null;
-    if (data) {
-      try {
-        const dir = fs.mkdtempSync(joinPath(os.tmpdir(), `claude-acp-img-${sessionId.slice(0, 8)}-`));
-        const ext = MIME_TO_EXT[mimeType] ?? (mimeType?.split("/")[1] || "png");
-        const dest = joinPath(dir, `image-${i + 1}.${ext}`);
-        tempPath = dest;
-        fs.writeFileSync(dest, Buffer.from(data, "base64"));
-        tempPaths.push(dest);
-      } catch (err) {
-        logger.warn(`Failed to persist attached image to temp file: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    }
-    const pathNote = tempPath ? `Saved to: ${tempPath}` : "(could not persist to disk)";
-    notes.push(
-      `[Attached image #${i + 1} (${mimeType || "unknown"}). The current model does NOT support image input, so you cannot see it. ${pathNote}. If you need to analyze it, ask the user to switch to a vision-capable model and re-attach, or use a tool that routes to one.]`,
-    );
-  }
-  return { note: notes.join("\n"), tempPaths };
-}
-
-/**
  * Models advertised in the ACP picker. When `acpEndpoints` is configured,
  * only healthy labeled endpoints are shown (dual-boot Windows/Ubuntu Strata).
  * Falls back to the static settings list when no endpoint is healthy.
@@ -1131,6 +1060,38 @@ export function getMaxOutputTokens(): number {
   );
 }
 
+const PROMPT_TOO_LONG_RE = /prompt is too long/i;
+
+/**
+ * The CLI's local preflight rejection. The synthetic assistant text is this
+ * sentence; a normal reply that only mentions it is longer.
+ */
+export function isPromptTooLongMessage(text: string | undefined): boolean {
+  if (!text) return false;
+  const trimmed = text.trim();
+  return trimmed.length <= 80 && PROMPT_TOO_LONG_RE.test(trimmed);
+}
+
+/**
+ * Max output for the summary request after "Prompt is too long".
+ *
+ * The CLI refuses a prompt when prompt + maxOutput + the 13k buffer exceed
+ * the window, which is how a full 32k continuation dies after max_tokens.
+ * An 8k summary fits in the headroom that 32k does not. When the measured
+ * prompt is already within 2k of that line, shrink further to the room left.
+ */
+export function summaryOutputCapForOverflow(
+  usedTokens: number,
+  modelId: string | undefined,
+): number {
+  const window = getContextWindowForModel(modelId);
+  const normal = getMaxOutputTokens();
+  const shrunk = Math.min(8192, normal);
+  const room = window - usedTokens - AUTOCOMPACT_BUFFER_TOKENS;
+  if (room >= 2048) return Math.min(shrunk, room);
+  return shrunk;
+}
+
 /**
  * The capacity used for compaction maths.
  *
@@ -1153,7 +1114,9 @@ export function getAutoCompactWindow(modelId: string | undefined): number {
  * a turn whose prompt sits at the threshold AND whose response uses the full
  * maxOutput budget can push `prompt + max_tokens` past the real window, which
  * the backend rejects. The reserve existed to guarantee `threshold + maxOutput
- * <= window`; removing it trades that safety for later compaction.
+ * <= window`; removing it trades that safety for later compaction. A turn
+ * that already overflowed (CLI result "Prompt is too long") is compacted and
+ * resumed instead of ending; see summaryOutputCapForOverflow.
  */
 export function getEffectiveContextWindowSize(modelId: string | undefined): number {
   return getAutoCompactWindow(modelId);
@@ -3287,6 +3250,7 @@ export function createClaudeCodeAgent(
     effectiveEffort: string | undefined,
     announce: boolean,
     skipCompleted: boolean = false,
+    summaryMaxOutputTokens?: number,
   ): Promise<{ compactionId: string; summary: string } | boolean> {
     const claudeSid = store.getClaudeSessionId(sessionId);
     if (!claudeSid) {
@@ -3340,21 +3304,34 @@ export function createClaudeCodeAgent(
       // is that interrupt, so reusing it returns an empty summary and the
       // fresh-session call then runs with no events. Drop it and summarize
       // through a new process that --resumes the same session id.
-      if (midTurnCompactArmed.has(sessionId)) {
+      if (midTurnCompactArmed.has(sessionId) || summaryMaxOutputTokens !== undefined) {
         runner.discardLiveSession(sessionId);
         logger.info(
-          `Dropped interrupted Claude process before summarizing session ${sessionId}`,
+          `Dropped Claude process before summarizing session ${sessionId}`,
         );
       }
-      const result = await runner.continueSessionStreaming(
-        claudeSid,
-        compactPrompt,
-        () => {}, // no streaming events for compact
-        sessionId,
-        modelOverride,
-        effectiveEffort,
-        store.getMcpServers(sessionId),
-      );
+      // The live process was spawned with the normal 32k output cap. A
+      // prompt-too-long recovery must spawn the summary under a smaller cap
+      // or the CLI rejects it the same way.
+      if (summaryMaxOutputTokens !== undefined) {
+        runner.setSpawnEnvOverlay({
+          CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(summaryMaxOutputTokens),
+        });
+      }
+      let result;
+      try {
+        result = await runner.continueSessionStreaming(
+          claudeSid,
+          compactPrompt,
+          () => {}, // no streaming events for compact
+          sessionId,
+          modelOverride,
+          effectiveEffort,
+          store.getMcpServers(sessionId),
+        );
+      } finally {
+        if (summaryMaxOutputTokens !== undefined) runner.setSpawnEnvOverlay(undefined);
+      }
       const summary = (result.text ?? "").trim();
       if (!summary) {
         throw new Error(
@@ -3701,6 +3678,12 @@ export function createClaudeCodeAgent(
     // turn failures to a visible error rather than an empty success.
     let turnErrored = false;
     let turnStopReason: string | undefined;
+    // Text of an isError result (the CLI's "Prompt is too long" sentence).
+    let turnErrorText: string | undefined;
+    // Highest real prompt/output seen this turn. A later synthetic error
+    // message reports 0 tokens and must not wipe these.
+    let peakPromptTokens = 0;
+    let peakOutputTokens = 0;
     // True when this turn forwards a native Claude CLI `local` slash command
     // (/usage, /heapdump, /context, /insights, /recap) that the CLI services
     // itself without an LLM turn. The CLI's output arrives as the `result`
@@ -3817,6 +3800,12 @@ export function createClaudeCodeAgent(
           (event.usage.cache_creation_input_tokens ?? 0);
         ctxEstimator.setRealTokens(real);
         lastRealOutputTokens = event.usage.output_tokens ?? 0;
+        if (real > 0) {
+          peakPromptTokens = real;
+          if (typeof event.usage.output_tokens === "number") {
+            peakOutputTokens = event.usage.output_tokens;
+          }
+        }
       }
       sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
       // NOTE: do NOT reset streamedTextThisMessage here. The `assistant`        // event fires at the START of the final assistant block (after the
@@ -3841,6 +3830,10 @@ export function createClaudeCodeAgent(
       if (realPrompt > 0) {
         ctxEstimator.setRealTokens(realPrompt);
         lastRealOutputTokens = event.usage.output_tokens ?? lastRealOutputTokens;
+        peakPromptTokens = realPrompt;
+        if (typeof event.usage.output_tokens === "number") {
+          peakOutputTokens = event.usage.output_tokens;
+        }
         sendEstimatedUsage(ctxEstimator, connection, sessionId, runModelResolved);
         // Auto-compact used to wait until the turn returned. A long tool loop
         // can sit past the threshold for the whole turn. Interrupt this CLI
@@ -4155,7 +4148,10 @@ export function createClaudeCodeAgent(
     // omit it), so an error_max_turns / failed turn is never silently
     // swallowed as a plain end_turn.
     turnStopReason = event.stopReason;
-    if (event.isError) turnErrored = true;
+    if (event.isError) {
+      turnErrored = true;
+      if (typeof event.text === "string" && event.text.trim()) turnErrorText = event.text;
+    }
     // Surface the CLI's own output for a native `local` command (/usage,
     // /heapdump, /context, /insights, /recap). These are queued-and-drained
     // like a normal prompt (NOT bypassed mid-turn) and the CLI services them
@@ -4285,6 +4281,14 @@ export function createClaudeCodeAgent(
        // streamedTextThisMessage flag (that dedup state belongs to the
        // parent's own messages).
        if (!event.isSidechain) {
+       // The CLI's local overflow rejection arrives as this one sentence.
+       // Don't paint it as the turn's reply; the post-turn path compacts
+       // and resumes. A longer message that merely mentions the phrase
+       // still renders.
+       if (isPromptTooLongMessage(event.text)) {
+         turnErrorText = event.text;
+         return;
+       }
        // In --verbose mode Claude CLI emits BOTH streaming content_block_delta
        // text AND the final assistant message block's full text. To avoid
        // double-counting assistant content in the context estimate, we count
@@ -4761,24 +4765,10 @@ const drainSteerQueue = async (): Promise<void> => {
         // temp-file note and fall back to the argv text path (same graceful
         // degradation the main prompt applies — the upstream would reject
         // image blocks a non-multimodal backend can't parse).
-        let outImages: import("./claude-runner.js").StdinContentBlock[] = steerImages;
-        if (outImages.length > 0) {
-          const steerModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-          if (!modelSupportsVision(steerModel)) {
-            logger.info(
-              `Steer drain on text-only model (${steerModel || "unknown"}): degrading ${outImages.length} image(s) to text notes`,
-            );
-            const { note, tempPaths } = degradeImageBlocksForTextOnlyModel(
-              outImages.filter((b): b is { type: "image"; source: { media_type: string; data: string } } => b.type === "image"),
-              sessionId,
-            );
-            if (tempPaths.length > 0) {
-              logger.info(`Steer drain persisted attached images to temp files: ${tempPaths.join(", ")}`);
-            }
-            steerPrompt = steerPrompt + "\n" + note;
-            outImages = [];
-          }
-        }
+        // Images always go to the CLI. A text-only backend (Strata) does not
+        // see the pixels: the proxy's vision-model describes them and splices
+        // the text back into this same request.
+        const outImages: import("./claude-runner.js").StdinContentBlock[] = steerImages;
 
         if (outImages.length > 0) {
           const steerContent: import("./claude-runner.js").StdinContentBlock[] = [
@@ -5413,6 +5403,78 @@ const drainSteerQueue = async (): Promise<void> => {
        }
       }
 
+      // The CLI's max-output continuation can overflow the window while
+      // input+output is still under the 90% compact threshold. It then
+      // returns success + isError and the text "Prompt is too long", and
+      // the post-turn check above does not compact. Summarize under a
+      // smaller output cap (the 32k cap is what the preflight rejected)
+      // and resume the same prompt.
+      if (
+        turnErrored &&
+        isPromptTooLongMessage(turnErrorText) &&
+        isAutoCompactEnabled() &&
+        !isCliLocalTurn
+      ) {
+        const used = peakPromptTokens + peakOutputTokens;
+        const cap = summaryOutputCapForOverflow(used, runModelResolved);
+        logger.info(
+          `Prompt is too long for session ${sessionId} (used≈${used}); compacting with max output ${cap} and resuming`,
+        );
+        const compactResult = await doCompact(
+          sessionId,
+          connection,
+          runner,
+          store,
+          runModel,
+          runEffort,
+          false,
+          false,
+          cap,
+        );
+        if (compactResult && typeof compactResult === "object") {
+          turnErrored = false;
+          turnErrorText = undefined;
+          try {
+            const claudeSid = store.getClaudeSessionId(sessionId);
+            if (claudeSid) {
+              const continueFraming =
+                `[Context was compacted to fit the model's context window. You are continuing the user's original request. Do not re-read files or re-execute tools that were already used — their results are summarized above. Continue working on the task.]\n\n${effectivePrompt}`;
+              const continueContent = [
+                { type: "text" as const, text: continueFraming },
+                ...(promptImages.length > 0 ? promptImages : []),
+              ];
+              const continueResult = promptImages.length > 0
+                ? await runner.continueSessionStreamingWithContent(
+                    claudeSid,
+                    continueContent,
+                    onEvent,
+                    sessionId,
+                    runModel,
+                    runEffort,
+                    store.getMcpServers(sessionId),
+                  )
+                : await runner.continueSessionStreaming(
+                    claudeSid,
+                    continueFraming,
+                    onEvent,
+                    sessionId,
+                    runModel,
+                    runEffort,
+                    store.getMcpServers(sessionId),
+                  );
+              store.setClaudeSessionId(sessionId, continueResult.sessionId);
+              await Promise.all(permissionPromises);
+            }
+          } catch (resumeErr) {
+            turnErrored = true;
+            turnErrorText = resumeErr instanceof Error ? resumeErr.message : String(resumeErr);
+            logger.error(
+              `Resume after prompt-too-long compact failed for session ${sessionId}: ${turnErrorText}`,
+            );
+          }
+        }
+      }
+
       // If Claude CLI reported an error result (e.g. error_max_turns — the
       // model hit the turn ceiling mid-task), surface it to the user as an
       // agent message instead of a silent end_turn. This is what makes a
@@ -5420,14 +5482,16 @@ const drainSteerQueue = async (): Promise<void> => {
       // does the same by mapping upstream failures to a visible error.
       if (turnErrored) {
         const reason = turnStopReason ?? "error";
+        const overflow = isPromptTooLongMessage(turnErrorText);
         await connection.sessionUpdate({
           sessionId,
           update: {
             sessionUpdate: "agent_message_chunk",
             content: {
               type: "text",
-              text:
-                reason === "error_max_turns"
+              text: overflow
+                ? "Prompt is too long for the context window, and compaction could not recover the turn."
+                : reason === "error_max_turns"
                   ? `Reached the maximum number of turns (${reason}) before finishing. The task may be incomplete — continue to resume.`
                   : `Turn ended with status: ${reason}.`,
             },
@@ -6531,31 +6595,10 @@ const drainSteerQueue = async (): Promise<void> => {
       // `-p <string>` path unchanged (zero behavior change).
       const promptImages = acpImageBlocksToStdinBlocks(prompt);
       const hasImages = promptImages.length > 0;
-
-      // Graceful degradation: if the serving model is text-only (e.g. a proxy
-      // base-url override routes "Claude" to a non-multimodal backend), persist
-      // the images to temp files and replace them with a text note instead of
-      // forwarding image blocks the upstream will reject. Native Claude (no
-      // proxy) is vision-capable, so this is a no-op there — zero behavior
-      // change for the common case. Mirrors codex-acp / pi-acp / ericli.
       if (hasImages) {
-        const currentModel = store.getConfigOverrides(sessionId)["model"] as string | undefined;
-        if (!modelSupportsVision(currentModel)) {
-          logger.info(
-            `Image prompt on text-only model (${currentModel || "unknown"}): degrading ${promptImages.length} image(s) to text notes`,
-          );
-          const { note, tempPaths } = degradeImageBlocksForTextOnlyModel(
-            promptImages.filter((b): b is { type: "image"; source: { media_type: string; data: string } } => b.type === "image"),
-            sessionId,
-          );
-          if (tempPaths.length > 0) {
-            logger.info(`Persisted attached images to temp files: ${tempPaths.join(", ")}`);
-          }
-          // Append the note to the prompt text so the model sees it; clear the
-          // image blocks so the turn uses the text-only `-p <string>` path.
-          promptImages.length = 0;
-          text = text + "\n" + note;
-        }
+        logger.info(
+          `Forwarding ${promptImages.length} image(s) to the CLI; a text-only backend is described by the proxy vision-model`,
+        );
       }
 
       // Read-only slash commands (/ps, /status, /skills, /list-agents, and

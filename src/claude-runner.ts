@@ -712,6 +712,17 @@ export class ClaudeRunner {
     this.endpointEnv = { ...env };
   }
 
+  /**
+   * Extra env for the next CLI spawn only. Used so a summary after
+   * "Prompt is too long" can lower CLAUDE_CODE_MAX_OUTPUT_TOKENS without
+   * changing the cap for later turns. Cleared by the caller.
+   */
+  private spawnEnvOverlay: NodeJS.ProcessEnv | undefined;
+
+  setSpawnEnvOverlay(overlay: NodeJS.ProcessEnv | undefined): void {
+    this.spawnEnvOverlay = overlay;
+  }
+
   private sanitizeEnv(): NodeJS.ProcessEnv {
     // Keep ANTHROPIC_API_KEY and ANTHROPIC_AUTH_TOKEN so claude CLI
     // routes through our CCR gateway → ericai-proxy → EricAI vLLM.
@@ -719,7 +730,8 @@ export class ClaudeRunner {
     // in our setup we use API key auth via the proxy chain.
     // endpointEnv (selected Strata host) overlays process.env so the
     // dual-boot Windows/Ubuntu picker can switch ANTHROPIC_BASE_URL per turn.
-    const env = { ...process.env, ...this.endpointEnv };
+    // spawnEnvOverlay is last so a one-shot max-output cap wins.
+    const env = { ...process.env, ...this.endpointEnv, ...this.spawnEnvOverlay };
     // Never leak the parent Claude Code session into the spawned CLI: claude
     // refuses to run nested when CLAUDECODE is set ("Claude Code cannot be
     // launched inside another Claude Code session", exit code 1). This hits

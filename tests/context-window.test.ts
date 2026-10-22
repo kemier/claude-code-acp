@@ -36,6 +36,8 @@ import {
   getEffectiveContextWindowSize,
   getAutoCompactThreshold,
   isAutoCompactEnabled,
+  isPromptTooLongMessage,
+  summaryOutputCapForOverflow,
 } from "../src/agent.js";
 
 /** GLM-5.2's real window, as advertised by the proxy's /v1/models. */
@@ -222,5 +224,30 @@ describe("auto-compact kill switches", () => {
       process.env.DISABLE_AUTO_COMPACT = v;
       expect(isAutoCompactEnabled()).toBe(true);
     }
+  });
+});
+
+describe("prompt-too-long recovery", () => {
+  it("recognises only the CLI's short overflow sentence", () => {
+    expect(isPromptTooLongMessage("Prompt is too long")).toBe(true);
+    expect(isPromptTooLongMessage("  prompt is too long  ")).toBe(true);
+    expect(isPromptTooLongMessage("The prompt is too long because the file was huge and then the model kept going for several more paragraphs.")).toBe(false);
+    expect(isPromptTooLongMessage("")).toBe(false);
+    expect(isPromptTooLongMessage(undefined)).toBe(false);
+  });
+
+  it("shrinks the summary output cap so prompt + cap + buffer fit", () => {
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "262144";
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "32768";
+    // 189730 input + 32768 output, the turn that overflowed on resume.
+    const cap = summaryOutputCapForOverflow(189_730 + 32_768, "qwen");
+    expect(cap).toBeLessThanOrEqual(8192);
+    expect(222_498 + cap + 13_000).toBeLessThanOrEqual(262_144);
+  });
+
+  it("uses 8192 when the measured usage is still under the normal cap", () => {
+    process.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS = "262144";
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = "32768";
+    expect(summaryOutputCapForOverflow(1000, "qwen")).toBe(8192);
   });
 });

@@ -90,6 +90,28 @@ vi.mock("../src/claude-runner.js", () => {
           });
           return { text: "", sessionId: "claude-uuid-abc" };
         }
+        // CLI local preflight: the continuation after max_tokens does not fit,
+        // so the turn ends with a synthetic "Prompt is too long" result while
+        // usage is still under the compact threshold.
+        if (
+          _prompt.includes("__prompt_too_long__") &&
+          !_prompt.includes("Context was compacted") &&
+          !_prompt.includes("Previous conversation summary")
+        ) {
+          onEvent({
+            type: "message_delta",
+            usage: { input_tokens: 150_000, output_tokens: 32_768 },
+          });
+          onEvent({ type: "text_delta", text: "Prompt is too long", fromAssistantBlock: true });
+          onEvent({
+            type: "result",
+            text: "Prompt is too long",
+            stopReason: "success",
+            isError: true,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          });
+          return { text: "Prompt is too long", sessionId: "claude-uuid-abc" };
+        }
         // Sentinel prompt to simulate a Claude CLI `local` command result
         // (/heapdump, /context): the CLI services it itself with no LLM turn,
         // returning the output as the `result` of a single `result` event with
@@ -158,6 +180,8 @@ vi.mock("../src/claude-runner.js", () => {
       }
     );
     this.cancel = vi.fn();
+    this.discardLiveSession = vi.fn();
+    this.setSpawnEnvOverlay = vi.fn();
     this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(
@@ -507,6 +531,25 @@ describe("slash commands & estimator", () => {
     // Turn 2 starts with turn 1's accumulated content carried forward plus
     // the new prompt, so it must NOT drop below turn 1's final value.
     expect(firstTurn2).toBeGreaterThanOrEqual(lastTurn1);
+  });
+
+  it("compacts and resumes when the CLI reports Prompt is too long", async () => {
+    const sid = await newSession();
+    const res = await prompt(sid, "__prompt_too_long__");
+
+    const calls = (conn.sessionUpdate as any).mock.calls;
+    const titles = calls
+      .map((c: any) => c[0]?.update?.title)
+      .filter((t: unknown) => typeof t === "string");
+    const messages = calls
+      .filter((c: any) => c[0]?.update?.sessionUpdate === "agent_message_chunk")
+      .map((c: any) => c[0].update.content.text as string);
+    expect(titles).toContain("Context compacted");
+    expect(messages.some((m: string) => m.includes("continued"))).toBe(true);
+    expect(messages.some((m: string) => /Turn ended with status/i.test(m))).toBe(false);
+    expect(messages.some((m: string) => m.trim() === "Prompt is too long")).toBe(false);
+    expect(capturedPrompt).toContain("Context was compacted");
+    expect(res.stopReason).toBe("end_turn");
   });
 
   it("surfaces an error_max_turns result to the user instead of a silent end_turn", async () => {

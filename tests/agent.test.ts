@@ -279,14 +279,10 @@ describe("ClaudeCodeAgent", () => {
       expect(withContentCalls).toHaveLength(1);
       expect(capturedRunnerCalls.some((c) => c.kind === "start")).toBe(false);
 
-      // The image block is forwarded as an Anthropic image block. This harness
-      // sets NO model override, so the resolved model is `undefined` →
-      // modelSupportsVision(undefined) is `true` (native Claude = vision-capable
-      // default), so the image is NOT degraded and is forwarded intact. The
-      // degrade path (degradeImageBlocksForTextOnlyModel) only fires for an
-      // explicit text-only model override — see the dedicated text-only test
-      // below. The text block carries the <collaboration_mode> Default-mode
-      // preamble the adapter prepends + the user's question.
+      // The image block is forwarded as an Anthropic image block. A text-only
+      // backend does not see the pixels: the proxy vision-model describes them.
+      // The text block carries the <collaboration_mode> Default-mode preamble
+      // the adapter prepends + the user's question.
       const [textBlock, imageBlock] = withContentCalls[0].content;
       expect(textBlock.type).toBe("text");
       expect(textBlock.text).toContain("What's in this picture?");
@@ -331,7 +327,7 @@ describe("ClaudeCodeAgent", () => {
       expect(body).toContain("讲一下这段的原理");
     });
 
-    it("should degrade an image prompt to a text note on an explicit text-only model", async () => {
+    it("forwards an image even when the session model is text-only", async () => {
       await agent.initialize({
         protocolVersion: 1,
         clientCapabilities: {},
@@ -341,9 +337,7 @@ describe("ClaudeCodeAgent", () => {
         cwd: "/tmp",
         mcpServers: [],
       });
-      // Pin an explicit text-only model so the degrade path (not the
-      // vision-capable default) is exercised. The name matches no entry in
-      // VISION_MODEL_NAME_PATTERN, so modelSupportsVision → false.
+      // Text-only name. The image still goes to the CLI; the proxy describes it.
       agent.setSessionConfigOption({
         sessionId: session.sessionId,
         configId: "model",
@@ -367,12 +361,13 @@ describe("ClaudeCodeAgent", () => {
         (c) => c.kind === "startWithContent"
       );
       expect(withContentCalls).toHaveLength(1);
-      const [textBlock] = withContentCalls[0].content;
+      const [textBlock, imageBlock] = withContentCalls[0].content;
       expect(textBlock.type).toBe("text");
       expect(textBlock.text).toContain("What's in this picture?");
-      // Text-only model: the image is degraded to that note, NOT forwarded.
-      expect(withContentCalls[0].content.some((b: any) => b.type === "image")).toBe(false);
-      expect(textBlock.text).toContain("[Attached image #1");
+      expect(imageBlock).toEqual({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" },
+      });
     });
 
     it("should route text-only prompts through the stream-json stdin path", async () => {
