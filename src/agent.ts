@@ -2192,13 +2192,12 @@ export function createClaudeCodeAgent(
   const sessionPendingToolNames = new Map<string, Map<string, string>>();
   // Background Bash commands: a Bash tool_use with run_in_background:true
   // returns an immediate "Command running in background" tool_result within
-  // the SAME turn — so the model only ever saw the launch ack, and (in headless
-  // `claude -p` mode) the CLI never re-injects the later completion, so the
-  // model keeps believing the command is running ("the sweep is still going").
-  // Record each backgrounded command here so the post-turn flush can detect
-  // the completion (a later tool_result reusing the same tool_use_id, or a
-  // <task-notification> for it) and inject a synthetic user message with the
-  // final output — mirroring the subagent <task-notification> auto-follow-up.
+  // the SAME turn. The interactive CLI (and a live `claude -p` stream-json
+  // process) later opens its own turn when the command finishes: it enqueues
+  // a `<task-notification>` and, if no prompt is in flight, dequeues it as a
+  // user message and runs the model. Record each command so that turn can be
+  // relayed. Do not invent a "still running" follow-up at end_turn — that
+  // holds a turn open and the real notification is absorbed into it.
   // Maps sessionId → (Claude tool_use_id → { acpCallId, command, startedAt }).
   const sessionBackgroundBash = new Map<string, Map<string, { acpCallId: string; command: string; startedAt: number }>>();
   // sessionId → true once loadSession's transcript replay has rehydrated
@@ -4039,7 +4038,9 @@ export function createClaudeCodeAgent(
     const notifHit = (t: string): string | null => {
       if (!t || !/<task-notification>/i.test(t)) return null;
       for (const [tuId, info] of bg) {
-        if (info.command && t.includes(info.command)) {
+        // The CLI's notification names the tool_use_id, not the shell text
+        // (`<tool-use-id>…</tool-use-id>`, summary is the description).
+        if ((info.command && t.includes(info.command)) || t.includes(tuId)) {
           bg.delete(tuId);
           if (bg.size === 0) sessionBackgroundBash.delete(sessionId);
           return info.command;
@@ -4404,12 +4405,9 @@ export function createClaudeCodeAgent(
          pendingNames.set(event.toolUseId, event.toolName);
          // A backgrounded Bash command resolves its launch-ack tool_result
          // within the same turn (so the pending-tool row flips completed and
-         // disappears from sessionPendingTools), but the model never learns
-         // the command FINISHED — in headless `claude -p` the CLI does not
-         // re-inject the later completion. Record it so the post-turn flush
-         // can detect completion and inject the final output (Option B:
-         // background-Bash completion awareness, mirroring the subagent
-         // <task-notification> auto-follow-up). Only Bash with
+         // disappears from sessionPendingTools). The CLI notifies the model
+         // later, on its own turn, when the command finishes. Record it so
+         // that idle `<task-notification>` can be relayed. Only Bash with
          // run_in_background:true — foreground Bash is not tracked.
          if (event.toolName === "Bash") {
            const bgInput = (event.toolInput ?? {}) as Record<string, unknown>;
@@ -5103,42 +5101,34 @@ const drainSteerQueue = async (): Promise<void> => {
         }
       }
 
-      // ── Background Bash completion injection (Option B) ──────────────────
-      // A backgrounded Bash command's launch-ack ("Command running in
-      // background…") is what the model saw this turn. In headless `claude -p`
-      // the CLI never re-injects the later completion, so without this the
-      // model keeps believing the command is still running — the exact
-      // "the sweep is still going" staleness. Two cases:
-      //   (a) COMPLETED this turn — collectCompletedBackgroundBash captured the
-      //       completion tool_result / <task-notification>; inject the output.
-      //   (b) STILL PENDING at end_turn — completion did not surface (premature
-      //       end_turn); inject a status-only note so the model is not left
-      //       believing it is still running.
+      // ── Background Bash (interactive CLI semantic) ─────────────────────
+      // The launch-ack ("Command running in background…") is all the model
+      // saw. A live CLI does not get a follow-up at end_turn. When the
+      // command finishes it enqueues `<task-notification>` and, if stdin is
+      // still open and no prompt is in flight, starts that turn itself
+      // (observed: enqueue then dequeue ~50ms later, then the model reply).
+      // Injecting "not yet reported" here holds a turn open, so the real
+      // notification is absorbed_mid_turn into the wrong prompt.
+      //   (a) The completion already arrived after this turn's result — the
+      //       CLI did not run a model turn for it. Inject the output.
+      //   (b) Still running — leave the process idle and relay the CLI's
+      //       own notification turn when it arrives.
       {
         const doneList = backgroundBashCompletedForTurn.get(sessionId) ?? [];
         const pendingList = backgroundBashPendingForTurn.get(sessionId) ?? [];
         backgroundBashCompletedForTurn.delete(sessionId);
         backgroundBashPendingForTurn.delete(sessionId);
-        if (doneList.length > 0 || pendingList.length > 0) {
-          let followUpText: string;
-          if (doneList.length > 0) {
-            const cap = 2000;
-            const body = doneList
-              .map(
-                (d) =>
-                  `- ${d.command} (completed via ${d.via}):\n${d.output.length > cap ? d.output.slice(0, cap) + " …[truncated]" : d.output}`,
-              )
-              .join("\n");
-            followUpText =
-              `[Auto] The following background command(s) you started have finished. ` +
-              `Here are their results — please incorporate them and continue. Do not assume they are still running:\n${body}`;
-          } else {
-            followUpText =
-              `[Auto] Note: the following background command(s) you started have not yet reported ` +
-              `a completion this turn — they may still be running or their result may not have been ` +
-              `delivered. Before asserting they are still in progress, verify their status (e.g. run ` +
-              `the relevant command or check the output) rather than assuming.\n- ${pendingList.join("\n- ")}`;
-          }
+        if (doneList.length > 0) {
+          const cap = 2000;
+          const body = doneList
+            .map(
+              (d) =>
+                `- ${d.command} (completed via ${d.via}):\n${d.output.length > cap ? d.output.slice(0, cap) + " …[truncated]" : d.output}`,
+            )
+            .join("\n");
+          const followUpText =
+            `[Auto] The following background command(s) you started have finished. ` +
+            `Here are their results — please incorporate them and continue. Do not assume they are still running:\n${body}`;
           const count = autoFollowUpCount.get(sessionId) ?? 0;
           if (count < AUTO_FOLLOW_UP_CAP) {
             autoFollowUpCount.set(sessionId, count + 1);
@@ -5152,8 +5142,7 @@ const drainSteerQueue = async (): Promise<void> => {
                 .catch(() => { /* non-fatal */ });
               logger.info(
                 `Background Bash completion injection ${count + 1}/${AUTO_FOLLOW_UP_CAP} ` +
-                  `delivering ${doneList.length} result(s) / ${pendingList.length} pending as its own turn ` +
-                  `for session ${sessionId}.`,
+                  `delivering ${doneList.length} result(s) for session ${sessionId}.`,
               );
               permissionPromises.length = 0;
               try {
@@ -5187,7 +5176,29 @@ const drainSteerQueue = async (): Promise<void> => {
               `Background Bash completion injection skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
             );
           }
+        } else if (pendingList.length > 0) {
+          logger.info(
+            `Background command(s) still running for session ${sessionId} ` +
+              `(${pendingList.length}); leaving the CLI idle until its task-notification.`,
+          );
         }
+        const armIdleBackgroundNotification = (): void => {
+          if ((sessionBackgroundBash.get(sessionId)?.size ?? 0) === 0) return;
+          if (runner.hasIdleNotificationWaiter(sessionId)) return;
+          runner.waitForIdleNotification(sessionId, onEvent).then(
+            (waited) => {
+              if (waited.superseded) return;
+              armIdleBackgroundNotification();
+            },
+            (waitErr) => {
+              logger.error(
+                `Idle task-notification wait failed for session ${sessionId}: ` +
+                  `${waitErr instanceof Error ? waitErr.message : String(waitErr)}`,
+              );
+            },
+          );
+        };
+        armIdleBackgroundNotification();
       }
 
       // Post-turn normal-tool flush. Tools whose tool_result never arrived

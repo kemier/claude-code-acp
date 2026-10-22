@@ -20,11 +20,11 @@ vi.mock("../src/validation.js", () => ({
  *
  * In headless `claude -p` the CLI returns an immediate "Command running in
  * background…" tool_result for a `run_in_background: true` Bash command and
- * never re-injects the later completion — so the model keeps believing the
- * command is still running ("the sweep is still going"). The adapter must
- * detect the completion (a second tool_result reusing the same tool_use_id, or
- * a <task-notification>) and inject a synthetic user message with the final
- * output, mirroring the subagent <task-notification> auto-follow-up.
+ * delivers the later completion as its own `<task-notification>` turn when
+ * the process is idle. If that completion is already in hand when the turn
+ * ends (no model turn followed it), the adapter injects the output. If the
+ * command is still running, it must NOT inject a "still pending" turn — that
+ * holds the process busy and the CLI absorbs the real notification into it.
  *
  * The mock stream fires the events the runner would: the tool_use (launch),
  * the launch-ack tool_result (same turn), the result/end_turn, and a SEPARATE
@@ -67,6 +67,8 @@ vi.mock("../src/claude-runner.js", () => {
     this.setSessionPermissionMode = vi.fn();
     this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+    this.hasIdleNotificationWaiter = vi.fn().mockReturnValue(false);
+    this.waitForIdleNotification = vi.fn().mockResolvedValue({ text: "", sessionId: "uuid-1", superseded: true });
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(
       (_cwd: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
         this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)
@@ -135,7 +137,8 @@ describe("Background Bash completion injection (Option B)", () => {
 
   it("does NOT inject a launch-ack as a completion (same tool_use_id, non-completion text)", async () => {
     // Replace the mock so the ONLY user event is the launch-ack (no separate
-    // completion). The pending fallback fires instead of a false "finished".
+    // completion). The turn must end without a synthetic follow-up; the
+    // adapter arms an idle wait for the CLI's own task-notification.
     vi.resetModules();
     vi.doMock("../src/claude-runner.js", () => {
       const MockClaudeRunner = vi.fn().mockImplementation(function (this: any) {
@@ -150,6 +153,8 @@ describe("Background Bash completion injection (Option B)", () => {
         this.setSessionPermissionMode = vi.fn();
         this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
         this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+        this.hasIdleNotificationWaiter = vi.fn().mockReturnValue(false);
+        this.waitForIdleNotification = vi.fn().mockResolvedValue({ text: "", sessionId: "uuid-2", superseded: true });
         this.startSessionStreamingWithContent = vi.fn().mockImplementation(
           (_cwd: string, _content: any, _onEvent: any, _t?: string, _m?: string, _e?: string, _mcp?: any) =>
             this.startSessionStreaming(_cwd, "", _onEvent, _t, _m, _e)
@@ -173,12 +178,12 @@ describe("Background Bash completion injection (Option B)", () => {
       .map((c: unknown[]) => c?.[0]?.update)
       .filter((u: any) => u?.sessionUpdate === "user_message_chunk");
     const synthetic = userChunks.find((u: any) =>
-      typeof u?.content?.text === "string" && u.content.text.includes("background command"),
+      typeof u?.content?.text === "string" &&
+      (u.content.text.includes("not yet reported") || u.content.text.includes("have finished")),
     );
-    // A status-only pending note fires, NOT a false "have finished" claim.
-    expect(synthetic).toBeTruthy();
-    expect(synthetic.content.text).not.toContain("have finished");
-    expect(synthetic.content.text).toContain("long-job.sh");
-    expect(synthetic.content.text).toMatch(/not yet reported|may still be running/i);
+    expect(synthetic).toBeFalsy();
+    const { ClaudeRunner } = await import("../src/claude-runner.js");
+    const runner = (ClaudeRunner as any).mock.results.at(-1)?.value;
+    expect(runner.waitForIdleNotification).toHaveBeenCalled();
   }, 20_000);
 });

@@ -58,6 +58,8 @@ vi.mock("../src/claude-runner.js", () => {
     this.setSessionPermissionMode = vi.fn();
     this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
+    this.hasIdleNotificationWaiter = vi.fn().mockReturnValue(false);
+    this.waitForIdleNotification = vi.fn().mockResolvedValue({ text: "", sessionId: "uuid-1", superseded: true });
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(
       (_cwd: string, _content: any, _onEvent: any, _t?: string, _m?: string, _e?: string, _mcp?: any) =>
         this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _t, _m, _e)

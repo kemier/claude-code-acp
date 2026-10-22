@@ -18,6 +18,11 @@ export interface McpServerConfig {
 export interface ClaudeResult {
   text: string;
   sessionId: string;
+  /**
+   * An idle task-notification wait was replaced or dropped because a newer
+   * wait was armed. The caller must not treat this as a finished command.
+   */
+  superseded?: boolean;
 }
 
 /** One long-lived `claude -p --input-format stream-json` process for an ACP session. */
@@ -46,6 +51,8 @@ interface LiveClaudeSession {
      * - `own`: the submitted prompt has started
      */
     phase: "awaiting" | "injected" | "own";
+    /** Resolves when this turn's resolve/reject runs, even if the caller ignores the result. */
+    done: Promise<void>;
   } | null;
   buffer: string;
   stderrText: string;
@@ -854,6 +861,122 @@ export class ClaudeRunner {
    */
   private liveSessions = new Map<string, LiveClaudeSession>();
 
+  /**
+   * While the persistent CLI is idle, a finished background command makes the
+   * CLI itself start a turn: a `<task-notification>` user message, then the
+   * model's reply, then `result`. Nothing is waiting on that stdout unless a
+   * prompt is in flight, so the turn used to be dropped. One waiter per
+   * tracking id relays it.
+   */
+  private idleWaiters = new Map<
+    string,
+    {
+      onEvent: (event: StreamEvent) => void;
+      resolve: (result: ClaudeResult) => void;
+      reject: (err: Error) => void;
+    }
+  >();
+
+  /**
+   * Relay the next idle `<task-notification>` turn on this process. Resolves
+   * with `superseded` when another wait replaces this one. The CLI keeps
+   * stdin open, so this is the interactive-terminal wake-up: the process
+   * stays up, and the turn starts only when the command finishes.
+   */
+  waitForIdleNotification(
+    trackingId: string,
+    onEvent: (event: StreamEvent) => void,
+  ): Promise<ClaudeResult> {
+    const previous = this.idleWaiters.get(trackingId);
+    if (previous) {
+      this.idleWaiters.delete(trackingId);
+      previous.resolve({ text: "", sessionId: "", superseded: true });
+    }
+    return new Promise((resolve, reject) => {
+      this.idleWaiters.set(trackingId, { onEvent, resolve, reject });
+    });
+  }
+
+  hasIdleNotificationWaiter(trackingId: string): boolean {
+    return this.idleWaiters.has(trackingId);
+  }
+
+  /** Parent user text, or "" when the line is not a parent user message. */
+  private parentUserText(parsed: any): string {
+    if (!parsed || parsed.type !== "user" || parsed.parent_tool_use_id != null) return "";
+    const content = parsed.message?.content;
+    const blocks = Array.isArray(content)
+      ? content
+      : typeof content === "string"
+        ? [{ type: "text", text: content }]
+        : [];
+    let text = "";
+    for (const block of blocks) {
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "text" && typeof block.text === "string") text += block.text;
+    }
+    return text;
+  }
+
+  /** A background task finished and the CLI is opening its own follow-up turn. */
+  private isIdleNotificationStart(parsed: any): boolean {
+    if (!parsed || parsed.parent_tool_use_id != null) return false;
+    if (parsed.type === "system" && parsed.subtype === "task_notification") return true;
+    return this.parentUserText(parsed).includes("<task-notification>");
+  }
+
+  /**
+   * Attach onEvent/resolve to a live process. `done` settles when the turn
+   * resolve or reject runs, so a later prompt can wait out a notification
+   * turn instead of SIGTERM-ing the process.
+   */
+  private attachTurn(
+    live: LiveClaudeSession,
+    onEvent: (event: StreamEvent) => void,
+    resolve: (result: ClaudeResult) => void,
+    reject: (err: Error) => void,
+    phase: "awaiting" | "own",
+  ): void {
+    let finishDone = (): void => {};
+    const done = new Promise<void>((r) => {
+      finishDone = r;
+    });
+    let settled = false;
+    const once = (): void => {
+      if (settled) return;
+      settled = true;
+      finishDone();
+    };
+    live.turn = {
+      resolve: (result) => {
+        once();
+        resolve(result);
+      },
+      reject: (err) => {
+        once();
+        reject(err);
+      },
+      onEvent,
+      resultText: "",
+      sessionId: live.claudeSessionId,
+      phase,
+      done,
+    };
+    this.runningProcesses.set(live.trackingId, live.proc);
+  }
+
+  /** If no prompt is in flight, a CLI task-notification turn becomes the active turn. */
+  private adoptIdleNotification(live: LiveClaudeSession, parsed: any): void {
+    if (live.turn) return;
+    const waiter = this.idleWaiters.get(live.trackingId);
+    if (!waiter || !this.isIdleNotificationStart(parsed)) return;
+    this.idleWaiters.delete(live.trackingId);
+    logger.info(
+      `CLI task-notification arrived while idle on ${live.trackingId}; relaying that turn`,
+    );
+    this.attachTurn(live, waiter.onEvent, waiter.resolve, waiter.reject, "own");
+  }
+
   private userMessageLine(content: StdinContentBlock[]): string {
     return (
       JSON.stringify({
@@ -918,15 +1041,7 @@ export class ClaudeRunner {
     onEvent: (event: StreamEvent) => void,
   ): Promise<ClaudeResult> {
     return new Promise((resolve, reject) => {
-      live.turn = {
-        resolve,
-        reject,
-        onEvent,
-        resultText: "",
-        sessionId: live.claudeSessionId,
-        phase: "awaiting",
-      };
-      this.runningProcesses.set(live.trackingId, live.proc);
+      this.attachTurn(live, onEvent, resolve, reject, "awaiting");
       live.proc.stdin!.write(this.userMessageLine(content));
     });
   }
@@ -947,8 +1062,14 @@ export class ClaudeRunner {
     effortOverride?: string;
     mcpServers?: McpServerConfig[];
   }): Promise<ClaudeResult> {
-    const existing = this.liveSessions.get(opts.trackingId);
     const spawnKey = this.liveSpawnKey(opts.modelOverride, opts.effortOverride);
+    let existing = this.liveSessions.get(opts.trackingId);
+    // A task-notification turn is already on this process. Wait it out.
+    // canReuseLive is false while a turn is set, and the next branch would
+    // SIGTERM the process and lose the CLI's own follow-up.
+    if (existing?.turn && !opts.replace && existing.spawnKey === spawnKey) {
+      return existing.turn.done.then(() => this.runPersistentTurn(opts));
+    }
     if (
       !opts.replace &&
       existing &&
@@ -1135,6 +1256,7 @@ export class ClaudeRunner {
     } catch {
       return;
     }
+    if (!live.turn) this.adoptIdleNotification(live, parsed);
     const turn = live.turn;
     if (turn) this.noteLiveTurnPhase(turn, parsed);
     // A drained task-notification ends with its own `result` before our
