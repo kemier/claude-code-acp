@@ -2150,6 +2150,24 @@ export function createClaudeCodeAgent(
   // queue behind the active turn as the user expects.
   const sessionPromptLocks = new Map<string, Promise<unknown>>();
 
+  // sessionId -> a mid-turn default→plan flip that interrupted the in-flight
+  // prompt (interruptForPlanMode). The flip SIGINTs the running turn and
+  // re-prompts internally, so WITHOUT a hold the victim prompt() resolves the
+  // moment its turn dies: the client sees promptEnd (button flips to Send,
+  // and a "Turn ended with status: error_during_execution" line lands in the
+  // chat) while the re-prompted turn streams on for minutes with no way to
+  // Stop it. The hold makes the victim prompt() await the re-prompt and
+  // return ITS result, so the client-side turn spans the interrupt.
+  // victimGen ties the hold to exactly one prompt generation: only the
+  // prompt() whose turn was SIGINT'd claims it; later prompts have a greater
+  // generation and never match. An unclaimed hold (the victim was an internal
+  // turn whose prompt() had already returned, e.g. a goal-eval continuation)
+  // is dropped when the re-prompt settles.
+  const modeFlipHolds = new Map<
+    string,
+    { victimGen: number; result: Promise<PromptResponse> }
+  >();
+
   // True for the entire duration of a executePrompt() call — from entry through
   // the LLM turn, steer drain, auto-compact, and the end_turn return. Unlike
   // runner.isRunning() (which flips false the moment the Claude subprocess
@@ -3491,6 +3509,10 @@ export function createClaudeCodeAgent(
     repromptEffort: string | undefined,
   ): Promise<unknown> => {
     const repromptText = buildMidTurnModeChangeNotice(planActive);
+    // Capture the generation of the prompt this SIGINT is about to kill BEFORE
+    // cancelling, so its prompt() can be held across the re-prompt (see
+    // modeFlipHolds) instead of resolving early.
+    const victimGen = inFlightGen.get(sessionId);
     // SIGINT the running Claude subprocess (keeps the session id valid).
     // The current executePrompt settles with stopReason:"cancelled"; the
     // re-prompt chains after it on the per-session lock.
@@ -3512,6 +3534,23 @@ export function createClaudeCodeAgent(
     );
     // Keep the lock chain alive for any further prompts queued behind.
     sessionPromptLocks.set(sessionId, repromptLock.catch(() => {}));
+    // Hold the victim prompt() on the re-prompt's outcome (see modeFlipHolds).
+    // The victim settles as soon as the SIGINT lands, but the client must not
+    // see promptEnd until the re-prompted turn finishes — otherwise the button
+    // flips to Send while the new turn is still streaming.
+    if (victimGen !== undefined) {
+      const held: Promise<PromptResponse> = repromptLock.catch(
+        (): PromptResponse => ({ stopReason: "end_turn" }),
+      );
+      modeFlipHolds.set(sessionId, { victimGen, result: held });
+      // If nobody claims the hold (the victim was an internal turn whose
+      // prompt() had already returned — e.g. a goal-eval continuation), drop
+      // it once the re-prompt settles so it cannot linger.
+      void held.finally(() => {
+        const h = modeFlipHolds.get(sessionId);
+        if (h && h.result === held) modeFlipHolds.delete(sessionId);
+      });
+    }
     return repromptLock;
   };
 
@@ -5527,7 +5566,14 @@ const drainSteerQueue = async (): Promise<void> => {
       // agent message instead of a silent end_turn. This is what makes a
       // genuinely premature stop distinguishable from a normal one; codex-acp
       // does the same by mapping upstream failures to a visible error.
-      if (turnErrored) {
+      // A turn this adapter SIGINT'd itself for a mid-turn mode flip is not a
+      // failure: the "error_during_execution" result is the interrupt, and the
+      // re-prompted turn continues the same client prompt (held across the
+      // flip — see modeFlipHolds). Surfacing "Turn ended with status: …" would
+      // inject a bogus error line into a conversation that is still going.
+      const interruptedByModeFlip =
+        modeFlipHolds.get(sessionId)?.victimGen === promptGen;
+      if (turnErrored && !interruptedByModeFlip) {
         const reason = turnStopReason ?? "error";
         const overflow = isPromptTooLongMessage(turnErrorText);
         await connection.sessionUpdate({
@@ -6735,7 +6781,23 @@ const drainSteerQueue = async (): Promise<void> => {
         }
       });
       sessionPromptLocks.set(sessionId, next.catch(() => {}));
-      return next;
+      // A mid-turn default→plan flip (interruptForPlanMode) SIGINTs this
+      // prompt's turn and re-prompts internally. Without this hold, `next`
+      // settles the moment the SIGINT lands — the client sees promptEnd and
+      // the button flips to Send while the re-prompted turn streams on. When
+      // a hold targets THIS generation, resolve with the re-prompt's result
+      // instead, so the client-side turn spans the interrupt and Stop keeps
+      // working (a session/cancel cancels the re-prompt, which resolves the
+      // hold with stopReason "cancelled").
+      return next.then((res) => {
+        const hold = modeFlipHolds.get(sessionId);
+        if (!hold || hold.victimGen !== myGen) return res;
+        modeFlipHolds.delete(sessionId);
+        logger.info(
+          `Session ${sessionId} prompt (gen ${myGen}) held across a mid-turn mode flip — returning the re-prompted turn's result`,
+        );
+        return hold.result;
+      });
     },
 
     async cancel(params: CancelNotification): Promise<void> {

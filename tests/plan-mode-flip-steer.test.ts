@@ -177,4 +177,61 @@ describe("collaboration picker flip mid-turn", () => {
       { timeout: 3000 },
     );
   });
+
+  it("default→plan holds the victim prompt's response until the re-prompted turn finishes", async () => {
+    const { agent, sid } = await setup();
+    await prompt(agent, sid, "hello"); // establish a Claude session (default mode)
+
+    // The flip SIGINTs the victim turn and re-prompts internally. The client's
+    // prompt must stay PENDING until the re-prompted turn finishes — resolving
+    // at the SIGINT is what flipped the webview button to Send mid-stream and
+    // left the re-prompt running with no way to Stop it.
+    let flipped = false;
+    let releaseReprompt: (() => void) | null = null;
+    const repromptGate = new Promise<void>((resolve) => {
+      releaseReprompt = resolve;
+    });
+    onStreamCall = async (call) => {
+      if (!flipped && call.prompt.includes("edit-the-code")) {
+        flipped = true;
+        // Fire-and-forget (same deadlock constraint as the test above)...
+        flipCollaboration(agent, sid, "plan");
+        // ...but keep the victim turn open until the flip handler has issued
+        // runner.cancel() and registered the hold. The real CLI takes
+        // milliseconds to die on SIGINT; the mock resolves instantly, so
+        // without this the victim can settle before the hold exists.
+        await vi.waitFor(() => expect(cancelCalls).toBe(1), { timeout: 1000 });
+        return;
+      }
+      if (call.prompt.includes("Collaboration Mode: Plan") && call.prompt.includes("no longer active")) {
+        // The re-prompted turn stays open until the test releases it.
+        await repromptGate;
+      }
+    };
+    recorded = [];
+    let settled: Awaited<ReturnType<typeof agent.prompt>> | null = null;
+    const p = prompt(agent, sid, "edit-the-code").then((r: Awaited<ReturnType<typeof agent.prompt>>) => {
+      settled = r;
+    });
+
+    // Wait until the re-prompted turn has STARTED (its stream call is gated
+    // open), then give the victim every chance to settle: the client prompt
+    // must still be pending on the re-prompt.
+    await vi.waitFor(
+      () => {
+        expect(
+          prompts().some((t) => t.includes("Collaboration Mode: Plan") && t.includes("no longer active")),
+        ).toBe(true);
+      },
+      { timeout: 3000 },
+    );
+    await new Promise((r) => setTimeout(r, 50));
+    expect(settled).toBeNull();
+
+    // Releasing the re-prompt resolves the held client prompt with ITS result.
+    releaseReprompt!();
+    await p;
+    expect(settled).not.toBeNull();
+    expect(settled!.stopReason).toBe("end_turn");
+  });
 });
