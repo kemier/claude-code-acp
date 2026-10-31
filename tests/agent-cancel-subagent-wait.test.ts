@@ -49,6 +49,7 @@ vi.mock("../src/claude-runner.js", () => {
       sessionId: "uuid-1",
     });
     // Simulate the CLI: on cancel the in-flight stream ends (process SIGINT'd).
+    this.discardLiveSession = vi.fn();
     this.cancel = vi.fn().mockImplementation(function () {
       if (resolveStream) {
         resolveStream({ text: "interrupted", sessionId: "uuid-1" });

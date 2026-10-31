@@ -63,6 +63,7 @@ vi.mock("../src/claude-runner.js", () => {
     this.startSessionStreaming = vi.fn().mockImplementation(async () => makeTurnPromise());
     this.continueSessionStreaming = vi.fn().mockImplementation(async () => makeTurnPromise());
     this.cancel = vi.fn();
+    this.discardLiveSession = vi.fn();
     this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(

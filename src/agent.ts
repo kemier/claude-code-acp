@@ -2115,6 +2115,17 @@ export function createClaudeCodeAgent(
   // could re-trigger). See `ericli-subagent-late-arrival-turn-trigger`.
   const autoFollowUpCount = new Map<string, number>();
   const AUTO_FOLLOW_UP_CAP = 3;
+  // Auto follow-up runs AFTER session/prompt returns, so a queued Send Now
+  // (Zed: cancel then session/prompt; vscode-acp: promptEnd then sendPrompt)
+  // is not stuck behind the subagent turn. A newer prompt bumps the epoch and
+  // the follow-up skips or aborts. Pending = scheduled or echoing; active =
+  // its CLI turn is in flight and must be killed before the user prompt.
+  const followUpEpoch = new Map<string, number>();
+  const autoFollowUpPending = new Set<string>();
+  const autoFollowUpActive = new Set<string>();
+  const bumpFollowUpEpoch = (sessionId: string): void => {
+    followUpEpoch.set(sessionId, (followUpEpoch.get(sessionId) ?? 0) + 1);
+  };
   // Degenerate empty-turn retry guard: when a turn returns end_turn with
   // zero tokens, no text, and no tool call, the CLI was answering a synthetic
   // control frame rather than the user's prompt. Re-deliver the same turn
@@ -3573,6 +3584,12 @@ export function createClaudeCodeAgent(
   };
 
   const executePrompt = async (sessionId: string, bodyText: string, modelOverride: string | undefined, effectiveEffort: string | undefined, promptImages: import("./claude-runner.js").StdinContentBlock[] = [], promptGen: number = 0): Promise<PromptResponse> => {
+    // Scheduled when this turn ends with subagents still pending. Run from the
+    // post-turn chain AFTER session/prompt returns — awaiting it here is what
+    // kept Zed on Generating for the whole follow-up, so Send Now's cancel
+    // waited on a turn the model had already finished and the queued text
+    // never became a prompt.
+    let deferredAutoFollowUp: ((capturedEpoch: number) => Promise<void>) | null = null;
     // Mark this session as having a prompt in flight for the entire executePrompt
     // body (LLM turn + steer drain + auto-compact + return). Cleared when the
     // lock chain settles (below). See sessionPromptInFlight.
@@ -5265,35 +5282,56 @@ const drainSteerQueue = async (): Promise<void> => {
           // them as their own turns.
           const claudeSidForFollowUp = store.getClaudeSessionId(sessionId);
           if (claudeSidForFollowUp) {
-            // Echo the synthetic turn as a user chunk so the client shows it.
-            await connection
-              .sessionUpdate({
-                sessionId,
-                update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpText } } as any,
-              })
-              .catch(() => { /* non-fatal */ });
+            const followUpSid = claudeSidForFollowUp;
+            const followUpBody = followUpText;
+            deferredAutoFollowUp = async (capturedEpoch: number) => {
+              if ((followUpEpoch.get(sessionId) ?? 0) !== capturedEpoch) return;
+              // Echo the synthetic turn as a user chunk so the client shows it.
+              await connection
+                .sessionUpdate({
+                  sessionId,
+                  update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: followUpBody } } as any,
+                })
+                .catch(() => { /* non-fatal */ });
+              if ((followUpEpoch.get(sessionId) ?? 0) !== capturedEpoch) return;
+              logger.info(
+                `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} delivering as its own turn ` +
+                  `for session ${sessionId} (user steers left for the post-turn drain).`,
+              );
+              permissionPromises.length = 0;
+              autoFollowUpPending.delete(sessionId);
+              autoFollowUpActive.add(sessionId);
+              try {
+                ctxEstimator.addText(followUpBody);
+                const streaming = runner.continueSessionStreaming(
+                  followUpSid,
+                  followUpBody,
+                  onEvent,
+                  sessionId,
+                  runModel,
+                  runEffort,
+                  store.getMcpServers(sessionId),
+                );
+                // A Send Now prompt may have bumped the epoch in the gap
+                // before this call yielded. Kill the turn it just started.
+                if ((followUpEpoch.get(sessionId) ?? 0) !== capturedEpoch) {
+                  runner.cancel(sessionId);
+                  runner.discardLiveSession(sessionId);
+                }
+                await streaming;
+                await Promise.all(permissionPromises);
+              } catch (followUpErr) {
+                logger.error(
+                  `Auto follow-up turn failed for session ${sessionId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
+                );
+              } finally {
+                autoFollowUpActive.delete(sessionId);
+              }
+            };
             logger.info(
-              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} delivering as its own turn ` +
-                `for session ${sessionId} (user steers left for the post-turn drain).`,
+              `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} scheduled after session/prompt returns ` +
+                `for session ${sessionId} so a queued message can start.`,
             );
-            permissionPromises.length = 0;
-            try {
-              ctxEstimator.addText(followUpText);
-              await runner.continueSessionStreaming(
-                claudeSidForFollowUp,
-                followUpText,
-                onEvent,
-                sessionId,
-                runModel,
-                runEffort,
-                store.getMcpServers(sessionId),
-              );
-              await Promise.all(permissionPromises);
-            } catch (followUpErr) {
-              logger.error(
-                `Auto follow-up turn failed for session ${sessionId}: ${followUpErr instanceof Error ? followUpErr.message : String(followUpErr)}`,
-              );
-            }
           } else {
             // No Claude session to resume into (e.g. straight after /clear).
             // Queue it so a later drain delivers it once a session exists.
@@ -5464,24 +5502,10 @@ const drainSteerQueue = async (): Promise<void> => {
 
      logger.info(`Prompt completed for session ${sessionId}`);
 
-      // Drain any steers queued during this turn (see drainSteerQueue).
-      // Non-blocking: the drain's follow-up turns (continueSessionStreaming)
-      // run in the background so executePrompt can return its JSON-RPC
-      // response immediately. Without this, a queued steer keeps executePrompt
-      // alive through the drain's LLM turns — the session/prompt response is
-      // never sent, vscode-acp's connection.prompt() never resolves, and the
-      // Stop button never switches to Send. The drain's turns still stream to
-      // the client; a new session/prompt chains on sessionPromptLocks and
-      // waits for the drain's turn to finish before starting.
-      const drainPromise = drainSteerQueue().catch((e) => {
-        logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
-      });
-      pendingDrainPromises.set(sessionId, drainPromise);
-      // Conditional: the goal evaluator may have replaced this entry with its
-      // own promise (chained on this drain); only clear if still ours.
-      void drainPromise.finally(() => {
-        if (pendingDrainPromises.get(sessionId) === drainPromise) pendingDrainPromises.delete(sessionId);
-      });
+      // Steer drain and the subagent auto follow-up are scheduled after
+      // compaction and the empty-turn retry, which still need this CLI.
+      // Starting them here raced those calls. See the chain above the goal
+      // evaluator.
 
       // ─── Auto-compact check ───────────────────────────────────────────
       // Uses the same threshold Claude Code CLI computes (context window,
@@ -5845,6 +5869,52 @@ const drainSteerQueue = async (): Promise<void> => {
       await publishGoalSnapshot(sessionId, connection);
     }
 
+    const ackCancel = (): PromptResponse => {
+      releaseArmedMidTurnCompact(sessionId);
+      cancelledSessions.delete(sessionId);
+      cancelledGen.delete(sessionId);
+      if (inFlightGen.get(sessionId) === promptGen) inFlightGen.delete(sessionId);
+      logger.info(`Prompt cancelled for session ${sessionId}`);
+      saveSessionSlot(sessionId);
+      return { stopReason: "cancelled" };
+    };
+    // A cancel that landed during compaction or the goal snapshot must not
+    // be reported as end_turn. vscode-acp Send Now only re-sends when the
+    // prompt ends with cancelled; end_turn leaves the drain arm holding
+    // isProcessing and the queued message stays put.
+    if (isCancelledForGen(sessionId, promptGen)) {
+      return ackCancel();
+    }
+
+    // Auto follow-up, then steer drain. Neither is awaited: session/prompt
+    // returns now so the client leaves Generating and can submit the queued
+    // message. The next prompt preempts a follow-up that has not finished
+    // (bumpFollowUpEpoch / runner.cancel) instead of waiting out the subagent.
+    {
+      const capturedEpoch = followUpEpoch.get(sessionId) ?? 0;
+      const runFollowUp = deferredAutoFollowUp;
+      if (runFollowUp) autoFollowUpPending.add(sessionId);
+      const drainPromise = (async () => {
+        try {
+          if (runFollowUp && (followUpEpoch.get(sessionId) ?? 0) === capturedEpoch) {
+            await runFollowUp(capturedEpoch);
+          }
+        } finally {
+          autoFollowUpPending.delete(sessionId);
+          autoFollowUpActive.delete(sessionId);
+        }
+        await drainSteerQueue();
+      })().catch((e) => {
+        logger.error(`Post-turn drain failed for session ${sessionId}: ${e instanceof Error ? e.message : String(e)}`);
+      });
+      pendingDrainPromises.set(sessionId, drainPromise);
+      // Conditional: the goal evaluator may have replaced this entry with its
+      // own promise (chained on this drain); only clear if still ours.
+      void drainPromise.finally(() => {
+        if (pendingDrainPromises.get(sessionId) === drainPromise) pendingDrainPromises.delete(sessionId);
+      });
+    }
+
     // ─── Adapter-side goal evaluator loop ──────────────────────────────
     // Native /goal (CLI ≥2.1.139) runs its own evaluator, but the adapter
     // intercepts /goal before the CLI sees it, so that loop never fires in
@@ -5928,6 +5998,9 @@ const drainSteerQueue = async (): Promise<void> => {
           });
         }
       }
+    }
+    if (isCancelledForGen(sessionId, promptGen)) {
+      return ackCancel();
     }
     saveSessionSlot(sessionId);
     return { stopReason: "end_turn", usage: (lastUsage as any) ? { inputTokens: (lastUsage as any).input_tokens ?? 0, outputTokens: (lastUsage as any).output_tokens ?? 0, totalTokens: ((lastUsage as any).input_tokens ?? 0) + ((lastUsage as any).output_tokens ?? 0) } : undefined };
@@ -6878,9 +6951,25 @@ const drainSteerQueue = async (): Promise<void> => {
       // prior prompt finishes. The lock is keyed by session and always
       // replaced, so it never holds a stale promise across /clear (which
       // resolves quickly and clears per-session state under the lock too).
+      // A queued Send Now arrives as this prompt while the previous turn's
+      // subagent follow-up may still be on the CLI. Abort that follow-up
+      // first. Waiting for it is the "Send Now did nothing until I retyped"
+      // failure: the client already submitted the queued text, and this
+      // handler was stuck behind the synthetic turn.
+      const settleBackgroundTurn = (): Promise<unknown> => {
+        if (autoFollowUpPending.has(sessionId) || autoFollowUpActive.has(sessionId)) {
+          logger.info(`User prompt preempts auto follow-up for session ${sessionId}`);
+          bumpFollowUpEpoch(sessionId);
+          if (autoFollowUpActive.has(sessionId)) {
+            runner.cancel(sessionId);
+            runner.discardLiveSession(sessionId);
+          }
+        }
+        return pendingDrainPromises.get(sessionId) ?? Promise.resolve();
+      };
       const prev = (sessionPromptLocks.get(sessionId) ?? Promise.resolve()).then(
-        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve(),
-        () => pendingDrainPromises.get(sessionId) ?? Promise.resolve()
+        () => settleBackgroundTurn(),
+        () => settleBackgroundTurn()
       );
       // Assign this prompt a monotonically-increasing generation for the
       // session. A cancel() latches by generation (the one in flight at cancel
@@ -6974,7 +7063,12 @@ const drainSteerQueue = async (): Promise<void> => {
       }
       // Cancel: discard undelivered steers (already handled above) so a
       // cancelled turn does not start a follow-up for them after settle.
+      // Drop the live CLI too. A result line clears the SIGTERM timer and
+      // leaves the process up; the next session/prompt (Send Now) then
+      // writes into that interrupted process and the queued text never runs.
+      bumpFollowUpEpoch(params.sessionId);
       runner.cancel(params.sessionId);
+      runner.discardLiveSession(params.sessionId);
     },
 
     /**

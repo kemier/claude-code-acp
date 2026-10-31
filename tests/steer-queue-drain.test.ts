@@ -42,6 +42,7 @@ vi.mock("../src/claude-runner.js", () => {
     this.continueSession = vi.fn().mockResolvedValue({ text: "", sessionId: "claude-uuid-abc" });
     this.isRunning = vi.fn(() => running);
     this.cancel = vi.fn();
+    this.discardLiveSession = vi.fn();
     this.startSessionStreamingWithContent = vi.fn().mockImplementation(
       (_cwd: string, _content: any, _onEvent: any, _trackingId?: string, _m?: string, _e?: string, _mcp?: any) =>
         this.startSessionStreaming(_cwd, (typeof _content?.[0]?.text === "string" ? _content[0].text : ""), _onEvent, _trackingId, _m, _e)

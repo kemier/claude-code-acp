@@ -72,6 +72,7 @@ vi.mock("../src/claude-runner.js", () => {
       });
     this.isRunning = vi.fn(() => false);
     this.writeSteerToMainTurn = vi.fn(() => false);
+    this.discardLiveSession = vi.fn();
     this.cancel = vi.fn().mockImplementation(() => {
       if (cancelReject) {
         cancelReject(new Error("Process killed"));

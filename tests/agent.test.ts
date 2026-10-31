@@ -65,6 +65,7 @@ vi.mock("../src/claude-runner.js", () => {
       }
     );
     this.cancel = vi.fn();
+    this.discardLiveSession = vi.fn();
     this.writeSteerToMainTurn = vi.fn().mockReturnValue(false);
     this.hasOpenMainTurnStdin = vi.fn().mockReturnValue(false);
     this.setSessionPermissionMode = vi.fn();

@@ -30,6 +30,7 @@ vi.mock("../src/claude-runner.js", () => {
       text: "ok",
       sessionId: "uuid-1",
     });
+    this.discardLiveSession = vi.fn();
     this.cancel = vi.fn().mockImplementation(function (this: any) {
       if (cancelReject) {
         cancelReject(new Error("Process killed"));
