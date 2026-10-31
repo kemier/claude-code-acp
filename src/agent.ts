@@ -29,6 +29,7 @@ import {
 } from "@agentclientprotocol/sdk";
 import { SessionStore, type SessionInfo } from "./session-store.js";
 import { buildMidTurnModeChangeNotice, shouldAnnounceModeChange } from "./plan-mode-notice.js";
+import { PlanModeToolXmlFilter, type PlanModeToolCall } from "./plan-mode-tool-xml.js";
 import { ClaudeRunner, isProxyBaseUrl, type StreamEvent, type McpServerConfig } from "./claude-runner.js";
 import { logger } from "./logger.js";
 import { saveSessionSlot, tryRestoreSlot } from "./slot-cache.js";
@@ -3774,6 +3775,138 @@ export function createClaudeCodeAgent(
     // turn.
     let lastTurnStreamedText = false;
     let lastTurnHadToolCall = false;
+    // Headless `claude -p` does not present ExitPlanMode's approval dialog, and
+    // plan mode disallows the tool, so proxy models write the call as
+    // `<tool_call><function=ExitPlanMode><parameter=plan>…`. Pull it out of the
+    // text stream and approve it through the same plan→default path as the
+    // collaboration picker.
+    const planModeXml = new PlanModeToolXmlFilter();
+    let exitPlanRequested = false;
+    const emitAssistantText = (text: string) => {
+      if (!text) return;
+      turnStreamedText = true;
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text },
+          messageId: currentMessageId ?? undefined,
+        },
+      });
+    };
+    const presentExitPlanMode = (plan: string | undefined) => {
+      const planText = (plan ?? "").trim();
+      if (planText) emitAssistantText(planText);
+      // A second copy in the same turn (streamed deltas plus the final block,
+      // or the model retrying the call) must not open another approval.
+      if (exitPlanRequested) return;
+      exitPlanRequested = true;
+      turnStreamedText = true;
+      turnHadToolCall = true;
+      const inPlan =
+        (sessionCollaborationModes.get(sessionId) ?? DEFAULT_COLLABORATION_MODE) ===
+        PLAN_COLLABORATION_MODE;
+      if (!inPlan) {
+        logger.info(`ExitPlanMode ignored for session ${sessionId}: not in plan mode`);
+        return;
+      }
+      const toolCallId = nextToolCallId();
+      const rawInput = { plan: planText };
+      connection.sessionUpdate({
+        sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId,
+          title: "Exit plan mode",
+          kind: "switch_mode",
+          status: "pending",
+          rawInput,
+        },
+      });
+      const permPromise = Promise.resolve()
+        .then(() =>
+          connection.requestPermission({
+            sessionId,
+            toolCall: {
+              toolCallId,
+              title: "Exit plan mode",
+              kind: "switch_mode",
+              status: "pending",
+              rawInput,
+            },
+            options: [
+              { optionId: "allow_once", kind: "allow_once", name: "Approve and implement" },
+              { optionId: "reject_once", kind: "reject_once", name: "Keep planning" },
+            ],
+          }),
+        )
+        .then(async (response) => {
+          const outcome = response.outcome as { outcome?: string; type?: string; optionId?: string };
+          const isSelected = outcome.outcome === "selected" || outcome.type === "selected";
+          const approved =
+            isSelected && (outcome.optionId === "allow_once" || outcome.optionId === "allow_always");
+          connection
+            .sessionUpdate({
+              sessionId,
+              update: {
+                sessionUpdate: "tool_call_update",
+                toolCallId,
+                status: approved ? "completed" : "failed",
+              },
+            })
+            .catch(() => {});
+          if (!approved) {
+            logger.info(`ExitPlanMode rejected for session ${sessionId}`);
+            return;
+          }
+          const previousCollab = sessionCollaborationModes.get(sessionId);
+          const stored = store.getMode(sessionId) ?? DEFAULT_MODE;
+          const targetMode = stored === "read-only" ? DEFAULT_MODE : stored;
+          await applyModeChange(sessionId, connection, store, runner, targetMode);
+          const inFlight =
+            runner.isRunning(sessionId) || sessionPromptInFlight.has(sessionId);
+          if (
+            shouldAnnounceModeChange(previousCollab, DEFAULT_COLLABORATION_MODE) &&
+            inFlight &&
+            !cancelledSessions.has(sessionId)
+          ) {
+            if (!steerQueues.has(sessionId)) steerQueues.set(sessionId, []);
+            const queue = steerQueues.get(sessionId)!;
+            for (let i = queue.length - 1; i >= 0; i -= 1) {
+              if (queue[i].text.startsWith("<collaboration_mode>")) queue.splice(i, 1);
+            }
+            queue.push({ text: buildMidTurnModeChangeNotice(false), images: [] });
+            logger.info(
+              `ExitPlanMode approved for session ${sessionId}; queued implementation turn`,
+            );
+          }
+        })
+        .catch((err) => {
+          logger.error(
+            `ExitPlanMode permission failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          connection
+            .sessionUpdate({
+              sessionId,
+              update: { sessionUpdate: "tool_call_update", toolCallId, status: "failed" },
+            })
+            .catch(() => {});
+        });
+      permissionPromises.push(permPromise);
+    };
+    const deliverPlanModeText = (parts: { text: string; calls: PlanModeToolCall[] }) => {
+      emitAssistantText(parts.text);
+      for (const call of parts.calls) {
+        if (call.name === "ExitPlanMode") {
+          presentExitPlanMode(call.plan);
+        } else {
+          // EnterPlanMode is picker-driven under headless -p. Drop the leaked
+          // tags so they are not painted as the assistant reply.
+          logger.info(`Dropped leaked ${call.name} text for session ${sessionId}`);
+          turnStreamedText = true;
+        }
+      }
+    };
     const onEvent = (event: StreamEvent) => {
       // Handle system/init — extract native Claude CLI slash commands and
       // surface them to vscode-acp via available_commands_update.
@@ -4207,6 +4340,9 @@ export function createClaudeCodeAgent(
     }
   }
   if (event.type === "result" && !event.isSidechain) {
+    // Release a plan-mode tool block that was still open when the turn ended,
+    // before the result-text fallback below can replay the raw XML.
+    deliverPlanModeText(planModeXml.flush());
     // A subagent's own conversation ends with its own result line (flagged
     // isSidechain by the runner). It must NOT overwrite the parent turn's
     // stop reason / error flag / usage accounting — the parent's own result
@@ -4386,21 +4522,26 @@ export function createClaudeCodeAgent(
        if (event.fromAssistantBlock) streamedTextThisMessage = false;
        if (!dropAsDuplicate) {
          // This turn delivered text to the UI — the result handler must not
-         // re-surface result.text as a second summary bubble.
-         turnStreamedText = true;
-         connection.sessionUpdate({
-           sessionId,
-           update: {
-             sessionUpdate: "agent_message_chunk",
-             content: { type: "text", text: event.text },
-             // Group all chunks of this assistant API call into one logical
-             // message so the client renders one bubble (not one per delta).
-             messageId: currentMessageId ?? undefined,
-           },
-         });
+         // re-surface result.text as a second summary bubble. Plan-mode tool
+         // XML is stripped here; ExitPlanMode becomes an approval instead.
+         deliverPlanModeText(planModeXml.push(event.text));
        }
        }
      } else if (event.type === "tool_use" && event.toolName) {
+       // A real tool_use (not the leaked XML path) for the plan-mode tools.
+       // Headless -p usually never emits these; when it does, ExitPlanMode
+       // still has to go through the approval gate rather than a generic row.
+       if (!event.isSidechain && event.toolName === "ExitPlanMode") {
+         ctxEstimator.addToolCall(event.toolName, event.toolInput);
+         const input = (event.toolInput ?? {}) as Record<string, unknown>;
+         presentExitPlanMode(typeof input.plan === "string" ? input.plan : undefined);
+         return;
+       }
+       if (!event.isSidechain && event.toolName === "EnterPlanMode") {
+         logger.info(`Dropped EnterPlanMode tool_use for session ${sessionId}`);
+         turnStreamedText = true;
+         return;
+       }
        ctxEstimator.addToolCall(event.toolName, event.toolInput);
        if (!event.isSidechain) turnHadToolCall = true;
        const toolCallId = nextToolCallId();
@@ -4411,11 +4552,9 @@ export function createClaudeCodeAgent(
        // is a full snapshot, so the count reflects the live list size
        // rather than a running total of updates.
        handleTaskTool(sessionId, event.toolName, event.toolInput);
-       // NOTE: the CLI's native EnterPlanMode/ExitPlanMode tools are
-       // interactive-TUI-only — they never fire under headless `claude -p`, so
-       // there is no tool_use event to relay here. Plan mode is driven solely by
-       // the user floating the picker (setSessionMode/setSessionConfigOption →
-       // applyModeChange).
+       // EnterPlanMode/ExitPlanMode are handled above when a tool_use does
+       // arrive. Leaked chat-template XML for those tools is stripped in the
+       // text_delta path (planModeXml).
        // Build a descriptive title + kind + (for edits) diff content +
        // locations, mirroring codex-acp, so the chat UI shows the action
        // verb and a click-to-open diff instead of a bare filename.
