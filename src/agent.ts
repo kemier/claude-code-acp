@@ -2214,6 +2214,38 @@ export function createClaudeCodeAgent(
     Map<string, { acpCallId: string; description: string }>
   >();
 
+  /**
+   * Mark every still-pending subagent tool_call as failed and drop the map.
+   * Used when the live Claude process is about to die (mid-turn auto-compact
+   * SIGINT, discardLiveSession before summarize) so ghost `in_progress` rows
+   * cannot defer `drainSteerQueue` forever or trigger a false auto-follow-up
+   * against a process that will never emit `<task-notification>`.
+   */
+  const clearSessionPendingAgents = (sid: string, reason: string): void => {
+    const pending = sessionPendingAgents.get(sid);
+    if (!pending || pending.size === 0) {
+      sessionPendingAgents.delete(sid);
+      return;
+    }
+    logger.info(
+      `Clearing ${pending.size} pending subagent(s) for session ${sid} (${reason})`,
+    );
+    for (const [, info] of pending) {
+      connection
+        .sessionUpdate({
+          sessionId: sid,
+          update: {
+            sessionUpdate: "tool_call_update",
+            toolCallId: info.acpCallId,
+            status: "failed",
+          } as any,
+        })
+        .catch(() => {});
+    }
+    pending.clear();
+    sessionPendingAgents.delete(sid);
+  };
+
   // Non-subagent tools (Bash/Read/Edit/Grep/…) use the same in_progress →
   // completed lifecycle, but resolve on the tool_result message (not a
   // <task-notification>). The runner collects the tool_use_ids a user message
@@ -3342,6 +3374,13 @@ export function createClaudeCodeAgent(
       // fresh-session call then runs with no events. Drop it and summarize
       // through a new process that --resumes the same session id.
       if (midTurnCompactArmed.has(sessionId) || summaryMaxOutputTokens !== undefined) {
+        // Process is dying — any in-flight subagent notification is lost.
+        // Clear ghosts before discard so a concurrent/post-compact steer
+        // drain cannot defer forever on them.
+        clearSessionPendingAgents(
+          sessionId,
+          "process drop before summarize",
+        );
         runner.discardLiveSession(sessionId);
         logger.info(
           `Dropped Claude process before summarizing session ${sessionId}`,
@@ -3579,6 +3618,10 @@ export function createClaudeCodeAgent(
   // write into it. doCompact itself discards when it still owns the flag.
   const releaseArmedMidTurnCompact = (sessionId: string): void => {
     if (!midTurnCompactArmed.has(sessionId)) return;
+    clearSessionPendingAgents(
+      sessionId,
+      "release armed mid-turn compact",
+    );
     runner.discardLiveSession(sessionId);
     midTurnCompactArmed.delete(sessionId);
   };
@@ -4069,6 +4112,13 @@ export function createClaudeCodeAgent(
               input_tokens: realPrompt,
               output_tokens: lastRealOutputTokens,
             });
+            // SIGINT kills the process; orphaned subagents will never notify.
+            // Clear now so the post-turn flush does not auto-follow-up into a
+            // dying process, and so drainSteerQueue does not defer forever.
+            clearSessionPendingAgents(
+              sessionId,
+              "mid-turn auto-compact",
+            );
             const contextWindow = getContextWindowForModel(runModelResolved);
             logger.info(
               `Mid-turn auto-compact for session ${sessionId}: ${occupied} >= ${threshold} ` +
@@ -5243,6 +5293,21 @@ const drainSteerQueue = async (): Promise<void> => {
       const pendingAgents = sessionPendingAgents.get(sessionId);
       if (pendingAgents && pendingAgents.size > 0) {
         const pendingCount = pendingAgents.size;
+        // Mid-turn auto-compact already SIGINT'd the process (and should have
+        // cleared the map at arm time). If anything is still here, drop it —
+        // a follow-up resume cannot receive <task-notification> from a dead
+        // process, and leaving the ghosts would defer the steer drain forever.
+        if (midTurnCompactArmed.has(sessionId)) {
+          clearSessionPendingAgents(
+            sessionId,
+            "post-turn flush under mid-turn compact",
+          );
+          logger.info(
+            `Turn ended with ${pendingCount} subagent(s) still pending for ` +
+              `session ${sessionId} during mid-turn auto-compact — cleared ` +
+              `(no auto follow-up; process is dying).`,
+          );
+        } else {
         logger.info(
           `Turn ended with ${pendingCount} subagent(s) still pending ` +
             `(no <task-notification> before end_turn) for session ${sessionId} ` +
@@ -5346,6 +5411,7 @@ const drainSteerQueue = async (): Promise<void> => {
             `Auto follow-up skipped for session ${sessionId}: reached cap ${AUTO_FOLLOW_UP_CAP}.`,
           );
         }
+        } // else: not mid-turn compact
       }
 
       // ── Background Bash (interactive CLI semantic) ─────────────────────
@@ -5505,7 +5571,8 @@ const drainSteerQueue = async (): Promise<void> => {
       // Steer drain and the subagent auto follow-up are scheduled after
       // compaction and the empty-turn retry, which still need this CLI.
       // Starting them here raced those calls. See the chain above the goal
-      // evaluator.
+      // evaluator. Ghost sessionPendingAgents are cleared on mid-turn compact
+      // / process drop so the deferred drain cannot stall forever.
 
       // ─── Auto-compact check ───────────────────────────────────────────
       // Uses the same threshold Claude Code CLI computes (context window,
