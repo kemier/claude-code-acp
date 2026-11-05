@@ -766,6 +766,33 @@ async function publishGoalSnapshot(
   }).catch(() => {});
 }
 
+/**
+ * Tell vscode-acp a CLI-owned follow-up turn (no session/prompt) is starting
+ * or ending. Idle `<task-notification>` relays and deferred auto-follow-ups
+ * stream after promptEnd with no promptStart; without these bookends the
+ * webview drops thoughts/messages (idle guards) and never shows Stop.
+ */
+async function notifyClaudeFollowUpTurn(
+  sessionId: string,
+  connection: AgentSideConnection,
+  phase: "start" | "end" | "arm",
+  count = 1,
+): Promise<void> {
+  const claudeMeta =
+    phase === "arm"
+      ? { armDrainFollowUps: Math.max(1, count | 0) }
+      : { idleRelayTurn: phase };
+  await connection
+    .sessionUpdate({
+      sessionId,
+      update: {
+        sessionUpdate: "session_info_update",
+        _meta: { claude: claudeMeta },
+      } as any,
+    })
+    .catch(() => {});
+}
+
 // ─── Context window resolution ──────────────────────────────────────────────
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 
@@ -5366,6 +5393,9 @@ const drainSteerQueue = async (): Promise<void> => {
               permissionPromises.length = 0;
               autoFollowUpPending.delete(sessionId);
               autoFollowUpActive.add(sessionId);
+              // Open the client-owned follow-up turn before the first chunk so
+              // thoughts are not idle-dropped and Stop appears immediately.
+              await notifyClaudeFollowUpTurn(sessionId, connection, "start");
               try {
                 ctxEstimator.addText(followUpBody);
                 const streaming = runner.continueSessionStreaming(
@@ -5391,12 +5421,16 @@ const drainSteerQueue = async (): Promise<void> => {
                 );
               } finally {
                 autoFollowUpActive.delete(sessionId);
+                await notifyClaudeFollowUpTurn(sessionId, connection, "end");
               }
             };
             logger.info(
               `Auto follow-up ${count + 1}/${AUTO_FOLLOW_UP_CAP} scheduled after session/prompt returns ` +
                 `for session ${sessionId} so a queued message can start.`,
             );
+            // Arm one drain slot before promptEnd so Stop stays up across the
+            // brief gap until the deferred turn's start signal arrives.
+            void notifyClaudeFollowUpTurn(sessionId, connection, "arm", 1);
           } else {
             // No Claude session to resume into (e.g. straight after /clear).
             // Queue it so a later drain delivers it once a session exists.
@@ -5498,10 +5532,35 @@ const drainSteerQueue = async (): Promise<void> => {
         const armIdleBackgroundNotification = (): void => {
           if ((sessionBackgroundBash.get(sessionId)?.size ?? 0) === 0) return;
           if (runner.hasIdleNotificationWaiter(sessionId)) return;
-          runner.waitForIdleNotification(sessionId, onEvent).then(
+          // Do NOT arm Stop at promptEnd — the command may run for minutes.
+          // Open the client-owned turn on the first relayed event, and close
+          // it when the CLI's result settles (mirrors drainSteerQueue).
+          let relayStarted = false;
+          let relayStartChain: Promise<void> = Promise.resolve();
+          const relayOnEvent = (event: StreamEvent): void => {
+            // Serialize start-signal before the first chunk so the webview
+            // arms Stop / drainFollowUpCount before thoughts arrive (otherwise
+            // they hit the idle thought-drop guard in the same tick).
+            if (!relayStarted) {
+              relayStarted = true;
+              relayStartChain = notifyClaudeFollowUpTurn(
+                sessionId,
+                connection,
+                "start",
+              );
+            }
+            const prior = relayStartChain;
+            relayStartChain = prior.then(() => {
+              onEvent(event);
+            });
+            void relayStartChain;
+          };
+          runner.waitForIdleNotification(sessionId, relayOnEvent).then(
             (waited) => {
               if (waited.superseded) return;
-              armIdleBackgroundNotification();
+              void notifyClaudeFollowUpTurn(sessionId, connection, "end").then(
+                () => armIdleBackgroundNotification(),
+              );
             },
             (waitErr) => {
               logger.error(
