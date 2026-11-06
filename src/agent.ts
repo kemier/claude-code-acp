@@ -1286,8 +1286,10 @@ function estimateTokensFromChars(chars: number): number {
   return Math.ceil(chars / CHARS_PER_TOKEN);
 }
 
-/** Per-turn accumulator for estimating real-time context size. */
-class TurnContextEstimator {
+/** Per-turn accumulator for estimating real-time context size.
+ *  Exported for unit testing only — all callers inside agent.ts use the
+ *  per-session instance held in `sessionEstimators`. */
+export class TurnContextEstimator {
   private contentBytes = 0;
   private apiCallCount = 0;
   /**
@@ -1297,6 +1299,27 @@ class TurnContextEstimator {
   private realTokens = 0;
   /** Content accumulated since `realTokens` was last refreshed. */
   private bytesSinceReal = 0;
+  /**
+   * Tokens claimed by inline images attached to the current conversation.
+   * `addText` cannot account for them — the ACP `image` block carries a
+   * base64 payload, but Anthropic's backend does NOT token-count that
+   * base64; it bills a per-image cost derived from image dimensions
+   * (≈ (W*H)/750, capped near 1600 for vision models). A pixel-accurate
+   * estimate is impossible client-side without decoding every image, so
+   * we use a flat per-image figure that is conservative for typical
+   * screenshots and is corrected by the real `prompt_tokens` from the
+   * first API response.
+   *
+   * Without this, a 10-image prompt looks ~0 bytes to the pre-turn
+   * compaction guard (`getEstimatedTokensWithPending`), the guard does
+   * not trip, and the request reaches vLLM / Claude CLI oversized.
+   * Observed symptom: ring jumps to 100% after the first API call and
+   * stays there because the real `prompt_tokens` landed above the
+   * compaction threshold on arrival.
+   */
+  private imageTokens = 0;
+  /** Image-token portion accumulated since `realTokens` was last refreshed. */
+  private imageTokensSinceReal = 0;
 
   /** Called when a new assistant event arrives (marks an API call boundary). */
   markApiCall(): void {
@@ -1312,6 +1335,10 @@ class TurnContextEstimator {
     if (!Number.isFinite(tokens) || tokens <= 0) return;
     this.realTokens = tokens;
     this.bytesSinceReal = 0;
+    // The real count from the backend already includes every image Claude
+    // CLI saw this turn — our pre-real image estimate becomes obsolete the
+    // moment the real number arrives, same lifecycle as `bytesSinceReal`.
+    this.imageTokensSinceReal = 0;
   }
 
   /** True once a real per-call token count has been observed. */
@@ -1333,6 +1360,31 @@ class TurnContextEstimator {
   }
 
   /**
+   * Record the per-image token cost for inline image blocks attached to the
+   * current turn (prompt, steer, or follow-up). Pass the array of stdin
+   * blocks that will actually be sent — non-image blocks are ignored.
+   *
+   * The flat per-image figure matches Anthropic's typical inline-image cost
+   * (1500 is a safe mid-point: real cost is ~85 tokens for a 256×256
+   * thumbnail and ~2500 for a 1080p screenshot). It over-counts tiny
+   * thumbnails (safe direction — triggers compaction slightly early) and
+   * under-counts giant photos a bit; the real `prompt_tokens` from the
+   * first API response corrects both.
+   */
+  addImages(blocks: ReadonlyArray<{ type?: string }> | undefined): void {
+    if (!blocks || blocks.length === 0) return;
+    const TOKENS_PER_IMAGE = 1500;
+    let count = 0;
+    for (const b of blocks) {
+      if (b && b.type === "image") count++;
+    }
+    if (count === 0) return;
+    const add = count * TOKENS_PER_IMAGE;
+    this.imageTokens += add;
+    this.imageTokensSinceReal += add;
+  }
+
+  /**
    * Reset accumulated conversation content (keep the fixed overhead).
    * Called after compaction, which replaces the entire conversation with a
    * short summary — without this, the estimator would keep counting the
@@ -1345,6 +1397,8 @@ class TurnContextEstimator {
     this.apiCallCount = 0;
     this.realTokens = 0;
     this.bytesSinceReal = 0;
+    this.imageTokens = 0;
+    this.imageTokensSinceReal = 0;
   }
 
   /** Accumulate tool call content (JSON-serialized input). */
@@ -1373,7 +1427,7 @@ class TurnContextEstimator {
    */
   getEstimatedTokens(): number {
     if (this.realTokens > 0) return this.realTokens;
-    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
+    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes) + this.imageTokens;
   }
 
   /**
@@ -1396,9 +1450,9 @@ class TurnContextEstimator {
    */
   getEstimatedTokensWithPending(): number {
     if (this.realTokens > 0) {
-      return this.realTokens + estimateTokensFromChars(this.bytesSinceReal);
+      return this.realTokens + estimateTokensFromChars(this.bytesSinceReal) + this.imageTokensSinceReal;
     }
-    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes);
+    return estimateTokensFromChars(CLAUDE_OVERHEAD_BYTES + this.contentBytes) + this.imageTokens;
   }
 
   getApiCallCount(): number {
@@ -3778,6 +3832,12 @@ export function createClaudeCodeAgent(
     sessionEstimators.set(sessionId, ctxEstimator);
     // Accumulate the user's prompt text (it's part of the conversation).
     ctxEstimator.addText(effectivePrompt);
+    // Account for any inline images attached to this prompt — their payload
+    // is sent to the CLI alongside `effectivePrompt` (see `turnContent` below)
+    // but was previously invisible to the pre-turn compaction guard. On a
+    // multi-image prompt that under-count let the request reach the backend
+    // oversized and the ring then landed at 100% on the first API response.
+    ctxEstimator.addImages(promptImages);
 
     // Get model and effort overrides from session config (set via pickers)
     const configOverrides = store.getConfigOverrides(sessionId);
@@ -5088,6 +5148,10 @@ const drainSteerQueue = async (): Promise<void> => {
         // description of interrupted state.
         let steerPrompt = frameTurnPrompt(sessionId, steerText, "steer");
         ctxEstimator.addText(steerPrompt);
+        // Image-bearing steers: the images are sent to the CLI in the
+        // stream-json content below — account for them in the estimator so
+        // the pre-next-turn guard doesn't under-count by 1500 tokens/image.
+        ctxEstimator.addImages(steerImages);
 
         // Image-bearing steers: deliver via the stream-json content path
         // (mirrors the main turn's turnContent) so the model actually receives
@@ -5198,6 +5262,9 @@ const drainSteerQueue = async (): Promise<void> => {
           // summary). Re-add this turn's prompt so the estimator reflects
           // the post-compact conversation + the new prompt before the turn.
           ctxEstimator.addText(effectivePrompt);
+          // Re-add images too — the post-compact turnContent carries them
+          // (see `turnContent` below), so the estimator must as well.
+          ctxEstimator.addImages(promptImages);
           // Re-read the claude session id: doCompact starts a fresh session.
           // The variable captured below must point at the compacted session,
           // not the pre-compact one (which the summary replaced).
